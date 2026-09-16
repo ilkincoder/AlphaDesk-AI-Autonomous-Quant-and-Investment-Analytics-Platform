@@ -9,3 +9,6 @@ __pycache__/
 # Editors and OS
 .idea/
 .DS_Store
+
+# Generated tool state (code-analysis working directory), not source
+.ua/
