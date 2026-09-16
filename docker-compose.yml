@@ -1,0 +1,53 @@
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      # Host port 5433, not 5432: a native PostgreSQL already listens on 5432 on
+      # this Mac, so binding 5432 here would fail.
+      - "5433:5432"
+    volumes:
+      # Postgres 18 stores its data in /var/lib/postgresql/18/docker and the image
+      # declares VOLUME /var/lib/postgresql, so that parent path is what must be
+      # persisted. (Postgres 16 and earlier used /var/lib/postgresql/data.)
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      # $$ escapes the dollar sign so Compose passes the variable through to the
+      # shell inside the container instead of substituting it on the host.
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  backend:
+    build:
+      context: ./backend
+    environment:
+      # The root .env file is only used for ${VAR} substitution inside this file.
+      # Compose does NOT inject it into containers, so DATABASE_URL is set
+      # explicitly here. It is assembled from the same POSTGRES_* variables the
+      # service above uses, so credentials live in exactly one place.
+      #
+      # Host is "postgres" (the Compose service name), not localhost: inside the
+      # Compose network each service is reachable by its service name.
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    ports:
+      - "8000:8000"
+    volumes:
+      # Live source mount: edits on the Mac appear in the container immediately,
+      # so changing code needs no rebuild at all (paired with --reload below).
+      - ./backend:/app
+    depends_on:
+      postgres:
+        # Don't start the backend until the postgres healthcheck passes.
+        condition: service_healthy
+    # --reload restarts the app when a mounted source file changes.
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+volumes:
+  # Named volume, so data survives container restarts and rebuilds.
+  postgres_data:
