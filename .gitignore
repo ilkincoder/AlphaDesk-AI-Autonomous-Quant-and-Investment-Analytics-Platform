@@ -6,6 +6,10 @@ __pycache__/
 *.py[cod]
 .venv/
 
+# Node / frontend. package-lock.json IS committed; these are generated.
+node_modules/
+dist/
+
 # Editors and OS
 .idea/
 .DS_Store

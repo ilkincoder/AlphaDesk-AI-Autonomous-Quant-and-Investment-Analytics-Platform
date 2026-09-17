@@ -1,0 +1,70 @@
+@import 'tailwindcss';
+
+/* Design tokens. Tailwind v4 reads these from CSS, so there is no tailwind.config.js:
+   every `--color-*` below becomes a `bg-*`/`text-*`/`border-*` utility, and every
+   `--text-*` becomes a `text-*` size. Components then use names, not hex codes, so a
+   colour only ever changes in one place. */
+@theme {
+  /* Surfaces, darkest first. */
+  --color-page: #060b12;
+  --color-sidebar: #080d15;
+  --color-panel: #101721;
+  --color-line: #1b2431;
+
+  /* Text, brightest first. */
+  --color-ink: #f3f4f6;
+  --color-dim: #9ca6b5;
+  --color-faint: #788394;
+
+  --color-accent: #8b5cf6;
+  --color-accent-ink: #c4b5fd; /* lavender: readable on the dark surfaces above */
+  /* A darker purple for filled buttons. White text on --color-accent measures about
+     4.2:1, just under the 4.5:1 WCAG AA needs for normal text; this measures about
+     5.7:1 and is the same purple family. */
+  --color-accent-strong: #7c3aed;
+  --color-selected: #21183b; /* selected navigation row */
+  --color-cash: #475569; /* cash is deliberately not purple: it is not a holding */
+  --color-danger: #f87171; /* a fall */
+  --color-positive: #4ade80; /* a rise. Never used alone: always with a sign and a word. */
+
+  --text-label: 0.75rem; /* 12px, table headings and small labels */
+  --text-note: 0.8125rem; /* 13px, secondary lines */
+  --text-body: 0.875rem; /* 14px, the default */
+  --text-heading: 0.9375rem; /* 15px, card headings */
+  --text-page: 1.625rem; /* 26px, the page heading */
+  --text-figure: 1.875rem; /* 30px, the headline portfolio value */
+
+  --radius-card: 10px;
+  /* Barely visible on purpose: enough to lift the card off the page, not enough to
+     notice as a shadow. */
+  --shadow-card: 0 1px 2px rgb(0 0 0 / 0.4);
+}
+
+@layer base {
+  :root {
+    /* Tells the browser this page is dark, so the parts it draws itself — the select
+       dropdown list, the number input's spinners, scrollbars — render dark too
+       instead of as bright system-default widgets. */
+    color-scheme: dark;
+  }
+
+  body {
+    font-size: var(--text-body);
+    /* Tailwind's default sans stack is already system-ui-first. */
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* One focus ring for the whole app. :focus-visible rather than :focus, so it
+     appears for keyboard users and not on every mouse click. */
+  :focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+
+  /* Disabled things must not look merely unclickable: dim them and drop the pointer. */
+  :disabled {
+    cursor: not-allowed;
+  }
+}

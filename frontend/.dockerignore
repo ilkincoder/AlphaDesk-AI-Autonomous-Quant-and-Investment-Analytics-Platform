@@ -1,0 +1,5 @@
+# The image installs its own dependencies with npm ci. Copying the host's would put
+# macOS binaries where Linux ones belong.
+node_modules/
+dist/
+npm-debug.log*

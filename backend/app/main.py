@@ -1,6 +1,7 @@
 """AlphaDesk AI backend."""
 
 import logging
+from decimal import Decimal
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import JSONResponse
@@ -9,8 +10,24 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.db import engine, get_session
 from app.models import Portfolio
-from app.schemas import PortfolioOut
+from app.schemas import (
+    PortfolioOut,
+    PortfolioValuationOut,
+    ScenarioOut,
+    ScenarioRequest,
+    ValuationHoldingOut,
+)
 from app.seed import DEMO_PORTFOLIO_NAME
+from app.valuation import (
+    DEMO_PRICE_SOURCE,
+    DEMO_PRICES,
+    HoldingNotFoundError,
+    MissingPriceError,
+    calculate_scenario,
+    calculate_valuation,
+)
+
+_HUNDRED = Decimal("100")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -70,3 +87,130 @@ def get_portfolio(session: Session = Depends(get_session)) -> PortfolioOut:
         )
 
     return PortfolioOut.model_validate(portfolio)
+
+
+@app.get("/portfolio/valuation", response_model=PortfolioValuationOut)
+def get_portfolio_valuation(
+    session: Session = Depends(get_session),
+) -> PortfolioValuationOut:
+    """Value the demo portfolio's holdings and cash against the demo prices.
+
+    Read-only: the same rows /portfolio returns, plus arithmetic on top. The prices are
+    the fictional constants in app.valuation, which is what `price_source: "demo"` says
+    -- they are not live quotes, so no market timestamp is reported.
+    """
+    portfolio = session.scalar(
+        select(Portfolio)
+        .where(Portfolio.name == DEMO_PORTFOLIO_NAME)
+        .options(selectinload(Portfolio.holdings))
+    )
+
+    if portfolio is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Portfolio {DEMO_PORTFOLIO_NAME!r} has not been seeded. "
+                "Run: docker compose exec backend python -m app.seed"
+            ),
+        )
+
+    try:
+        valuation = calculate_valuation(
+            portfolio.holdings, portfolio.cash_balance, DEMO_PRICES
+        )
+    except MissingPriceError as exc:
+        # 503, not 200 with a partial total: a valuation that silently omits a holding
+        # would look complete while being wrong.
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"No demo price available for held symbol(s): {', '.join(exc.symbols)}. "
+                "Add them to DEMO_PRICES in app/valuation.py."
+            ),
+        ) from exc
+
+    return PortfolioValuationOut(
+        portfolio_id=portfolio.id,
+        currency=portfolio.currency,
+        price_source=DEMO_PRICE_SOURCE,
+        cash_balance=valuation.cash_balance,
+        holdings_value=valuation.holdings_value,
+        total_value=valuation.total_value,
+        cash_allocation_percent=valuation.cash_allocation_percent,
+        holdings=[
+            ValuationHoldingOut.model_validate(item) for item in valuation.holdings
+        ],
+    )
+
+
+@app.post("/portfolio/scenario", response_model=ScenarioOut)
+def post_portfolio_scenario(
+    payload: ScenarioRequest,
+    session: Session = Depends(get_session),
+) -> ScenarioOut:
+    """Re-price one holding and report the hypothetical impact.
+
+    POST rather than GET because the question has a body, not a path: "what if *this*
+    symbol moved by *this* much". Nothing is stored — the same rows are read, arithmetic
+    is applied, and the answer is returned.
+
+    The percentage becomes a fraction here, not in the calculation: `calculate_scenario`
+    takes a fraction, so the parsing and the -100..+100 bound (enforced by
+    `ScenarioRequest`) stay on this side of the boundary.
+    """
+    portfolio = session.scalar(
+        select(Portfolio)
+        .where(Portfolio.name == DEMO_PORTFOLIO_NAME)
+        .options(selectinload(Portfolio.holdings))
+    )
+
+    if portfolio is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Portfolio {DEMO_PORTFOLIO_NAME!r} has not been seeded. "
+                "Run: docker compose exec backend python -m app.seed"
+            ),
+        )
+
+    try:
+        scenario = calculate_scenario(
+            portfolio.holdings,
+            portfolio.cash_balance,
+            DEMO_PRICES,
+            payload.symbol,
+            payload.price_change_percent / _HUNDRED,
+        )
+    except HoldingNotFoundError as exc:
+        held = ", ".join(sorted(holding.symbol for holding in portfolio.holdings))
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"{exc.symbol} is not held by {DEMO_PORTFOLIO_NAME!r}. "
+                f"Held: {held or 'nothing'}."
+            ),
+        ) from exc
+    except MissingPriceError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"No demo price available for held symbol(s): {', '.join(exc.symbols)}. "
+                "Add them to DEMO_PRICES in app/valuation.py."
+            ),
+        ) from exc
+
+    return ScenarioOut(
+        portfolio_id=portfolio.id,
+        currency=portfolio.currency,
+        price_source=DEMO_PRICE_SOURCE,
+        symbol=scenario.symbol,
+        price_change_percent=payload.price_change_percent,
+        price_before=scenario.price_before,
+        price_after=scenario.price_after,
+        holding_value_before=scenario.holding_value_before,
+        holding_value_after=scenario.holding_value_after,
+        total_value_before=scenario.total_value_before,
+        total_value_after=scenario.total_value_after,
+        change_value=scenario.change_value,
+        change_percent=scenario.change_percent,
+    )

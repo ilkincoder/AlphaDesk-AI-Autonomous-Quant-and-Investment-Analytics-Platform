@@ -48,6 +48,24 @@ services:
     # --reload restarts the app when a mounted source file changes.
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
+  frontend:
+    build:
+      context: ./frontend
+    # No `environment:` block at all. The frontend reaches the API through Vite's
+    # proxy, which runs inside this container and uses the Compose service name, so
+    # no database credential is ever passed here or shipped to the browser.
+    ports:
+      - "5173:5173"
+    volumes:
+      # Live source mount, same as the backend: edits on the Mac reload the page.
+      - ./frontend:/app
+      # Anonymous volume over node_modules. The mount above would otherwise hide the
+      # Linux dependencies installed into the image with whatever `npm install` left
+      # on the Mac, and native binaries built for the wrong platform fail obscurely.
+      - /app/node_modules
+    depends_on:
+      - backend
+
 volumes:
   # Named volume, so data survives container restarts and rebuilds.
   postgres_data:
