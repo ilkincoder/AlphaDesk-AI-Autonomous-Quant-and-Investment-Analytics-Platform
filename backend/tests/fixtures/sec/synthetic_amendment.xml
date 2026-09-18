@@ -1,0 +1,76 @@
+<?xml version="1.0"?>
+<!--
+  SYNTHETIC. Not a real SEC filing, though it mirrors the structure of a real 4/A that
+  was inspected during development (accession 0001045810-23-000242).
+
+  Exercises: documentType "4/A" so is_amendment derives True, and
+  <dateOfOriginalSubmission>, which real Form 4s do not carry at all; it appears only on
+  amendments. Nothing here says which accession this amends, because the document does not
+  say, and the parser must not guess.
+
+  See tests/fixtures/sec/README.md.
+-->
+<ownershipDocument>
+    <schemaVersion>X0609</schemaVersion>
+    <documentType>4/A</documentType>
+    <periodOfReport>2026-02-14</periodOfReport>
+    <dateOfOriginalSubmission>2026-02-18</dateOfOriginalSubmission>
+
+    <issuer>
+        <issuerCik>0000320193</issuerCik>
+        <issuerName>SYNTHETIC EXAMPLE CORP</issuerName>
+        <issuerTradingSymbol>SYN</issuerTradingSymbol>
+    </issuer>
+
+    <reportingOwner>
+        <reportingOwnerId>
+            <rptOwnerCik>0000000005</rptOwnerCik>
+            <rptOwnerName>EPSILON OFFICER</rptOwnerName>
+        </reportingOwnerId>
+        <reportingOwnerRelationship>
+            <isDirector>0</isDirector>
+            <isOfficer>1</isOfficer>
+            <isTenPercentOwner>0</isTenPercentOwner>
+            <isOther>0</isOther>
+            <officerTitle>Vice President</officerTitle>
+        </reportingOwnerRelationship>
+    </reportingOwner>
+
+    <aff10b5One>0</aff10b5One>
+
+    <nonDerivativeTable>
+        <nonDerivativeTransaction>
+            <securityTitle>
+                <value>Common Stock</value>
+            </securityTitle>
+            <transactionDate>
+                <value>2026-02-14</value>
+            </transactionDate>
+            <transactionCoding>
+                <transactionFormType>4</transactionFormType>
+                <transactionCode>F</transactionCode>
+            </transactionCoding>
+            <transactionAmounts>
+                <transactionShares>
+                    <value>1200</value>
+                </transactionShares>
+                <transactionPricePerShare>
+                    <value>88.10</value>
+                </transactionPricePerShare>
+                <transactionAcquiredDisposedCode>
+                    <value>D</value>
+                </transactionAcquiredDisposedCode>
+            </transactionAmounts>
+            <ownershipNature>
+                <directOrIndirectOwnership>
+                    <value>D</value>
+                </directOrIndirectOwnership>
+            </ownershipNature>
+        </nonDerivativeTransaction>
+    </nonDerivativeTable>
+
+    <derivativeTable></derivativeTable>
+    <footnotes></footnotes>
+    <remarks>This amendment restates the reporting person's holdings following the
+        issuer's recalculated share count.</remarks>
+</ownershipDocument>

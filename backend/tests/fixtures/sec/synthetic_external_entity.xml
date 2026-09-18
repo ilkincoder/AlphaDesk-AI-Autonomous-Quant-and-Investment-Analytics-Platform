@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<!--
+  SYNTHETIC. Not a real SEC filing. Deliberately hostile.
+
+  Declares an external entity pointing at a local file. A parser that resolved it would
+  read from the filesystem, and one that fetched over the network would make an outbound
+  request from inside a supposedly pure function. Neither happens: Python's stdlib
+  ElementTree refuses external entities outright, and this fixture is here to pin that,
+  so a future change of parser cannot quietly lose the property.
+
+  The parser must raise MalformedDocumentError, and no external resource may be touched.
+
+  See tests/fixtures/sec/README.md.
+-->
+<!DOCTYPE ownershipDocument [
+    <!ENTITY xxe SYSTEM "file:///etc/passwd">
+]>
+<ownershipDocument>
+    <schemaVersion>X0609</schemaVersion>
+    <documentType>4</documentType>
+    <periodOfReport>2026-07-01</periodOfReport>
+
+    <issuer>
+        <issuerCik>0000320193</issuerCik>
+        <issuerName>&xxe;</issuerName>
+        <issuerTradingSymbol>SYN</issuerTradingSymbol>
+    </issuer>
+
+    <reportingOwner>
+        <reportingOwnerId>
+            <rptOwnerCik>0000000008</rptOwnerCik>
+            <rptOwnerName>THETA HOSTILE</rptOwnerName>
+        </reportingOwnerId>
+    </reportingOwner>
+
+    <nonDerivativeTable></nonDerivativeTable>
+    <derivativeTable></derivativeTable>
+</ownershipDocument>

@@ -1,0 +1,40 @@
+<?xml version="1.0"?>
+<!--
+  SYNTHETIC. Not a real SEC filing. A real NVDA filing with no transactions at all was
+  seen during development (accession 0001347842-26-000015), and this mirrors that shape.
+
+  Exercises: a filing that reports owners but no trades. It must parse successfully with
+  an empty transactions tuple, not raise and not be treated as a failure. A filing that
+  reports nothing is a valid answer.
+
+  See tests/fixtures/sec/README.md.
+-->
+<ownershipDocument>
+    <schemaVersion>X0609</schemaVersion>
+    <documentType>4</documentType>
+    <periodOfReport>2026-05-01</periodOfReport>
+
+    <issuer>
+        <issuerCik>0000320193</issuerCik>
+        <issuerName>SYNTHETIC EXAMPLE CORP</issuerName>
+        <issuerTradingSymbol>SYN</issuerTradingSymbol>
+    </issuer>
+
+    <reportingOwner>
+        <reportingOwnerId>
+            <rptOwnerCik>0000000006</rptOwnerCik>
+            <rptOwnerName>ZETA TEN PERCENT OWNER</rptOwnerName>
+        </reportingOwnerId>
+        <reportingOwnerRelationship>
+            <isDirector>0</isDirector>
+            <isOfficer>0</isOfficer>
+            <isTenPercentOwner>1</isTenPercentOwner>
+            <isOther>0</isOther>
+        </reportingOwnerRelationship>
+    </reportingOwner>
+
+    <nonDerivativeTable></nonDerivativeTable>
+    <derivativeTable></derivativeTable>
+    <footnotes></footnotes>
+    <remarks>No transactions to report.</remarks>
+</ownershipDocument>

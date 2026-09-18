@@ -1,0 +1,72 @@
+<?xml version="1.0"?>
+<!--
+  SYNTHETIC. Not a real SEC filing.
+
+  Real Form 4 documents carry no XML namespace, which is why the parser matches on local
+  element names rather than assuming either way. This fixture exists so the tolerant path
+  is exercised rather than assumed: it is a valid ownership document wrapped in a default
+  namespace, and must parse to exactly the same values as the un-namespaced equivalent.
+
+  See tests/fixtures/sec/README.md.
+-->
+<ownershipDocument xmlns="http://www.sec.gov/edgar/ownership">
+    <schemaVersion>X0609</schemaVersion>
+    <documentType>4</documentType>
+    <periodOfReport>2026-04-10</periodOfReport>
+
+    <issuer>
+        <issuerCik>0000320193</issuerCik>
+        <issuerName>SYNTHETIC EXAMPLE CORP</issuerName>
+        <issuerTradingSymbol>SYN</issuerTradingSymbol>
+    </issuer>
+
+    <reportingOwner>
+        <reportingOwnerId>
+            <rptOwnerCik>0000000004</rptOwnerCik>
+            <rptOwnerName>DELTA DIRECTOR</rptOwnerName>
+        </reportingOwnerId>
+        <reportingOwnerRelationship>
+            <isDirector>1</isDirector>
+            <isOfficer>0</isOfficer>
+            <isTenPercentOwner>0</isTenPercentOwner>
+            <isOther>0</isOther>
+        </reportingOwnerRelationship>
+    </reportingOwner>
+
+    <aff10b5One>0</aff10b5One>
+
+    <nonDerivativeTable>
+        <nonDerivativeTransaction>
+            <securityTitle>
+                <value>Common Stock</value>
+            </securityTitle>
+            <transactionDate>
+                <value>2026-04-10</value>
+            </transactionDate>
+            <transactionCoding>
+                <transactionFormType>4</transactionFormType>
+                <transactionCode>S</transactionCode>
+            </transactionCoding>
+            <transactionAmounts>
+                <transactionShares>
+                    <value>3000</value>
+                </transactionShares>
+                <transactionPricePerShare>
+                    <value>123.4567890</value>
+                </transactionPricePerShare>
+                <transactionAcquiredDisposedCode>
+                    <value>D</value>
+                </transactionAcquiredDisposedCode>
+            </transactionAmounts>
+            <ownershipNature>
+                <directOrIndirectOwnership>
+                    <value>D</value>
+                </directOrIndirectOwnership>
+            </ownershipNature>
+        </nonDerivativeTransaction>
+    </nonDerivativeTable>
+
+    <derivativeTable></derivativeTable>
+    <footnotes></footnotes>
+    <remarks></remarks>
+</ownershipDocument>

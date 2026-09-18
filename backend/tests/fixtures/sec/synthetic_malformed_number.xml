@@ -1,0 +1,70 @@
+<?xml version="1.0"?>
+<!--
+  SYNTHETIC. Not a real SEC filing. Deliberately invalid.
+
+  The share count is not a number. The parser must refuse the whole document rather than
+  skipping this row and returning the rest as though it were complete; a filing that
+  silently loses a transaction is worse than one that fails loudly, because the loss is
+  invisible and the totals still look plausible.
+
+  See tests/fixtures/sec/README.md.
+-->
+<ownershipDocument>
+    <schemaVersion>X0609</schemaVersion>
+    <documentType>4</documentType>
+    <periodOfReport>2026-06-01</periodOfReport>
+
+    <issuer>
+        <issuerCik>0000320193</issuerCik>
+        <issuerName>SYNTHETIC EXAMPLE CORP</issuerName>
+        <issuerTradingSymbol>SYN</issuerTradingSymbol>
+    </issuer>
+
+    <reportingOwner>
+        <reportingOwnerId>
+            <rptOwnerCik>0000000007</rptOwnerCik>
+            <rptOwnerName>ETA BROKEN ROW</rptOwnerName>
+        </reportingOwnerId>
+        <reportingOwnerRelationship>
+            <isDirector>1</isDirector>
+            <isOfficer>0</isOfficer>
+            <isTenPercentOwner>0</isTenPercentOwner>
+            <isOther>0</isOther>
+        </reportingOwnerRelationship>
+    </reportingOwner>
+
+    <nonDerivativeTable>
+        <nonDerivativeTransaction>
+            <securityTitle>
+                <value>Common Stock</value>
+            </securityTitle>
+            <transactionDate>
+                <value>2026-06-01</value>
+            </transactionDate>
+            <transactionCoding>
+                <transactionFormType>4</transactionFormType>
+                <transactionCode>S</transactionCode>
+            </transactionCoding>
+            <transactionAmounts>
+                <transactionShares>
+                    <value>not-a-number</value>
+                </transactionShares>
+                <transactionPricePerShare>
+                    <value>10.00</value>
+                </transactionPricePerShare>
+                <transactionAcquiredDisposedCode>
+                    <value>D</value>
+                </transactionAcquiredDisposedCode>
+            </transactionAmounts>
+            <ownershipNature>
+                <directOrIndirectOwnership>
+                    <value>D</value>
+                </directOrIndirectOwnership>
+            </ownershipNature>
+        </nonDerivativeTransaction>
+    </nonDerivativeTable>
+
+    <derivativeTable></derivativeTable>
+    <footnotes></footnotes>
+    <remarks></remarks>
+</ownershipDocument>

@@ -35,18 +35,57 @@ services:
       # Host is "postgres" (the Compose service name), not localhost: inside the
       # Compose network each service is reachable by its service name.
       DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      # Market-data and SEC configuration. Passed explicitly because Compose does
+      # not inject .env into containers by itself -- without these two lines the
+      # backend would never see the values, and `docker compose exec backend ...`
+      # could not reach them either.
+      #
+      # `:-` supplies an empty default, so a machine with no key still starts, and
+      # Compose does not warn about an unset variable. Nothing reads them yet.
+      #
+      # Deliberately absent from the frontend service below: a key that reaches the
+      # browser is a key given away.
+      TWELVE_DATA_API_KEY: ${TWELVE_DATA_API_KEY:-}
+      SEC_USER_AGENT: ${SEC_USER_AGENT:-}
+      # Where FastEmbed keeps the embedding model it downloads.
+      #
+      # Set explicitly because FastEmbed's own default is `{tempdir}/fastembed_cache`,
+      # which is /tmp: not on a volume, and gone every time this container is recreated.
+      # With it pointing at the mounted volume below, the weights survive rebuilds.
+      FASTEMBED_CACHE_PATH: /models/fastembed
     ports:
       - "8000:8000"
     volumes:
       # Live source mount: edits on the Mac appear in the container immediately,
       # so changing code needs no rebuild at all (paired with --reload below).
       - ./backend:/app
+      # The embedding model, on a named volume. Without this the weights live in /tmp
+      # and every `docker compose up --build` re-downloads ~130 MB.
+      - model_cache:/models
     depends_on:
       postgres:
         # Don't start the backend until the postgres healthcheck passes.
         condition: service_healthy
+      # Deliberately NO dependency on qdrant. The requirement is that existing API
+      # startup neither downloads model weights nor requires Qdrant, and an edge here is
+      # the surest way to break the first half of that: the backend must come up and
+      # serve /health, /portfolio and the analysis whether or not Qdrant is running.
+      # Qdrant is reached lazily, by the commands that need it.
     # --reload restarts the app when a mounted source file changes.
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  qdrant:
+    image: qdrant/qdrant:v1.19.1
+    ports:
+      # Bound to 127.0.0.1, not published to the network. The backend reaches Qdrant by
+      # its service name over the Compose network, so nothing outside needs this; it is
+      # here only so the collection can be inspected from the Mac at localhost:6333
+      # (its dashboard is at /dashboard).
+      - "127.0.0.1:6333:6333"
+    volumes:
+      # Named volume at the path the image expects. Qdrant keeps everything -- collection
+      # configuration and vectors -- under here.
+      - qdrant_storage:/qdrant/storage
 
   frontend:
     build:
@@ -69,3 +108,8 @@ services:
 volumes:
   # Named volume, so data survives container restarts and rebuilds.
   postgres_data:
+  # The derived search index. Unlike postgres_data this can be thrown away and rebuilt
+  # from PostgreSQL, which stays authoritative.
+  qdrant_storage:
+  # The embedding model weights, so a container rebuild does not re-download them.
+  model_cache:

@@ -4,3 +4,11 @@ SQLAlchemy==2.0.54
 psycopg2-binary==2.9.13
 pydantic-settings==2.15.0
 alembic==1.20.0
+httpx==0.28.1
+fastembed==0.8.0
+qdrant-client==1.19.1
+# Pinned rather than left transitive. The container is aarch64, and whether a compatible
+# wheel exists is the thing this whole step depends on: onnxruntime-1.30.0 ships
+# cp312-manylinux_2_28_aarch64, but a future resolve picking a version without that wheel
+# would break the image build rather than the code, which is a much worse place to find out.
+onnxruntime==1.30.0
