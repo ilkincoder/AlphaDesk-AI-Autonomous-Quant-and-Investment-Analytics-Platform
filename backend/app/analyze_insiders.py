@@ -110,65 +110,83 @@ def main(argv: list[str] | None = None) -> int:
     return EXIT_OK
 
 
-def run(symbol: str, start: date | None, end: date | None) -> AnalysisResult:
-    """Read everything, then analyse. Nothing is read after `analyze` is called."""
-    with SessionLocal() as session:
-        company = _company_for(session, symbol)
+def run(
+    symbol: str, start: date | None, end: date | None, *, session: Session | None = None
+) -> AnalysisResult:
+    """Read everything, then analyse. Nothing is read after `analyze` is called.
 
-        if company is None:
-            stored = _stored_tickers(session)
-            today = date.today()
-            return unavailable_result(
-                symbol=symbol,
-                reason=UNAVAILABLE_NO_COMPANY,
-                requested_start=start or today,
-                requested_end=end or today,
-                note=(
-                    f"No company is stored under {symbol!r}. Stored tickers: "
-                    f"{', '.join(stored) if stored else 'none'}. Ingest a company before "
-                    "analysing it."
-                ),
-            )
+    `session` exists so a caller that already holds one -- the Module 1 tools, which must be
+    able to run inside a test's rolled-back transaction -- can supply it instead of this
+    function opening its own. With no session given, one is opened and closed here, which is
+    what the command line does.
+    """
+    if session is not None:
+        return _analyse(session, symbol, start, end)
 
-        coverage = _coverage(session, company.id)
-        series, series_reason = _price_series(session, company.id)
+    with SessionLocal() as owned:
+        return _analyse(owned, symbol, start, end)
 
-        if series is None:
-            today = date.today()
-            return unavailable_result(
-                symbol=symbol,
-                reason=series_reason or PRICE_REASON_NO_SERIES,
-                requested_start=start or today,
-                requested_end=end or today,
-                company_cik=company.cik,
-                company_name=company.name,
-                note=_series_note(series_reason),
-                coverage=coverage,
-            )
 
-        # No emptiness check here: the series above is derived from the stored rows, so a
-        # series that exists has at least one observation behind it. A company with no
-        # prices at all has no series and was already handled.
-        observations = _observations(session, company.id, series)
+def _analyse(
+    session: Session, symbol: str, start: date | None, end: date | None
+) -> AnalysisResult:
+    """The reads and the analysis, over a session the caller owns."""
+    company = _company_for(session, symbol)
 
-        # The dates actually used. When the caller gave none, the stored range decides --
-        # and the result reports both, so what was asked for and what was used cannot be
-        # confused.
-        requested_start = start or observations[0].trading_date
-        requested_end = end or observations[-1].trading_date
-        transactions = _transactions(session, company.id)
-
-        return analyze(
+    if company is None:
+        stored = _stored_tickers(session)
+        today = date.today()
+        return unavailable_result(
             symbol=symbol,
+            reason=UNAVAILABLE_NO_COMPANY,
+            requested_start=start or today,
+            requested_end=end or today,
+            note=(
+                f"No company is stored under {symbol!r}. Stored tickers: "
+                f"{', '.join(stored) if stored else 'none'}. Ingest a company before "
+                "analysing it."
+            ),
+        )
+
+    coverage = _coverage(session, company.id)
+    series, series_reason = _price_series(session, company.id)
+
+    if series is None:
+        today = date.today()
+        return unavailable_result(
+            symbol=symbol,
+            reason=series_reason or PRICE_REASON_NO_SERIES,
+            requested_start=start or today,
+            requested_end=end or today,
             company_cik=company.cik,
             company_name=company.name,
-            requested_start=requested_start,
-            requested_end=requested_end,
-            observations=observations,
-            transactions=transactions,
+            note=_series_note(series_reason),
             coverage=coverage,
-            price_series=series,
         )
+
+    # No emptiness check here: the series above is derived from the stored rows, so a
+    # series that exists has at least one observation behind it. A company with no
+    # prices at all has no series and was already handled.
+    observations = _observations(session, company.id, series)
+
+    # The dates actually used. When the caller gave none, the stored range decides --
+    # and the result reports both, so what was asked for and what was used cannot be
+    # confused.
+    requested_start = start or observations[0].trading_date
+    requested_end = end or observations[-1].trading_date
+    transactions = _transactions(session, company.id)
+
+    return analyze(
+        symbol=symbol,
+        company_cik=company.cik,
+        company_name=company.name,
+        requested_start=requested_start,
+        requested_end=requested_end,
+        observations=observations,
+        transactions=transactions,
+        coverage=coverage,
+        price_series=series,
+    )
 
 
 # --- reads ------------------------------------------------------------------------------

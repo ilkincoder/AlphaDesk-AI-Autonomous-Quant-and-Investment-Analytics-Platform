@@ -59,6 +59,15 @@ POINT_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "https://alphadesk.local/sec-fi
 _OVERFETCH_FACTOR = 4
 _MAX_QUERY_LIMIT = 100
 
+# The caveat that belongs on every set of retrieved passages. A module constant rather than an
+# inline string because the Module 1 tool layer reports the same sentence on outcomes that
+# return no passages at all, and copying it there would let the two drift apart.
+PASSAGES_ARE_EVIDENCE = (
+    "These are passages retrieved by similarity. That they were returned does not mean "
+    "the question is answered, and it says nothing about whether the filings held here "
+    "are complete."
+)
+
 # Retrieval statuses. Each is a different answer, and collapsing any two of them would make
 # the caller report something that is not true.
 STATUS_OK = "ok"
@@ -630,11 +639,7 @@ def search_filings(
             warnings=tuple(warnings),
         )
 
-    warnings.append(
-        "These are passages retrieved by similarity. That they were returned does not mean "
-        "the question is answered, and it says nothing about whether the filings held here "
-        "are complete."
-    )
+    warnings.append(PASSAGES_ARE_EVIDENCE)
     if len(passages) < top_k:
         warnings.append(
             f"{len(passages)} passage(s) were returned where {top_k} were asked for."

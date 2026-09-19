@@ -49,6 +49,29 @@ class Settings(BaseSettings):
     # `docker compose up --build` would re-download the model.
     fastembed_cache_path: str = "/models/fastembed"
 
+    # --- Module 1 agent -----------------------------------------------------------------
+    #
+    # DeepSeek, spoken to over its OpenAI-compatible chat-completions endpoint. The API key
+    # is optional for the same reason the Twelve Data key is: the API must start and serve
+    # every existing endpoint whether or not a key is present. Nothing here is read at
+    # import time -- the client is constructed inside the analysis run, by the code that
+    # actually needs it, and a missing key is that code's error to report.
+    #
+    # Read from DEEPSEEK_API_KEY. Never log it, never send it to the frontend, and never
+    # put it in a prompt.
+    deepseek_api_key: str | None = None
+
+    # The model and endpoint are settings rather than constants so a future model change is
+    # a configuration change, not a code change. Both defaults are the current documented
+    # values.
+    deepseek_model: str = "deepseek-flash"
+    deepseek_base_url: str = "https://api.deepseek.com"
+
+    # Seconds. A ceiling on one provider request, so an unreachable or stalled endpoint
+    # yields an error rather than a command that never returns. The run's own deadline is
+    # enforced separately, across all its requests.
+    deepseek_timeout_seconds: float = 60.0
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 

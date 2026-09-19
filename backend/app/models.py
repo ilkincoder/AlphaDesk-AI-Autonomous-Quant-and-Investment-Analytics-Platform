@@ -647,3 +647,164 @@ class FinancialFact(Base):
     fiscal_year: Mapped[int | None] = mapped_column()
     fiscal_period: Mapped[str | None] = mapped_column(String(8))
     frame: Mapped[str | None] = mapped_column(String(32))
+
+
+class Conversation(Base):
+    """One conversation: a sequence of turns about a company, carried across requests.
+
+    The row holds two things beyond its identity: **the settled context** the run has agreed
+    on (which company, which market window, what was knowable) and **the pending
+    clarification** if the last turn ended by asking the user something. Both are what makes
+    a follow-up turn continue the earlier request instead of starting a new one.
+
+    **`processing_turn_id` is a lease, not a lock.** A turn claims the conversation by writing
+    its own id and a deadline here; it releases the claim when it finishes, and only if the
+    claim is still its own -- so a turn that overran its deadline cannot come back later and
+    overwrite context that a newer turn has already moved on from. Nothing holds a database
+    transaction open while a model is thinking: the claim is committed, and the model call
+    happens with no transaction in flight at all.
+
+    A conversation id separates conversations from each other. It is **not** an authorization
+    boundary -- see the README on what this local, single-user build does not provide.
+    """
+
+    __tablename__ = "conversations"
+    __table_args__ = (
+        # The claim and its deadline are written together or not at all. A turn id with no
+        # deadline would be a claim nothing could ever expire.
+        CheckConstraint(
+            "(processing_turn_id IS NULL) = (processing_deadline IS NULL)",
+            name="ck_conversations_lease_is_whole",
+        ),
+        # A pending clarification is a question, the date it was asked about, and what was
+        # missing. Any one of them without the others cannot be resumed.
+        CheckConstraint(
+            "(pending_question IS NULL) = (pending_reference_date IS NULL)",
+            name="ck_conversations_pending_is_whole",
+        ),
+    )
+
+    # A uuid4 hex, generated here rather than by the client. Not a sequence: a small integer
+    # would let anyone holding one id read the neighbouring conversations by guessing.
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    # --- the settled context, carried forward -------------------------------------------
+    #
+    # Nullable throughout: a conversation that has only ever been greeted has settled nothing.
+    settled_symbol: Mapped[str | None] = mapped_column(String(20))
+    settled_start_date: Mapped[date | None] = mapped_column(Date)
+    settled_end_date: Mapped[date | None] = mapped_column(Date)
+    settled_as_of: Mapped[date | None] = mapped_column(Date)
+
+    # --- the pending clarification, if the last turn asked one ---------------------------
+    #
+    # `pending_question` is the *original* analytical question, not the reply. A reply of
+    # "August 6 to September 17" means nothing on its own; what it answers is the question
+    # that came before it, and that is what has to be resumed.
+    pending_question: Mapped[str | None] = mapped_column(Text)
+    # The reference date the original question was asked against. Kept so a reply arriving
+    # days later still resolves "last quarter" against the date it was actually asked about,
+    # rather than silently sliding to today.
+    pending_reference_date: Mapped[date | None] = mapped_column(Date)
+    # What the Supervisor asked for, so a resume can restate it.
+    pending_asked_for: Mapped[str | None] = mapped_column(Text)
+
+    # --- the lease ------------------------------------------------------------------------
+    processing_turn_id: Mapped[str | None] = mapped_column(String(32))
+    processing_deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    turns: Mapped[list["ConversationTurn"]] = relationship(
+        back_populates="conversation",
+        order_by="ConversationTurn.sequence",
+        cascade="all, delete-orphan",
+    )
+
+
+class ConversationTurn(Base):
+    """One user message and what came back.
+
+    Written in two steps, deliberately. The row is **committed before the analysis starts**,
+    so a client that retries, or a second request that arrives while this one is running, can
+    see that the turn exists and what state it is in. The result is written afterwards, in a
+    second short transaction that also updates the conversation's carried context.
+
+    **The evidence lives inside `result`, scoped to this turn's run.** An `E1` in one turn's
+    citation list belongs to that turn's run and is meaningless anywhere else; nothing ever
+    merges evidence across turns, so one run's `E1` cannot resolve to another's.
+
+    `status` is deliberately not constrained to a list. The run's vocabulary
+    (`app/agent/run.py`) grows as the analysis does, and a status that needed a migration to
+    be recorded would be a status somebody records wrongly instead. Everything written here
+    comes from that module's constants.
+    """
+
+    __tablename__ = "conversation_turns"
+    __table_args__ = (
+        # One request id means one turn, per conversation. This is the constraint the whole
+        # duplicate-suppression story rests on: a retry cannot create a second turn, so it
+        # cannot cause a second paid analysis.
+        UniqueConstraint(
+            "conversation_id", "request_id", name="uq_conversation_turns_request"
+        ),
+        # Turns are ordered by this, and two turns cannot share a place in the order.
+        UniqueConstraint(
+            "conversation_id", "sequence", name="uq_conversation_turns_sequence"
+        ),
+        # History is read newest-first for a page and oldest-first for the context window.
+        Index(
+            "ix_conversation_turns_conversation_id_sequence",
+            "conversation_id",
+            "sequence",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE")
+    )
+    # Chosen by the client so it can retry safely. Unique within the conversation, not
+    # globally: two clients that both start at "1" are not in conflict.
+    request_id: Mapped[str] = mapped_column(String(64))
+    # 1-based position in the conversation, assigned by the server.
+    sequence: Mapped[int] = mapped_column()
+
+    user_message: Mapped[str] = mapped_column(Text)
+    # What the client stated outright for this turn, if anything. These are authoritative for
+    # the turn; the conversation's settled context is only a default it can override.
+    request_symbol: Mapped[str | None] = mapped_column(String(20))
+    request_start_date: Mapped[date | None] = mapped_column(Date)
+    request_end_date: Mapped[date | None] = mapped_column(Date)
+    request_as_of: Mapped[date | None] = mapped_column(Date)
+    # The date relative periods were resolved against. Server-supplied, and for a resumed
+    # clarification it is the *original* date, not today's.
+    reference_date: Mapped[date] = mapped_column(Date)
+
+    status: Mapped[str] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # When an unfinished turn stops being believed. Past this, a new request recovers the
+    # conversation instead of being told to wait for work that is no longer happening.
+    processing_deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    # The analysis run this turn produced, if one ran.
+    run_id: Mapped[str | None] = mapped_column(String(64))
+    # The Supervisor's answer, including a clarification question. Null when there is none.
+    answer: Mapped[str | None] = mapped_column(Text)
+
+    # What this turn resolved to, so a later turn can carry it forward without re-deriving it.
+    resolved_symbol: Mapped[str | None] = mapped_column(String(20))
+    resolved_start_date: Mapped[date | None] = mapped_column(Date)
+    resolved_end_date: Mapped[date | None] = mapped_column(Date)
+    resolved_as_of: Mapped[date | None] = mapped_column(Date)
+
+    # The public structured result: citations with their filing metadata, the evidence list,
+    # limitations, tool statuses and usage. Public on purpose -- no prompt text, no model
+    # reasoning, no credentials. A failure's message is sanitised before it gets here.
+    result: Mapped[dict | None] = mapped_column(JSONB)
+    # Why the turn did not complete, in a sentence a user could be shown. NULL when it did.
+    failure: Mapped[str | None] = mapped_column(Text)
+
+    conversation: Mapped["Conversation"] = relationship(back_populates="turns")

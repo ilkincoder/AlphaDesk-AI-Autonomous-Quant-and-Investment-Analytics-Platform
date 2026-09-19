@@ -1,8 +1,9 @@
 /** Application shell navigation.
  *
- * Ten destinations, two of which exist. Portfolio and What if? are real pages; the other
- * eight are rendered as genuinely disabled buttons with a "Coming soon" description,
- * because a link that navigates nowhere is worse than a link that says it cannot.
+ * Ten destinations, three of which exist. Analysis, Portfolio and What if? are real pages;
+ * the other seven are rendered as genuinely disabled buttons with a "Coming soon"
+ * description, because a link that navigates nowhere is worse than a link that says it
+ * cannot.
  */
 
 import { useEffect, useRef, useState } from 'react'
@@ -24,7 +25,7 @@ import {
 
 /** The pages that exist. Declared here because this file owns the list of destinations;
  *  `App` holds whichever one is current. */
-export type PageId = 'portfolio' | 'what-if'
+export type PageId = 'analysis' | 'portfolio' | 'what-if'
 
 type NavItem = {
   label: string
@@ -36,7 +37,7 @@ type NavItem = {
 
 const NAV_ITEMS: NavItem[] = [
   { label: 'Dashboard', Icon: DashboardIcon },
-  { label: 'Analysis', Icon: AnalysisIcon },
+  { id: 'analysis', label: 'Analysis', Icon: AnalysisIcon },
   { id: 'portfolio', label: 'Portfolio', Icon: PortfolioIcon },
   { id: 'what-if', label: 'What if?', Icon: WhatIfIcon },
   { label: 'Strategies', Icon: StrategiesIcon },

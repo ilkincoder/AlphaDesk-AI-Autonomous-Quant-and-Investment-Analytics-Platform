@@ -30,5 +30,8 @@ export default defineConfig({
     // @testing-library/react registers its automatic cleanup through the global
     // afterEach, which only exists when this is on.
     globals: true,
+    // jsdom has no layout, so the scrolling methods the components use do not exist there.
+    // Stubbed once, here, rather than guarded for in every component.
+    setupFiles: ['./src/testSetup.ts'],
   },
 })

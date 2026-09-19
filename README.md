@@ -36,7 +36,7 @@ reach its database should not report itself as healthy.
 None of that changed as the schema grew, and none of it will: the tables behind Module 1
 have no endpoint, and nothing a command writes is served on this page.
 
-Eight commands have since arrived, none of them a route. `python -m app.fetch_prices` fetches
+Ten commands have since arrived, and then the first routes that are not about portfolios. `python -m app.fetch_prices` fetches
 Twelve Data daily bars, `python -m app.fetch_sec` fetches SEC Form 4 filings, and
 `python -m app.ingest_nvda` fetches both and **stores** them — `python -m app.ingest_company`
 does the same for any issuer named on the command line, and is the command that implements
@@ -44,8 +44,14 @@ both. `python -m app.analyze_insiders` reads that back and describes it.
 `python -m app.ingest_company_context` stores a bounded set of disclosures — a 10-K, a 10-Q,
 recent 8-Ks, their earnings exhibits and selected financial facts — with the readable text of
 each. `python -m app.index_filings` embeds that text into Qdrant, and
-`python -m app.search_filings` retrieves passages from it. Every endpoint on this page behaves
-exactly as it did before, and none of them reads any of it yet.
+`python -m app.search_filings` retrieves passages from it. `python -m app.tools` invokes one
+of the four typed analysis tools below, and `python -m app.run_analysis` is the Module 1 agent:
+it takes a question and answers it from all of that.
+
+Step 9 gave that agent an HTTP surface and a memory — three routes under `/analysis`, and two
+tables holding what a conversation settled and what it is waiting to be told. Step 10 put it in
+front of a person: the **Analysis** page at `http://localhost:5173`. The portfolio endpoints on
+this page behave exactly as they did before, and still read none of it.
 
 ### Database schema
 
@@ -330,11 +336,14 @@ Everything is read from `.env`.
 | `POSTGRES_USER` `POSTGRES_PASSWORD` `POSTGRES_DB` | yes | the local database — see the notes at the top of `.env.example` |
 | `TWELVE_DATA_API_KEY` | **no** | a Twelve Data key, read by the price client — see "Fetching daily prices" |
 | `SEC_USER_AGENT` | **no** | the User-Agent EDGAR requires: application name plus a contact address — see "Fetching insider filings" |
+| `DEEPSEEK_API_KEY` | **no** | the key the Module 1 agent uses. **A real secret** — leave it empty in `.env.example` and put the value in `.env`, which is not committed |
+| `DEEPSEEK_MODEL` | no | defaults to `deepseek-flash` |
+| `DEEPSEEK_BASE_URL` | no | defaults to `https://api.deepseek.com` |
 
-Both are optional at startup, and that is deliberate: a missing provider setting must never
-stop `/health`, `/portfolio`, or `/portfolio/valuation` from starting. The components that
-do call a provider report their own missing configuration, in their own words, and only
-when they are actually run:
+The three provider settings are all optional at startup, and that is deliberate: a missing
+provider setting must never stop `/health`, `/portfolio`, or `/portfolio/valuation` from
+starting. The components that do call a provider report their own missing configuration, in
+their own words, and only when they are actually run:
 
 ```
 error: No Twelve Data API key is configured. Set TWELVE_DATA_API_KEY in .env, then run: docker compose up -d backend
@@ -453,14 +462,14 @@ silently on every boot.
 docker compose exec backend alembic upgrade head
 ```
 
-That runs every migration not yet applied. Today there are two — `0001`
-(`portfolios`, `holdings`) and `0002` (`companies`, `daily_prices`, `sec_filings`,
-`insider_transactions`, `insider_reporting_owners`) — for seven tables in all.
-`alembic current` prints the revision the database is on:
+That runs every migration not yet applied. There are nine, adding sixteen tables in all: the
+portfolio, then the market and filing data, the ingestion receipts, the disclosures and financial
+facts, the search index manifest, and finally the two conversation tables. `alembic current`
+prints the revision the database is on:
 
 ```bash
 docker compose exec backend alembic current
-# 0002_market_data_and_filings (head)
+# 0009_conversations (head)
 ```
 
 **2. Seed the demo portfolio** (inserts the data):
@@ -1716,6 +1725,853 @@ They measure whether retrieval finds what is there, not whether it would find wh
 asks.
 
 
+## Analysis tools (step 7A)
+
+Everything above exists as a hand-written command, and each command decides for itself what
+"I could not answer that" means. A language model cannot call a command, and it must not have
+to read a warning list to discover that a number is missing. So the work is now also behind
+four callable functions with validated arguments and one shared vocabulary for their answers.
+
+**These are tools, not an agent.** Nothing here calls a model, and no new endpoint exists.
+Step 7B binds these four to a Module 1 LLM; this step builds and verifies them so that 7B is
+wiring rather than judgement calls about data semantics.
+
+They live in `app/tools/`. `python -m app.tools list` prints them.
+
+| Tool | Answers | Wraps |
+|---|---|---|
+| `market_insider_analysis` | How did the price move, and what did insiders report, over a window? | `app.analyze_insiders` reads + `app.analysis` rules |
+| `company_financial_facts` | What did the company report for one metric in one period? | a read over `financial_facts` ⋈ `sec_filings` |
+| `filing_evidence_search` | What do the indexed filings say about this question? | `app.filing_index.search_filings` |
+| `portfolio_context` | Is this symbol held, how much, and what is the portfolio worth? | `app.valuation.calculate_valuation` + `DEMO_PRICES` |
+
+No tool places an order, recommends anything, scores anything, or writes a row. Every statement
+any of them issues is a `SELECT`.
+
+### One envelope, four statuses
+
+Every call returns the same shape: `tool`, `status`, `reason`, `symbol`, `as_of`,
+`information_cutoff`, `warnings`, and `data`.
+
+```json
+{
+  "tool": "market_insider_analysis",
+  "status": "ok",
+  "reason": null,
+  "symbol": "NVDA",
+  "as_of": "2026-09-17",
+  "information_cutoff": "2026-09-18T04:00:00Z",
+  "warnings": ["Retrospective analysis over currently stored data. ..."],
+  "data": { "...": "the payload" }
+}
+```
+
+`status` says whether the tool could **do its job**, never what the data means:
+
+| Status | Meaning | Exit code |
+|---|---|---|
+| `ok` | Ran, and everything asked for is present | 0 |
+| `partial` | Ran and has data, but something was withheld — `reason` says what | 0 |
+| `unavailable` | Ran correctly; the store holds nothing that answers it | 0 |
+| `failed` | Could not run: database, index or model unreachable | 1 |
+
+That is why the exit code is not just 0 or 1, and why `0` is not the same as "there is data".
+`unavailable` is an *answer* — "we hold no prices for that symbol" is a fact about this
+database — and it accounts for a large share of honest questions here. `failed` claims nothing
+about the data at all, and `data` is `null` on both so an error can never be read as a result.
+
+**`insufficient_coverage` is not a status.** It is this project's standing conclusion about a
+bounded sample, and it lives inside the payload. A call that returns it is `ok` or `partial` —
+treating it as a failure would make every honest answer look like an error.
+
+A rejected argument is none of the four: validation happens before anything is read, so an
+invalid request raises and touches neither the database nor the index.
+
+### What each tool takes, and what it will not do
+
+**`market_insider_analysis`** — `symbol`, `start_date`, `end_date`, all required.
+
+Both dates are required on purpose. The command line defaults a missing date to the stored
+range; this does not, and nothing is widened to fit what happens to be stored. `end_date` is
+also what the information cutoff is derived from, through the existing
+`analysis.information_cutoff`. The payload reports the requested window, the dates actually
+used, `stored_price_availability` (the first and last price date this database holds at all),
+the provider and adjustment mode, the first and last close and the calculated return, the
+eligible purchases and sales with reported values, the excluded rows and why, the sample
+comparison, and the overall conclusion. The per-row transaction listing is capped at 50 with
+`included_transactions` giving the full count — the counts and the money totals are always
+complete.
+
+```bash
+docker compose exec backend python -m app.tools market_insider_analysis \
+    --symbol NVDA --start 2026-08-06 --end 2026-09-17
+docker compose exec backend python -m app.tools market_insider_analysis \
+    --symbol AAPL --start 2026-08-06 --end 2026-09-17
+```
+
+**`company_financial_facts`** — `symbol`, `metric`, `as_of` required; `period_start`,
+`period_end`, `accession_number`, `unit`, `candidate_limit` optional.
+
+`metric` is one of `revenue`, `revenue_contract_with_customer`, `net_income`, `total_assets`,
+`total_liabilities`, `cash_and_cash_equivalents` — the six concepts already mapped in
+`app.company_facts`. Because one metric selects exactly one concept, the two revenue concepts
+cannot be combined or summed by accident. Each observation carries its exact taxonomy concept,
+unit, value, period start and end, the reporting accession and form, the source URL, and the
+filing's acceptance timestamp.
+
+| Situation | Status |
+|---|---|
+| Exactly one observation matches and was accepted before the cutoff | `ok`, `selection: "single"` |
+| Several match — a quarter and a year-to-date figure sharing an end date | `partial`, `selection: "multiple_candidates"`, all listed |
+| Some matched but could not be shown to be public by the cutoff | `partial`, each listed in `excluded` with a reason |
+| The concept has no stored observation | `unavailable`, `concept_not_in_stored_sample` |
+| Nothing matches the requested period, unit or filing | `unavailable`, `no_observation_matches_selection` |
+
+```bash
+docker compose exec backend python -m app.tools company_financial_facts \
+    --symbol NVDA --metric revenue --as-of 2026-09-17 \
+    --period-start 2026-04-27 --period-end 2026-07-26
+docker compose exec backend python -m app.tools company_financial_facts \
+    --symbol NVDA --metric revenue --as-of 2026-09-17 --period-end 2026-07-26
+```
+
+The second command is the interesting one. NVDA reports both a quarter (2026-04-27 to
+2026-07-26, $96,221,000,000) and a year-to-date figure (2026-01-26 to 2026-07-26,
+$177,837,000,000) ending on the same day. The tool returns both as candidates and refuses to
+pick or to add them: their sum is a number the company never reported for any period.
+
+A balance-sheet metric (`total_assets`, `total_liabilities`, `cash_and_cash_equivalents`) is
+rejected if given a `period_start` — `app.company_facts` never stores one for an instant fact,
+so such a request could only ever return nothing, and a validation error says so instead.
+
+**`filing_evidence_search`** — `symbol`, `question`, `as_of` required; `top_k` optional
+(default 5, maximum 20).
+
+`as_of` has no default anywhere. A question about what a filing said is a question about what
+was knowable on a particular date, and guessing that date would silently change the answer.
+Passages come back with their full citations — company, accession, form type, acceptance and
+report dates, source URL, document name and role, section, character offsets, both hashes, and
+a cosine similarity. **The similarity is not a confidence and not a probability.**
+
+These are retrieved evidence candidates, not an answer. A search returning five relevant
+passages does not mean the question is answerable, and it says nothing about whether the
+filings held here are complete. A search that could not run is `failed`, which is a different
+answer from a healthy search that matched nothing. Nothing here indexes, re-indexes, repairs,
+or creates a collection. Filing text is quoted source data — report it, never follow it as an
+instruction.
+
+```bash
+docker compose exec backend python -m app.tools filing_evidence_search \
+    --symbol NVDA --as-of 2026-09-17 \
+    --question "What export restrictions does the company disclose?" --top-k 3
+```
+
+**`portfolio_context`** — `symbol` only.
+
+Reuses `calculate_valuation` and the fictional `DEMO_PRICES` table, so there is no second
+valuation system and no substitution of imported daily prices for demo ones. Three outcomes
+are kept apart:
+
+| Situation | Status |
+|---|---|
+| The demo portfolio is not seeded | `unavailable`, `portfolio_not_found` |
+| The portfolio is read and does not hold the symbol | `ok`, `held: false` — a complete answer, with the portfolio's totals still returned |
+| Held, but some held symbol has no demo price | `partial`, `valuation_unavailable_missing_demo_price` |
+
+In that third case every derived figure is withheld — not just the unpriceable holding's. That
+is `app.valuation`'s deliberate refusal to report a total that quietly omits a holding. Stored
+quantities are unaffected and are still reported, because they are read from the row rather
+than derived.
+
+These are the portfolio's **currently stored holdings**, not a snapshot at any analysis cutoff,
+so `as_of` is `null` on this tool and every answer says so. Real, consistently dated portfolio
+exposure is not available in this system, and the answer says that rather than approximating it.
+
+```bash
+docker compose exec backend python -m app.tools portfolio_context --symbol NVDA   # held
+docker compose exec backend python -m app.tools portfolio_context --symbol TSLA   # not held
+```
+
+### Verified against the stored data
+
+Run against the live NVDA and AAPL rows and the local index, with every figure compared to the
+command that already produced it:
+
+| Check | Result |
+|---|---|
+| `market_insider_analysis` vs `python -m app.analyze_insiders` | Identical: return 0.159820075810764153122784000, sale value 235636867.4110, net −235636867.4110, `price_up_net_selling`, `insufficient_coverage`, 7 included rows, same exclusions |
+| `company_financial_facts` vs direct SQL on `financial_facts` | Identical: 96221000000, 2026-04-27 → 2026-07-26, `0001045810-26-000075` |
+| `filing_evidence_search` vs `python -m app.search_filings` | Identical passages, sections, similarities and text |
+| `portfolio_context` vs `GET /portfolio/valuation` | Identical: total 16100.00, holdings 6100.00, same holding order |
+| A returned citation, resolved end to end | Document id, both hashes and source URL match the stored `filing_documents` row and its manifest; the offsets slice the stored text exactly; acceptance 2026-08-26 is inside the cutoff 2026-09-18 |
+
+Two data limitations worth knowing before reading any of it:
+
+- **The stored financial sample is one 10-K and one 10-Q per company.** "No stored observation"
+  always means "not in this sample". It is never a statement that the company did not report it,
+  and the warning says so in those words.
+- **A company's two price series would be refused, not chosen between.** No stored company has
+  more than one today, so the tool reports the series it used and the analysis stops if it ever
+  finds two. There is no argument for selecting one, deliberately: which series to analyse is a
+  choice a person should make, not something to guess.
+
+
+## The Module 1 agent and the Supervisor (steps 7B and 8)
+
+Everything above is either stored data or a command that reads it. This is the part that
+answers a question: a Supervisor decides what kind of request it is, a Module 1 agent picks
+tools and reads this system's data, and the Supervisor writes the answer from what came back.
+
+```bash
+docker compose exec backend python -m app.run_analysis \
+    --question "Compare the price movement with reported insider activity, explain relevant filing risks, and relate this to my demo holdings." \
+    --symbol NVDA --start-date 2026-08-06 --end-date 2026-09-17 --as-of 2026-09-17
+```
+
+`--symbol`, `--start-date`, `--end-date` and `--as-of` are all optional. Leave them out and the
+Supervisor settles them from the question and `--reference-date` (which defaults to today).
+Pass them and they are **authoritative**: a question that disagrees with them produces a
+clarification request rather than a guess in either direction. `--start-date` and `--end-date`
+must be given together — the market tool needs a window, and half of one is not a question
+anybody can answer. Add `--json` for the whole structured result instead of the readable form.
+
+### What actually happens
+
+```
+question ──→ Supervisor (route) ──┬─→ clarification_needed      (asks the user)
+                                  ├─→ unsupported_capability    (explains what is not available)
+                                  ├─→ simple_response           (answers conversationally)
+                                  └─→ module1_analysis
+                                            │
+                        Module 1 agent ── decide ⇄ act ──→ four read-only tools
+                                            │
+                                        summarise  (structured findings)
+                                            │
+                              Supervisor (compose) ──→ final answer
+```
+
+**The Supervisor versus the Module 1 agent.** They are two roles with two jobs, and the split
+is deliberate.
+
+The **Supervisor** decides *what kind of thing is being asked* and writes the prose the user
+reads. It has no tools at all. That is the point: it cannot answer a company question from its
+own memory of that company, because it has nothing to answer from — it can only route to the
+agent that reads this system's data, or tell the user why it cannot.
+
+The **Module 1 agent** decides *which tool to call and what to look for*, and reports what came
+back. It does not write the user's answer. It has exactly four tools and no other capability:
+no SQL, no shell, no code execution, no fetching, no writes.
+
+Both are run on the same model (`deepseek-flash`), with separate prompts, because that is the
+cheapest thing that works. Nothing about the design depends on them being the same model.
+
+### What the model is not trusted with
+
+This is the part worth reading. Model output is a suggestion everywhere except the two things
+a model is actually good at — choosing what to look at, and writing prose.
+
+| The model chooses | The application decides |
+|---|---|
+| Which tools to call, and what to search for | Which company the run is about |
+| The metric and period for a financial figure | The market window |
+| The wording of the answer | What was knowable (the information cutoff) |
+| | Which evidence exists, and its reference IDs |
+| | URLs, accessions, sections and similarity scores |
+
+Before any tool call is executed, it is checked against the run's settled request. A call that
+names a different company, a different market window, or a later information cutoff is
+**refused**, and the refusal goes back to the model as a short correctable message. An earlier
+cutoff is allowed — that is a strictly more conservative question about what was knowable — but
+a later one is not, because it would read filings that were not public at the moment being
+analysed. A tool name that is not one of the four is refused before anything is looked up.
+
+The financial tool's `period_start` and `period_end` are deliberately **not** constrained by
+the market window. A reporting period routinely precedes the window being asked about: a
+quarter ending 27 June is discussed in September. Conflating the two would make the tool
+useless for exactly the questions it exists to answer.
+
+### Evidence, and what a citation proves
+
+Every tool result is recorded in an application-owned evidence map, and each citable thing gets
+a reference: `E1`, `E2`, … A filing search contributes one reference **per passage**, because a
+passage is what a citation points at. The map stores its own accession number, form type,
+section, source URL, offsets and similarity — all read out of the retrieval result, which read
+them out of the index and the manifest. Nothing in a citation ever comes from the model's prose.
+
+The Supervisor is told to cite with `[E2]`. The application then extracts the cited references
+and checks them against the map. A reference that does not exist gets **one** correction
+request; if the answer still cites something invented, the answer is **withheld** and the run
+reports `invalid_citations`. The application never rewrites the prose itself — inventing a
+citation to replace an invented citation would be the same mistake with more confidence.
+
+**Valid citation IDs do not prove the prose is factually supported.** They prove that every
+reference the answer names corresponds to something a tool actually returned. Whether the
+sentences around those references say what the evidence says is a different question, and this
+code cannot answer it. The live demonstrations below were checked by reading the claims against
+the tool outputs by hand, which is what that question takes.
+
+### Limits, all enforced in code
+
+| Limit | Default | Where it bites |
+|---|---|---|
+| Model requests per run | 12 | routing, each agent turn, findings, composition, retries |
+| Tool executions per run | 10 | the agent's `act` step |
+| Output tokens per request | 1500 | sent as `max_tokens` |
+| Output tokens for findings | 3000 | that step must restate every warning; 1500 truncated it |
+| Characters per tool result | 12000 | trimmed by value, never by dropping a warning |
+| Overall deadline | 180 s | checked before every request and tool call |
+| Transient retries | 2 | rate limits, timeouts, 5xx — and nothing else |
+
+None of these is a sentence in a prompt. A model asked to "be brief" is being asked politely;
+a model that has run out of tool calls is stopped. Reaching a limit ends the run with
+`budget_exhausted` and says which one, and everything gathered before that is still reported.
+
+Authentication failures are never retried — a wrong key stays wrong. A provider that stays down
+after its retries is reported as `provider_failed`, **not** as budget exhaustion, because
+naming the wrong cause sends a reader looking in the wrong place.
+
+An identical tool call repeated in one run is not executed again: the previous result still
+applies, so it is reused and marked `reused_previous_result`. It does not spend a tool call.
+
+### Dates
+
+Relative periods are resolved **in code** from the reference date, never by the model's
+arithmetic. A model asked to work out "the last 30 days before 17 September" will usually be
+right and will occasionally be confidently wrong, and a price comparison over the wrong window
+looks exactly like one over the right window. So the model returns a token and this table
+decides:
+
+| Token | Window |
+|---|---|
+| `last_7_days` / `last_30_days` / `last_90_days` | The N calendar days ending on the reference date, inclusive |
+| `year_to_date` | 1 January of the reference year through the reference date |
+| `last_quarter` | The previous complete calendar quarter |
+| `explicit` | Dates the question or the arguments stated outright |
+| `none` | No window — only valid when no tool needs one |
+
+`as_of` defaults to the end of the market window, or to the reference date when there is no
+window. **The stored sample's dates are never substituted for the requested ones.** If you ask
+about a window this database has no prices for, the tools say so and the answer carries that
+limitation; widening the window to meet the data would turn a thin answer into a confident
+wrong one.
+
+### Statuses
+
+| Status | Meaning | Exit code |
+|---|---|---|
+| `completed` | An answer was written | 0 |
+| `clarification_needed` | The request could not be settled; the answer is the question to ask | 0 |
+| `unsupported_capability` | Not something this system does, or a company it holds no data for | 0 |
+| `invalid_citations` | The answer cited evidence that does not exist and was withheld | 1 |
+| `budget_exhausted` | A limit was reached before an answer | 1 |
+| `provider_failed` | DeepSeek could not be used | 1 |
+| `configuration_error` | No API key, or the stored companies could not be read | 1 |
+
+Tool unavailability and partial analysis are **not** statuses. They are in the evidence and the
+tool log, exactly as they are in Step 7A — a `partial` tool result inside a `completed` run is
+how a thin answer looks, and it is not an error.
+
+### What is sent to DeepSeek
+
+The question, the explicit arguments, the four tool descriptions, the resolved dates, and the
+tool results. Those results include SEC filing passages, reported financial figures, insider
+transaction totals, and the demo portfolio's holdings and valuation.
+
+**The local index stays local.** The embedding model and Qdrant run here; retrieval happens
+here, and only the passages it returns are sent. The API key is read from the environment,
+never logged, never sent to the frontend, and never placed in a prompt.
+
+### Live demonstrations
+
+Three runs against the real API, with every claim in each answer checked back against the tool
+outputs it cited. Reference date 2026-09-17 throughout.
+
+**1. NVDA — price, insiders, filing risks, and the demo holding.** All three tool families.
+
+```
+status      completed          tools  market_insider_analysis ok
+symbol      NVDA                      filing_evidence_search ok (2 calls)
+window      2026-08-06 → 2026-09-17    portfolio_context      ok
+6 model requests, 4 tool calls, ~42k tokens, 26s
+```
+
+The answer reported 218.99001 → 219.34000 (+0.16%), 0 purchases and 7 sales totalling
+$235,636,867.41, `price_up_net_selling` with `overall_conclusion: insufficient_coverage`, the
+coverage note that 1,001 filings were scanned and 1,478 older ones were not, the 10 NVDA shares
+at a demo 150.00 valuing 1,500.00 and 9.32% of the portfolio, and the 10-K's "31% of our
+revenue in fiscal year 2026 from sales outside the United States". Every one of those was
+checked against `E1`–`E12` and matched, including the two quoted sentences.
+
+It also did the thing the design is for: it separated observation from interpretation, refused
+to read `price_up_net_selling` as a signal because the tool's own conclusion is
+`insufficient_coverage`, and explicitly refused to combine the fictional demo price with the
+stored daily closes.
+
+**2. AAPL — a reported figure and filing evidence.** No window, no `--symbol`, so the
+Supervisor settled both from the question.
+
+```
+status      completed          symbol AAPL      period none (no market window needed)
+tools       company_financial_facts unavailable, then ok
+            filing_evidence_search ok (2 calls)
+7 model requests, 4 tool calls, ~42k tokens, 30s
+```
+
+Its first financial-facts call asked for a period that is not stored and was told so; it then
+asked for the metric alone and got the quarter. The answer reported revenue from contracts with
+customers of $109,417,000,000 for 2026-03-29 → 2026-06-27 from the 10-Q `0000320193-26-000020`
+— which is exactly what the tool returned — and handled the `unavailable` result for the
+`Revenues` concept the way the rules require: *"an absence from the stored sample, not a
+reported zero and not a statement that Apple never reported it."*
+
+**3. TSLA — absent from the stored sample.**
+
+```
+status      unsupported_capability
+reason      Tesla (TSLA) is not among the companies with stored data (AAPL, NVDA)
+2 model requests, 0 tool calls, ~3k tokens, 3s
+```
+
+Refused without spending a tool call, because the stored company list is in the Supervisor's
+prompt. The answer named what *is* available and offered the two companies it holds, and said
+plainly that this is a limit of the data rather than a fact about Tesla. Asked about a company
+this system has never ingested, it did not answer from the model's own knowledge — which is the
+property the whole design is for.
+
+### Failure modes worth knowing
+
+Two that were found by running it, and are now covered by tests:
+
+- **The findings step must not be one more turn of the agent's conversation.** It was, at
+  first. Given several thousand characters of tool results and an agent that had been asked to
+  analyse things, the model answered by writing the report — ignoring the JSON instruction and
+  `response_format` with it. It now runs as its own short conversation built from the
+  application's own records, with passages excerpted. That is both what it obeys and several
+  times cheaper.
+- **Tool warnings are collected from the execution log, not from the model's summary.** The
+  first live run lost `insufficient_coverage` between the tools and the answer, because the
+  findings step failed and the warnings only existed inside it. They are now recorded on the
+  run's own tool log and reach the answer regardless of what any model step does.
+
+## The analysis chat (step 9)
+
+The CLI answers one question and forgets it. The chat API answers a question, remembers what
+was said, and — the part that matters — lets you answer a *question the Supervisor asked you*.
+
+```bash
+docker compose exec backend alembic upgrade head    # adds the two conversation tables
+```
+
+That migration is `0009_conversations`. It is purely additive: nothing existing is altered and
+no row is touched. The two new tables are empty on a fresh apply, and without it `/analysis/chat`
+returns 500 with `relation "conversations" does not exist` — which is how the mistake announces
+itself.
+
+### Why a conversation is not just a transcript
+
+The Supervisor routinely answers with a question of its own. Ask *"Compare NVDA's price movement
+with insider activity"* and it will not guess a period — it asks which one you meant, because a
+price-and-insider comparison over seven days and over ninety are different answers.
+
+Without a conversation that question goes nowhere. The reply *"August 6 through September 17,
+2026"* arrives as a new request, and a date range on its own is not a question — analysed alone
+it would produce a confident answer to something nobody asked.
+
+So a conversation stores two things beyond the messages: **what it settled** (which company,
+which window, what was knowable) and **the question it is waiting on an answer to**. A reply
+resolves against the original question, not against itself.
+
+The pending clarification also keeps **the date the original question was asked**. A reply
+arriving three days later still resolves "last quarter" against the day you asked, rather than
+silently sliding to today.
+
+### The three routes
+
+```
+POST /analysis/conversations       201  {conversation_id, ...}          no model is called
+POST /analysis/chat                200 | 202 | 404 | 409 | 422 | 503
+GET  /analysis/conversations/{id}  200  metadata + ordered, paged history
+```
+
+```bash
+# 1. start a conversation — this costs nothing and calls no model
+curl -s -X POST localhost:8000/analysis/conversations
+# {"conversation_id":"3023c99c3b6d4a538e00615ce83868b3", "settled": {...}, ...}
+
+CID=3023c99c3b6d4a538e00615ce83868b3
+
+# 2. ask a question with no period in it
+curl -s -X POST localhost:8000/analysis/chat -H 'Content-Type: application/json' -d "{
+  \"conversation_id\": \"$CID\",
+  \"request_id\": \"live-1\",
+  \"message\": \"Compare NVDA's price movement with insider activity.\"
+}"
+# status: "clarification_needed", answer: "...tell me the period you want..."
+
+# 3. answer the clarification with nothing but dates
+curl -s -X POST localhost:8000/analysis/chat -H 'Content-Type: application/json' -d "{
+  \"conversation_id\": \"$CID\",
+  \"request_id\": \"live-2\",
+  \"message\": \"August 6 through September 17, 2026.\"
+}"
+# status: "completed"
+# resolved: {"symbol":"NVDA","start_date":"2026-08-06","end_date":"2026-09-17",...}
+# citations: [E1 market_insider_analysis, E2 portfolio_context]
+
+# 4. retry the same request id — the saved result, no second analysis
+curl -s -X POST localhost:8000/analysis/chat -H 'Content-Type: application/json' -d "{
+  \"conversation_id\": \"$CID\", \"request_id\": \"live-2\",
+  \"message\": \"August 6 through September 17, 2026.\"
+}"
+# identical turn_id, run_id, answer and citations, in ~70ms
+
+# 5. read the conversation
+curl -s "localhost:8000/analysis/conversations/$CID?limit=20&offset=0"
+```
+
+Optional `symbol`, `start_date`, `end_date` and `as_of` may be sent with a turn. They are
+**authoritative when given**, exactly as `--symbol` is on the command line — the conversation's
+settled context is only a default the model may override, which is what lets "actually, what
+about Apple?" switch company instead of colliding with what was settled before.
+
+Only user content and those four fields are accepted. The request model is `extra="forbid"`, so
+a client that sends a system message, an assistant message, a tool output, an evidence map or a
+budget override gets a **422** rather than having it quietly ignored — or worse, honoured. The
+conversation the Supervisor sees is assembled by the backend from its own rows.
+
+### Retrying with a request id
+
+`request_id` is generated by the client and unique within a conversation. It is the only thing
+standing between a retry and a second paid analysis.
+
+| Situation | What you get |
+|---|---|
+| Same `request_id`, same content, already finished | **200** with the saved result. No model call. |
+| Same `request_id`, different content or arguments | **409** — an id identifies one request |
+| Same `request_id`, still running | **202** with the turn id and `Retry-After` |
+| Different `request_id` while a turn is running | **409** — a second turn would run against history the first is still changing |
+| Its turn's deadline has passed | the stale turn is marked `interrupted` and the new one proceeds |
+
+A **failed or interrupted** request replayed with the same id returns its recorded state, not a
+new attempt. The money was spent once and the question was asked once; running it again without
+being asked would produce a second thing to be confused about. An intentional retry uses a
+**new request id** — a decision only you can make.
+
+This prevents routine duplicate execution. It **cannot** guarantee exactly-once provider
+billing across a process crash: a request that died mid-flight may already have been charged
+for, and the recording of that is what the deadline recovery is for.
+
+### Deadlines, disconnects and restarts
+
+Each turn records a **processing deadline** — the run's own 180-second budget plus a 30-second
+grace. Past it the turn stops being believed. Recovery is lazy: the next request that touches
+the conversation marks the abandoned turn `interrupted` and frees it. There is no background
+sweeper, and **nothing is replayed automatically**.
+
+A **client disconnect does not cancel the analysis.** The endpoint is synchronous and the work
+runs in a thread, so a client that gives up and closes the connection leaves the run finishing
+and persisting on its own. **A client timeout does not prove the analysis failed.**
+
+For the future frontend: on a timeout, `GET /analysis/conversations/{id}` and read the turn's
+status. Ask again only with a new request id, and only once you know the first attempt is not
+still running.
+
+Finalization is **leased**. The context update applies only while the turn still holds the
+conversation, so a run that overran its deadline cannot come back later and overwrite context
+a newer turn has already moved past. Its own answer is still recorded — the work was done — but
+the conversation does not move backwards.
+
+### Bounded context
+
+The prompt does **not** receive the transcript. Each turn is given:
+
+- the company, window and cutoff the conversation has settled, as structured fields;
+- the pending question, if there is one, with the date it was asked;
+- the last **6 turns**, each as the user's message plus a **600-character** digest of the answer.
+
+No historical tool payloads, ever. The prompt says plainly that earlier assistant prose is
+conversational context and not evidence, and the architecture enforces it: only the current
+run's evidence map can be cited, so a follow-up triggers fresh retrieval rather than reusing
+last turn's passages. Every turn is its own run with its own map, so an `E1` in one answer can
+never resolve to another's.
+
+The whole transcript is still there — `GET /analysis/conversations/{id}` pages through all of
+it. The bound is a cost control on prompts, not a limit on what you can read back.
+
+### What a turn can come back as
+
+| Status | HTTP | Meaning |
+|---|---|---|
+| `completed` | 200 | An answer, with citations and limitations |
+| `clarification_needed` | 200 | The answer *is* the question to ask next; it is recorded as pending |
+| `company_not_stored` | 200 | A definite ticker this system holds nothing for |
+| `unsupported_capability` | 200 | Trading, order approval, backtesting |
+| `invalid_citations` | 200 | The answer cited evidence that does not exist and was withheld |
+| `budget_exhausted` | 200 | A run limit was reached; what was gathered is reported |
+| `processing` | 202 | Still running |
+| `provider_failed`, `service_failed` | 503 | DeepSeek, or this application's own database, failed |
+
+The HTTP status is derived from the turn's status by one mapping, used for the first response
+and for every replay — so the same request id always produces the same status code.
+
+### An un-ingested company is not an unsupported one
+
+A company this system holds no data for used to be reported as `unsupported_capability`, which
+told the user this application could not do something when the truth was that it held nothing.
+Trading is unsupported. Tesla is simply absent. Those send a reader to different places.
+
+Three branches now, decided in code from the database:
+
+- **A definite ticker in neither list** → `company_not_stored`, and if you named it yourself
+  (the CLI's `--symbol`, the API's `symbol`) that costs **no model request at all**. The answer
+  is written in code, so it cannot fail because a provider is down or a budget ran out.
+- **A symbol this system knows, but the data asked for is missing** → the run proceeds and the
+  tool reports `unavailable` or `partial` with its own explanation. A metric with no stored
+  observation is not the same as an unknown company.
+- **A symbol that is not a definite ticker** → clarification, not a refusal. "Apple Inc." and
+  "the chip maker" are failed lookups, not evidence that nothing is stored.
+
+**"Known" is two lists, not one, and the difference is load-bearing.** `companies` is what has
+been ingested; `holdings` is what the demo portfolio owns. **MSFT is held and has never been
+ingested**, so a question about owning it must work while a question about its price cannot.
+A single merged list would answer "do we know this symbol" and mislead about everything else.
+
+**Being held licenses ownership questions and nothing else.** Recognising a symbol is one thing;
+having data about it is another. The two lists are told apart in both prompts, and the symbols
+that are held but not ingested are named outright, so neither the routing nor the answer has to
+work it out:
+
+```
+Companies with ingested data (market, insiders, financial facts, filing text): AAPL, NVDA
+Symbols held in the demo portfolio (ownership questions only): AAPL, MSFT, NVDA
+  Of the held symbols, these are held but NOT ingested, so no market, insider,
+  financial-fact or filing data exists for them: MSFT
+```
+
+The tools already behave this way — `portfolio_context` reads holdings, the other three look up
+ingested companies — so a **mixed** question ("do I own MSFT and how has it moved?") returns the
+ownership facts and says plainly that the market data is unavailable, rather than refusing the
+whole thing or answering half of it from memory. Nothing about MSFT's price is asserted, because
+nothing about it is stored.
+
+### Dates: three of them, and one that must never stand in for another
+
+The answer has to keep three different dates apart, and two of them are routinely different
+numbers:
+
+| Which | Where it comes from | What it bounds |
+|---|---|---|
+| **Market comparison period** | `resolved.start_date` → `resolved.end_date` | The price comparison, and every transaction it counts |
+| **Overall information date** | `resolved.as_of` | What was knowable for the whole run, the filing discussion included |
+| A tool's own cutoff | Inside a tool's payload | That tool only — never the run's |
+
+They differ whenever a question is asked later than the window it is about, which is the normal
+case. In the live conversation below the run's information date was 2026-09-19 while
+`market_insider_analysis` reported **2026-09-18T04:00Z** — its own cutoff, derived from the
+window ending on the 17th. The first answer presented the tool's figure as the run's, and that
+is not a cosmetic slip: **a filing accepted between those two instants is readable for the
+filing discussion and excluded from the market comparison.** An answer that runs them together
+can attribute evidence to a comparison that ruled it out.
+
+So the composition prompt is given both values, labelled and built from what the application
+resolved rather than read out of any payload, plus the rule:
+
+> The market comparison is bounded by the period above. A tool result may report its own
+> narrower cutoff; that is that tool's, not this run's information date. Do not present it as
+> the overall cutoff, and do not attribute anything admitted under the wider information date
+> to the market comparison.
+
+The run's own cutoff is also returned as `information_cutoff`, derived from `as_of` with the
+same `app.analysis.information_cutoff` the tools use — so the run's cutoff and theirs cannot
+drift apart, and a client can see which instant governed without parsing prose. It is null when
+nothing was settled, which is the honest answer for a clarification or a refusal.
+
+A **database failure is never an absence**. If the lists cannot be read the run reports
+`service_failed` and says so — turning an outage into "this system holds no data for that
+company" would be a confident falsehood about the data, made on the strength of not being able
+to look at it.
+
+### Concurrency
+
+Handlers are declared `def`, not `async def`. `run_analysis` blocks on httpx and psycopg2, and
+FastAPI's own guidance is that a blocking path operation declared with plain `def` runs in an
+external threadpool rather than on the event loop. An `async def` handler calling blocking code
+would stall every other request in the process — including `/health`. There is a test that calls
+`/health` while a deliberately slow analysis is in flight, rather than assuming it.
+
+**Two analyses may run at once in one process**, enforced by a semaphore. A third gets **503**
+with `Retry-After` and a body naming the limit — rejected, not queued, because an unbounded queue
+turns a slow provider into a backlog nobody agreed to wait for. This limit is **per process**: two
+uvicorn workers would admit four.
+
+No database session and no row lock is held across a model call. A turn is claimed in one short
+transaction, the analysis runs with nothing open, and the result is written in a second short
+transaction.
+
+### This is a local, single-user application
+
+**A conversation id separates conversations from one another. It is not an authorization
+boundary.** Anyone who can reach this port can read any conversation whose id they have, and ids
+are not secrets — they are unguessable UUIDs, which is obscurity, not access control.
+
+There is no authentication, no user model, and no ownership check. Do not expose this to anyone
+else. Public deployment needs authentication and a per-conversation ownership check first, and
+neither is in this milestone.
+
+No new CORS settings were added; the credentials stay backend-only, as they are everywhere else.
+
+## The Analysis page (step 10)
+
+Open **http://localhost:5173** and choose **Analysis** in the sidebar. Ask a question; the
+Supervisor answers from the same stored data the rest of this page describes, with its citations
+and limitations attached.
+
+No further setup. The page talks to the three routes above through Vite's `/api` proxy, so there
+is no hostname to configure and no CORS. If the backend is not running the page says so rather
+than appearing empty.
+
+### What the page does
+
+**Your conversations are remembered, by this browser.** The active conversation id is kept in
+`localStorage`, so a reload restores the conversation from PostgreSQL — its questions, answers,
+citations and limitations — rather than starting again. **New conversation** opens a fresh one;
+it creates a new conversation and deletes nothing, so everything you had is still on the server.
+
+The **History** panel lists the conversations this browser has started. It is honest about being
+that and no more: it cannot see a conversation opened in another browser or on another machine,
+because there is no endpoint that lists them, and inventing one was out of scope.
+
+### Streaming, and what it is honest about
+
+The answer streams — but not the answer's *text*. The backend emits **progress events** over
+server-sent events as it genuinely does each thing: the request was read and what it settled,
+which tool ran and how it went, what the tools returned, and that the answer is being written.
+The finished answer arrives at the end, in one piece.
+
+That distinction is deliberate. Nothing on the page is a timer, a percentage, or a stage the
+backend does not have; every line came from the code that did the work, at the moment it did it.
+A progress bar computed beside the run would look the same and mean nothing.
+
+**Closing the page does not cancel the analysis.** The run happens on the backend's own thread,
+bounded by its 180-second budget, and finishes and persists whether or not anyone is reading.
+The stream stopping stops the reading, and nothing else.
+
+### Retrying, and the one mistake that costs money
+
+Every question is sent with a `request_id` generated once and stored before the request goes
+out. That id is what makes a retry safe, and the page uses it strictly:
+
+- A timeout or a dropped connection is **not** proof the analysis failed. The page says so,
+  offers **Check request status**, and offers **Send that request again** — the *same* request
+  id and the *same* body, which the backend recognises as the duplicate it is and answers from
+  the stored result in about 30 milliseconds.
+- **Ask as a new request** is a second, explicit choice, and it generates a new id — a second
+  paid analysis. The page never does that on its own, because a client that regenerates an id
+  after a timeout turns one question into two charges and does it silently.
+- A `202` means the request is already running: the page polls the conversation, bounded, and
+  offers a manual check if that bound is reached. It does not ask again.
+- A `409`, a `422` and a `404` are shown as themselves, with the backend's own wording.
+
+### Reading an answer
+
+Answers are Markdown — headings, lists and tables — rendered with raw HTML **off** and links
+restricted to `https:`, because the text is model output and a filing passage is not a document
+anybody vetted. Tables scroll inside their own box rather than widening the page.
+
+A `[E1]` in the prose is a control only when `E1` is evidence *for that answer*, and its target
+is scoped to the turn — so `E1` in two different answers opens two different sources. An
+unresolved citation stays plain text rather than becoming a link to nothing.
+
+**Sources and evidence** expands to what each reference actually holds: for a filing passage,
+the form, accession, section, dates, the quoted text and a link to `sec.gov` taken from the
+evidence record — never assembled from the answer's prose. For a tool result, the tool, its
+status and its warnings. A similarity is labelled as one and never as a confidence.
+
+Above it, the **Limitations** the answer came with, including `insufficient_coverage`. Under
+*tool details*, which tools ran and what the request cost. No prompts and no model reasoning are
+shown, because none are sent.
+
+### The dates it shows, and why they are separate
+
+The context summary names two dates and never one:
+
+| Shown as | Meaning |
+|---|---|
+| **Market comparison period** | `resolved.start_date` → `end_date`. Bounds the price comparison, and every transaction it counts |
+| **Overall information date** | `resolved.as_of`. What was knowable for the whole run, the filing discussion included |
+
+They are routinely different numbers, and a tool may report a *narrower* cutoff of its own —
+`market_insider_analysis` derives one from the window's end. That one belongs with that tool's
+evidence, not in the summary, where it would read as the run's. The run's own cutoff is also
+returned as `information_cutoff`, derived from `as_of` so the two cannot drift.
+
+Portfolio figures are labelled as **demo values from a fictional price table** wherever they
+appear — not a live quote, and not a historical valuation.
+
+### A live conversation
+
+One conversation, two questions, run through the page's own requests against the real backend.
+Two paid submissions, which is what the milestone allowed.
+
+**Turn 1 did not ask for clarification.** Asked *"Compare NVDA's price movement with insider
+activity"*, the router resolved a 90-day window itself (`period: last_90_days`,
+2026-06-22 → 2026-09-19) and answered. That is a legitimate routing choice and **not** the
+behaviour the earlier milestone intended — an unspecified market-analysis period was meant to
+prompt a question. It is reported rather than forced or papered over, and nothing in the routing
+prompt was changed to hide it.
+
+```
+turn 1  "Compare NVDA's price movement with insider activity."
+        routing    module1_analysis, NVDA, window 2026-06-22 → 2026-09-19
+        tool       market_insider_analysis  ok → E1
+        tool       portfolio_context        ok → E2
+        findings   12 findings, 11 limitations
+        done       completed — 7 model requests, 2 tool calls, ~33k tokens, 27s
+
+turn 2  "What filing risks help explain that?"
+        routing    module1_analysis, NVDA, carried from turn 1, period none
+        tool       filing_evidence_search   ok → E1…E12
+        tool       portfolio_context        ok → E13
+        findings   14 findings, 4 limitations
+        done       completed — 7 model requests, 2 tool calls, ~34k tokens, 26s
+
+with no further model call:
+replay  turn 2's request id → same turn_id, answer and citations, in 19 ms
+reload  history returned both turns with their own citations, evidence,
+        limitations and information_cutoff
+```
+
+Turn 2 is the follow-up the page is built for: the settled company and information date were
+carried into a second, different question, which then ran a **filing search** against them
+rather than the market tool. Its `period` is `none` — a filing question needs no window — and
+that is the routing decision working, not a missing one.
+
+**And the same run proves why citations are scoped by turn.** `E1` in turn 1's evidence is a
+`market_insider_analysis` result; `E1` in turn 2's is a filing passage from the 10-K. Same
+identifier, different evidence, two different answers — which is exactly the case a bare `#E1`
+anchor would get wrong.
+
+The turn 1 answer separates **Comparison window: 2026-06-22 to 2026-09-19** from **Information
+cutoff for the run: 2026-09-19**, and explains the gap honestly: *"The requested comparison
+window began 2026-06-22, but no stored bars exist before 2026-08-06"*. It carries
+`insufficient_coverage`, the 1,001-scanned / 1,478-unsearched coverage note, and labels the
+portfolio figures as demo.
+
+### What was not verified
+
+**No browser tooling was available in this session** — no Playwright, no DevTools protocol,
+nothing that can drive a real page. The layout, keyboard focus order, scrolling, the mobile
+drawer and the visual appearance are covered by component tests and by reading the code, and
+were **not** seen rendered. Everything below was verified by tests, type-checking, a production
+build and HTTP.
+
+Also unmeasured: how the Vite proxy behaves across a *full* 180-second analysis. The relevant
+values were inspected rather than assumed — Node 24's socket timeout is `0` (none), Vite sets no
+proxy timeout, and the 180-second run deadline sits inside Node's 300-second request timeout,
+which governs receiving rather than responding. So no adjustment was needed. A stream through the
+proxy was measured and arrives incrementally with `Cache-Control: no-cache` and
+`X-Accel-Buffering: no`; a 180-second hold was not.
+
 ## Logs
 
 ```bash
@@ -2040,25 +2896,71 @@ while your Mac-side tools use `localhost:5433`. It is the same database either w
   conflict — and does not rewrite anything either. `extraction_version` is how such rows would
   be found; performing the refresh is a later step.
 
+### Live conversation
+
+One conversation over HTTP against the real API, two paid user turns, on 2026-09-19.
+
+```
+POST /analysis/conversations                     -> 3023c99c3b6d4a538e00615ce83868b3
+
+turn 1  "Compare NVDA's price movement with insider activity."
+        status       clarification_needed
+        destination  module1_analysis
+        tool log     market_insider_analysis  rejected: no_market_window
+                     portfolio_context        ok
+                     filing_evidence_search   ok
+        usage        6 model requests, 2 tool calls, ~25k tokens
+
+turn 2  "August 6 through September 17, 2026."
+        status       completed
+        resolved     NVDA, 2026-08-06 -> 2026-09-17
+        tool log     market_insider_analysis  ok   -> E1
+                     portfolio_context        ok   -> E2
+        citations    [E1, E2], 9 limitations
+        usage        5 model requests, 2 tool calls, ~22k tokens
+
+replay  same request id -> identical turn_id, run_id, answer and citations, in 70 ms
+```
+
+Every number in turn 2's answer was checked against the evidence it cited and matched: 30
+observations, 218.99001 to 219.34000 (+0.16%), 0 purchases and 7 sales worth $235,636,867.41,
+`price_up_net_selling` with `overall_conclusion: insufficient_coverage`, the coverage note that
+1,001 filings were scanned and 1,478 were not, and the demo holding — 10 shares, a demo price of
+150.00, 9.32% of a 16,100.00 portfolio, labelled `demo` throughout.
+
+Two defects that run exposed were fixed afterwards, without further paid calls: the answer
+quoted the market tool's cutoff as the run's overall information date, and neither prompt said
+that being *held* licenses only ownership questions. Both are covered by
+`tests/test_agent_dates.py` and the MSFT cases in `tests/test_agent_availability.py`.
+
+**Turn 1 is worth reading closely**, because the first live attempt got it wrong. Asked for a
+price-versus-insider comparison with no period, the routing model chose `module1_analysis` with
+`period: none` rather than `clarification_needed`. The agent then tried the market tool, was
+refused for having no window, and the composed answer correctly asked which period to use —
+right prose, **wrong status**, and nothing recorded as pending, so the reply could not have
+resumed anything. The refusal is raised by this application and now carries a code, so the run
+turns it into a clarification in code rather than hoping the routing prompt gets it right. Two
+tests cover it.
+
 ## Next milestone
 
-**Module 1, step 7: typed tools and the Module 1 agent.** Everything the agent needs is now
-stored: prices, insider transactions, a deterministic analysis over them, filing text in
-PostgreSQL, and a searchable index over that text. Nothing yet puts them behind tools, and no
-model reads any of it.
+**Not decided here.** Two things this step surfaced are worth a decision before more is built:
 
-Four things step 7 inherits, all deliberate:
+- **The routing prompt is ambiguous about unspecified periods.** A question about price movement
+  with no period in it is meant to produce a clarification, and in this step's live run the
+  router resolved a 90-day window itself and answered instead. Whether that is a prompt to
+  sharpen or a rule to enforce in code — as the missing-market-window case already is — is a
+  decision for whoever owns that behaviour, and neither was changed here.
+- **Token streaming was considered and deliberately not built.** The page streams real progress
+  events; the answer still arrives whole. Streaming the composition would mean a streaming model
+  client and a new transport, and the progress channel covers what a reader actually waits on.
 
-- **A financial tool must return an explicit "unavailable"**, with a reason, rather than
-  leaving every caller to consult a warning list. Company Facts reports unmatched concepts;
-  that is a fact about the data, and turning `sum([])` into `0` downstream is the mistake to
-  avoid.
-- **A financial tool must pick its period and accession**, not sum every observation of a
-  concept. A quarter and a year-to-date figure can share an end date and a fiscal period.
-- **Retrieved passages are evidence, not answers.** Two questions with no answer in the stored
-  filings each returned five passages anyway.
-- **`insufficient_coverage` remains the honest conclusion** for anything drawn from insider
-  activity, because three filings are a sample.
+Still outstanding, unchanged from Step 9:
 
-The remaining Module 1 steps, in order: supervisor routing, `POST /analysis/chat`, and the
-Analysis chat UI.
+- **Authentication and ownership**, before any of this is reachable by anyone but you.
+- **Checkpointer-based resumption.** The conversation tables record what was said and what came
+  back; they do not make a half-finished graph resumable.
+- **A conversation list endpoint**, which is what the History panel cannot see past.
+
+Still not built, and out of scope for Module 1: trading and order approval (Module 2),
+backtesting (Module 3), and any recommendation not grounded in a tool result.

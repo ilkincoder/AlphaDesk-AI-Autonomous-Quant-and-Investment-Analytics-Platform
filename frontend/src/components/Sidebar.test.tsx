@@ -38,17 +38,35 @@ describe('Sidebar', () => {
     ])
   })
 
-  it('marks the current page and disables the eight that have no page', () => {
+  it('marks the current page and disables the seven that have no page', () => {
     renderSidebar()
 
     const portfolio = screen.getByRole('button', { name: 'Portfolio' })
     expect(portfolio.getAttribute('aria-current')).toBe('page')
     expect(portfolio.hasAttribute('disabled')).toBe(false)
 
-    // Ten destinations, two built. The eight without a page behind them are genuinely
+    // Ten destinations, three built. The seven without a page behind them are genuinely
     // disabled rather than links that navigate nowhere.
-    expect(screen.getAllByTitle('Coming soon')).toHaveLength(8)
+    expect(screen.getAllByTitle('Coming soon')).toHaveLength(7)
     expect(screen.getByRole('button', { name: 'Dashboard' }).hasAttribute('disabled')).toBe(true)
+  })
+
+  it('enables Analysis, and marks it current when it is the page', () => {
+    renderSidebar('analysis')
+
+    const analysis = screen.getByRole('button', { name: 'Analysis' })
+    expect(analysis.hasAttribute('disabled')).toBe(false)
+    expect(analysis.getAttribute('aria-current')).toBe('page')
+    // Portfolio is enabled too; only one destination is current.
+    expect(screen.getByRole('button', { name: 'Portfolio' }).getAttribute('aria-current')).toBeNull()
+  })
+
+  it('reports Analysis as the chosen destination', () => {
+    const onNavigate = renderSidebar()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Analysis' }))
+
+    expect(onNavigate).toHaveBeenCalledWith('analysis')
   })
 
   it('highlights the current page, not merely an enabled one', () => {
@@ -57,7 +75,7 @@ describe('Sidebar', () => {
     expect(screen.getByRole('button', { name: 'What if?' }).getAttribute('aria-current')).toBe(
       'page',
     )
-    // Both destinations are enabled; only one is current.
+    // Every built destination is enabled; only one is current.
     expect(screen.getByRole('button', { name: 'Portfolio' }).getAttribute('aria-current')).toBeNull()
   })
 

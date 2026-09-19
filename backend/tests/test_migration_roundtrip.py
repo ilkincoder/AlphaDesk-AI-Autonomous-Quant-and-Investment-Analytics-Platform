@@ -21,7 +21,8 @@ from sqlalchemy import text
 
 from tests.testdb import alembic_revision, run_alembic, table_names, test_engine
 
-HEAD_REVISION = "0008_form4_scope_rename"
+HEAD_REVISION = "0009_conversations"
+REVISION_0008 = "0008_form4_scope_rename"
 REVISION_0007 = "0007_document_index_manifest"
 REVISION_0004 = "0004_company_context"
 REVISION_0003 = "0003_ingestion_storage"
@@ -45,10 +46,17 @@ TABLES_FROM_0004 = frozenset(
     {"filing_documents", "company_fact_snapshots", "financial_facts"}
 )
 TABLES_FROM_0007 = frozenset({"document_index_manifest"})
+TABLES_FROM_0009 = frozenset({"conversations", "conversation_turns"})
 
 # Every table any of our migrations creates, for the checks that only care that they are
 # all there or all gone.
-ALL_INTRODUCED = TABLES_FROM_0002 | TABLES_FROM_0003 | TABLES_FROM_0004 | TABLES_FROM_0007
+ALL_INTRODUCED = (
+    TABLES_FROM_0002
+    | TABLES_FROM_0003
+    | TABLES_FROM_0004
+    | TABLES_FROM_0007
+    | TABLES_FROM_0009
+)
 
 # Untouched by any of them, and the reason every downgrade has to be selective.
 EXISTING_TABLES = frozenset({"portfolios", "holdings"})
@@ -63,7 +71,7 @@ class MigrationRoundtripTest(unittest.TestCase):
         # Every test here starts from head, whatever the previous one did.
         run_alembic("upgrade", "head")
 
-    def test_head_is_the_search_index_revision(self):
+    def test_head_is_the_conversation_revision(self):
         self.assertEqual(alembic_revision(self.engine), HEAD_REVISION)
 
     def test_every_introduced_table_exists_at_head(self):

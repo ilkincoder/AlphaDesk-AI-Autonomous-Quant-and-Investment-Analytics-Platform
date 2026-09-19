@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session, selectinload
 
+from app.analysis_api import router as analysis_router
 from app.db import engine, get_session
 from app.models import Portfolio
 from app.schemas import (
@@ -33,6 +34,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="AlphaDesk AI")
+
+# The analysis chat lives in its own module: three routes, their own persistence, and a
+# concurrency ceiling that has nothing to do with portfolios.
+app.include_router(analysis_router)
 
 
 @app.get("/health")

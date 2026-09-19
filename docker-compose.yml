@@ -47,6 +47,13 @@ services:
       # browser is a key given away.
       TWELVE_DATA_API_KEY: ${TWELVE_DATA_API_KEY:-}
       SEC_USER_AGENT: ${SEC_USER_AGENT:-}
+      # Module 1 agent (steps 7B and 8). The model name and base URL are not secrets, but
+      # they are passed the same way so all the agent's configuration lives in one place.
+      # `:-` again, so a machine with no key still starts and `python -m app.run_analysis`
+      # is the only thing that reports the key as missing.
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-flash}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
       # Where FastEmbed keeps the embedding model it downloads.
       #
       # Set explicitly because FastEmbed's own default is `{tempdir}/fastembed_cache`,
