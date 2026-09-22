@@ -18,7 +18,7 @@ from fastapi import HTTPException
 from app.main import post_portfolio_scenario
 from app.schemas import ScenarioRequest
 from tests.test_valuation import StubHolding
-from tests.test_valuation_endpoint import StubPortfolio, StubSession
+from tests.test_valuation_endpoint import SYNCED_AT, StubPortfolio, StubSession
 
 
 def request(symbol: str = "NVDA", percent: str = "-10") -> ScenarioRequest:
@@ -84,6 +84,36 @@ class ScenarioEndpointTest(unittest.TestCase):
         self.assertEqual(response.price_change_percent, Decimal("-7.5"))
         self.assertEqual(response.price_before, Decimal("200.00"))
         self.assertEqual(response.price_after, Decimal("185.00"))
+
+    def test_a_synchronised_portfolio_moves_the_brokers_price_not_a_demo_one(self):
+        """AAPL is held here and the demo table also has a price for it. What-if is the
+        page where falling back to that price would be least visible and most wrong."""
+        portfolio = StubPortfolio(
+            broker="alpaca_paper",
+            broker_equity=Decimal("12345.67"),
+            last_synced_at=SYNCED_AT,
+            holdings=[
+                StubHolding(
+                    symbol="AAPL", quantity=Decimal("5"), market_price=Decimal("201.25")
+                )
+            ],
+        )
+
+        response = post_portfolio_scenario(
+            request(symbol="AAPL", percent="-10"), session=StubSession(portfolio)
+        )
+
+        self.assertEqual(response.price_source, "alpaca_paper")
+        self.assertEqual(response.last_synced_at, SYNCED_AT)
+        # 201.25, not the demo table's 200.00.
+        self.assertEqual(response.price_before, Decimal("201.25"))
+        self.assertEqual(response.price_after, Decimal("181.13"))
+        self.assertEqual(response.holding_value_before, Decimal("1006.25"))
+        self.assertEqual(response.holding_value_after, Decimal("905.63"))
+        # The broker's equity moves by the one price that moved, and nothing else.
+        self.assertEqual(response.total_value_before, Decimal("12345.67"))
+        self.assertEqual(response.total_value_after, Decimal("12245.05"))
+        self.assertEqual(response.change_value, Decimal("-100.62"))
 
 
 class ScenarioRequestValidationTest(unittest.TestCase):

@@ -45,6 +45,7 @@ from app.conversations import (
     history as conversations_history,
 )
 from app.models import Conversation, ConversationTurn
+from app.portfolio_identity import DEMO_PORTFOLIO_NAME
 from app.schemas import ChatRequest
 from tests.conversation_doubles import (
     REFERENCE,
@@ -83,7 +84,7 @@ class ChatTestCase(ToolTestCase):
         from app.models import Holding, Portfolio
 
         portfolio = Portfolio(
-            name="AlphaDesk Demo", currency="USD", cash_balance=Decimal("100.00")
+            name=DEMO_PORTFOLIO_NAME, currency="USD", cash_balance=Decimal("100.00")
         )
         self.session.add(portfolio)
         self.session.flush()

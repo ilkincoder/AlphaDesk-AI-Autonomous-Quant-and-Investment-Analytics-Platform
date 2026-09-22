@@ -10,12 +10,13 @@ up as a historical position.
 """
 
 import unittest
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from sqlalchemy import select
 
 from app.models import Holding, Portfolio
-from app.seed import DEMO_PORTFOLIO_NAME
+from app.portfolio_identity import BROKER_PORTFOLIO_NAME, DEMO_PORTFOLIO_NAME
 from app.tools import portfolio
 from app.tools.portfolio import PortfolioContextRequest
 from app.tools.results import ToolStatus
@@ -63,7 +64,11 @@ class MissingPortfolioTests(PortfolioToolTestCase):
 
         joined = " ".join(result.warnings)
         self.assertIn("not a historical position", joined)
-        self.assertIn("fictional demo price table", joined)
+        self.assertIn("not available in this system", joined)
+        # The price-source caveat is deliberately absent: there is no portfolio, so no
+        # value on this answer came from a price, and a sentence about which prices were
+        # used would be noise. It is on every answer that carries a figure.
+        self.assertNotIn("fictional demo price table", joined)
 
 
 class HeldTests(PortfolioToolTestCase):
@@ -166,11 +171,11 @@ class UnpriceableHoldingTests(PortfolioToolTestCase):
             result = self.context("NVDA")
 
         self.assertEqual(result.status, ToolStatus.PARTIAL)
-        self.assertEqual(result.reason, "valuation_unavailable_missing_demo_price")
+        self.assertEqual(result.reason, "valuation_unavailable_missing_price")
         self.assertIsNone(result.data["valuation"])
         self.assertEqual(
             result.data["valuation_unavailable_reason"],
-            "valuation_unavailable_missing_demo_price",
+            "valuation_unavailable_missing_price",
         )
         self.assertIn("deliberate refusal", " ".join(result.warnings))
 
@@ -194,6 +199,85 @@ class UnpriceableHoldingTests(PortfolioToolTestCase):
 
         self.assertTrue(result.data["held"])
         self.assertIsNotNone(result.data["holding"])
+
+
+class SynchronisedPortfolioTests(PortfolioToolTestCase):
+    """Once the portfolio holds real positions, the demo table is not an option.
+
+    The tool is the one place a fictional price could reach an answer the Supervisor
+    repeats as fact, so what it does with a broker-linked portfolio is checked here rather
+    than left to the endpoints that share the same resolution.
+    """
+
+    SYNCED_AT = datetime(2026, 9, 22, 14, 30, tzinfo=timezone.utc)
+
+    def link(self, record: Portfolio) -> Portfolio:
+        # The name moves with the link, exactly as a real sync moves it.
+        record.name = BROKER_PORTFOLIO_NAME
+        record.broker = "alpaca_paper"
+        record.broker_account_id = "8f3a2b10-4c5d-4e6f-8a9b-0c1d2e3f4a5b"
+        record.broker_equity = Decimal("12345.67")
+        record.last_synced_at = self.SYNCED_AT
+        self.session.flush()
+        return record
+
+    def add_priced_holding(
+        self, record: Portfolio, symbol: str, quantity: str, entry: str, price: str
+    ) -> None:
+        self.session.add(
+            Holding(
+                portfolio_id=record.id,
+                symbol=symbol,
+                quantity=Decimal(quantity),
+                average_buy_price=Decimal(entry),
+                market_price=Decimal(price),
+                # The broker's own figure, not recomputed from quantity x price.
+                market_value=Decimal(price) * Decimal(quantity),
+            )
+        )
+        self.session.flush()
+
+    def test_a_synchronised_portfolio_is_valued_at_the_brokers_prices(self):
+        record = self.link(self.add_portfolio(cash="2500.25"))
+        self.add_priced_holding(record, "AAPL", "5", "180.10", "201.25")
+
+        result = self.context("AAPL")
+
+        self.assertEqual(result.data["price_source"], "alpaca_paper")
+        self.assertEqual(result.data["holding"]["price"], "201.25")
+        self.assertEqual(result.data["holding"]["holding_value"], "1006.25")
+        self.assertEqual(result.data["valuation"]["total_value"], "12345.67")
+
+    def test_the_broker_basis_is_stated_and_the_demo_caveat_is_not(self):
+        record = self.link(self.add_portfolio())
+        self.add_priced_holding(record, "AAPL", "5", "180.10", "201.25")
+
+        result = self.context("AAPL")
+
+        joined = " ".join(result.warnings)
+        self.assertIn("prices the broker last reported", joined)
+        self.assertIn(self.SYNCED_AT.isoformat(), joined)
+        # The demo sentence would be false here, so it is absent -- and its absence is what
+        # keeps both sentences worth reading.
+        self.assertNotIn("fictional demo price table", joined)
+        self.assertNotIn("fictional", result.data["price_source_note"])
+
+    def test_a_synchronised_holding_with_no_stored_price_is_never_given_a_demo_one(self):
+        """AAPL has a demo price. Using it against a real quantity is exactly the mistake
+        this basis exists to prevent."""
+        record = self.link(self.add_portfolio())
+        self.add_holding(record, "AAPL", "5", "180.10")
+
+        with self.assertLogs("app.tools.portfolio", level="WARNING"):
+            result = self.context("AAPL")
+
+        self.assertEqual(result.status, ToolStatus.PARTIAL)
+        self.assertEqual(result.reason, "valuation_unavailable_missing_price")
+        self.assertIsNone(result.data["valuation"])
+        self.assertIsNone(result.data["holding"]["price"])
+        # The basis is still named, so the answer says whose prices are missing rather
+        # than leaving the reader to guess.
+        self.assertEqual(result.data["price_source"], "alpaca_paper")
 
 
 class ReadOnlyTests(PortfolioToolTestCase):

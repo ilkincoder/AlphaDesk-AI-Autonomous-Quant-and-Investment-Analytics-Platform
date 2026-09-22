@@ -43,6 +43,7 @@ from app.models import (
     Portfolio,
     SecFiling,
 )
+from app.portfolio_identity import DEMO_PORTFOLIO_NAME
 from app.tools import TOOLS, UnknownToolError, invoke, tool_names
 from app.tools import financial_facts, market_insider, portfolio
 from app.tools.financial_facts import MetricName
@@ -440,7 +441,7 @@ class JsonSafetyTests(ToolTestCase):
 
     def test_a_portfolio_result_keeps_its_decimals_exact(self):
         self.session.add(
-            Portfolio(name="AlphaDesk Demo", currency="USD", cash_balance=Decimal("10000.00"))
+            Portfolio(name=DEMO_PORTFOLIO_NAME, currency="USD", cash_balance=Decimal("10000.00"))
         )
         self.session.flush()
 
@@ -449,7 +450,7 @@ class JsonSafetyTests(ToolTestCase):
         )
         document = json.loads(json.dumps(result.as_json()))
 
-        self.assertEqual(document["data"]["portfolio"]["name"], "AlphaDesk Demo")
+        self.assertEqual(document["data"]["portfolio"]["name"], DEMO_PORTFOLIO_NAME)
         self.assertEqual(document["data"]["valuation"]["cash_balance"], "10000.00")
 
 
@@ -465,7 +466,7 @@ class ReadOnlyTests(ToolTestCase):
         snapshot = self.add_snapshot(self.company)
         self.add_fact(self.company, snapshot)
         self.session.add(
-            Portfolio(name="AlphaDesk Demo", currency="USD", cash_balance=Decimal("100.00"))
+            Portfolio(name=DEMO_PORTFOLIO_NAME, currency="USD", cash_balance=Decimal("100.00"))
         )
         self.session.flush()
 

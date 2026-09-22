@@ -1,7 +1,7 @@
 /** Application shell navigation.
  *
- * Ten destinations, three of which exist. Analysis, Portfolio and What if? are real pages;
- * the other seven are rendered as genuinely disabled buttons with a "Coming soon"
+ * Ten destinations, four of which exist. Analysis, Portfolio, What if? and News are real
+ * pages; the other six are rendered as genuinely disabled buttons with a "Coming soon"
  * description, because a link that navigates nowhere is worse than a link that says it
  * cannot.
  */
@@ -25,7 +25,7 @@ import {
 
 /** The pages that exist. Declared here because this file owns the list of destinations;
  *  `App` holds whichever one is current. */
-export type PageId = 'analysis' | 'portfolio' | 'what-if'
+export type PageId = 'analysis' | 'portfolio' | 'what-if' | 'news'
 
 type NavItem = {
   label: string
@@ -40,11 +40,11 @@ const NAV_ITEMS: NavItem[] = [
   { id: 'analysis', label: 'Analysis', Icon: AnalysisIcon },
   { id: 'portfolio', label: 'Portfolio', Icon: PortfolioIcon },
   { id: 'what-if', label: 'What if?', Icon: WhatIfIcon },
+  { id: 'news', label: 'News', Icon: DataNewsIcon },
   { label: 'Strategies', Icon: StrategiesIcon },
   { label: 'Backtest', Icon: BacktestIcon },
   { label: 'Orders', Icon: OrdersIcon },
   { label: 'Watchlist', Icon: WatchlistIcon },
-  { label: 'Data & News', Icon: DataNewsIcon },
   { label: 'Settings', Icon: SettingsIcon },
 ]
 

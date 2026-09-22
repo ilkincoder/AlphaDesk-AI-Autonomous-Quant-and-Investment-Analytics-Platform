@@ -157,7 +157,7 @@ def extract(html: str, *, form_type: str) -> ExtractedDocument:
             limitations=("The document was empty, so there was no text to extract.",),
         )
 
-    text = _to_text(html)
+    text = to_text(html)
     if not text.strip():
         return ExtractedDocument(
             text=text,
@@ -194,7 +194,18 @@ def extract(html: str, *, form_type: str) -> ExtractedDocument:
     return ExtractedDocument(text=text, sections=sections, limitations=tuple(limitations))
 
 
-def _to_text(html: str) -> str:
+def to_text(html: str) -> str:
+    """Readable text from markup, with tags removed and structure kept.
+
+    The general-purpose half of this module: `extract` calls it to get a filing's text, and
+    the news ingestion calls it on a release page or a feed summary. Both want the same
+    thing -- the words, with scripts and styles gone and paragraph and table structure
+    intact -- because text that still contains markup is not text, and text with its rows
+    flattened cannot say which column a number was in.
+
+    Input is untrusted in both cases, and is treated as text throughout: nothing here
+    evaluates, resolves or fetches anything the markup refers to.
+    """
     parser = _TextExtractor()
     parser.feed(html)
     parser.close()

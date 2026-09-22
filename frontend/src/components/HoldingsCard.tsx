@@ -8,13 +8,17 @@ const NUMERIC_CELL = 'px-3 py-2 text-right tabular-nums'
 
 /** The holdings table, with cash appended as a row rather than hidden in a footnote.
  *
- * Cash is not a holding, so it sits after the holdings and its Shares and Demo Price
- * cells are empty — a dash, not a zero, because there are no shares of cash.
+ * Cash is not a holding, so it sits after the holdings and its Shares and Price cells are
+ * empty — a dash, not a zero, because there are no shares of cash.
  */
 export function HoldingsCard({ valuation }: { valuation: Valuation }) {
   // The API already sorts by symbol; sorting again costs one line and means this
   // component does not silently depend on that promise staying true.
   const holdings = [...valuation.holdings].sort((a, b) => a.symbol.localeCompare(b.symbol))
+
+  // "Demo Price" is a claim about where a number came from, so it is only made when it is
+  // true. A synchronised portfolio's prices are the broker's.
+  const priceHeading = valuation.price_source === 'demo' ? 'Demo Price' : 'Price'
 
   return (
     <Card className="flex flex-col min-[1100px]:min-h-[400px]">
@@ -25,7 +29,7 @@ export function HoldingsCard({ valuation }: { valuation: Valuation }) {
       <div className="mt-3 -mx-5 overflow-x-auto px-5">
         <table className="w-full min-w-[520px] border-collapse">
           <caption className="sr-only">
-            Holdings valued at demo prices, with cash shown last
+            Holdings valued at {valuation.price_source} prices, with cash shown last
           </caption>
           <thead>
             <tr className="border-b border-line">
@@ -36,7 +40,7 @@ export function HoldingsCard({ valuation }: { valuation: Valuation }) {
                 Shares
               </th>
               <th scope="col" className={HEAD_CELL_NUMERIC}>
-                Demo Price
+                {priceHeading}
               </th>
               <th scope="col" className={HEAD_CELL_NUMERIC}>
                 Holding Value

@@ -1,6 +1,7 @@
 import { useCallback, useState } from 'react'
 
 import { AnalysisPage } from './components/AnalysisPage'
+import { NewsPage } from './components/NewsPage'
 import { PortfolioPage } from './components/PortfolioPage'
 import { Sidebar } from './components/Sidebar'
 import type { PageId } from './components/Sidebar'
@@ -12,7 +13,7 @@ import { WhatIfPage } from './components/WhatIfPage'
  * above the content) and a row above it. One breakpoint, so the sidebar and its
  * replacement swap at the same width and can never both be absent.
  *
- * Which page is showing is plain state, not a URL. There is no router: three destinations
+ * Which page is showing is plain state, not a URL. There is no router: four destinations
  * do not justify the dependency or the rework, and the cost is only that a refresh
  * returns to Portfolio and a page cannot be linked to. The Analysis page keeps its own
  * conversation in `localStorage`, so a refresh there restores the conversation even though
@@ -44,11 +45,17 @@ export function App() {
           is what lets a table or a transcript scroll inside its own container. */}
       <main className="flex min-h-0 min-w-0 flex-1 flex-col">
         <div className="min-h-0 flex-1 flex-col p-6" style={{ display: showing('portfolio') }}>
-          {visited.has('portfolio') && <PortfolioPage />}
+          {/* `active` is what the page polls on. It stays mounted while hidden, so
+              mounting is not the same event as arriving here. */}
+          {visited.has('portfolio') && <PortfolioPage active={page === 'portfolio'} />}
         </div>
 
         <div className="min-h-0 flex-1 flex-col p-6" style={{ display: showing('what-if') }}>
           {visited.has('what-if') && <WhatIfPage />}
+        </div>
+
+        <div className="min-h-0 flex-1 flex-col p-6" style={{ display: showing('news') }}>
+          {visited.has('news') && <NewsPage active={page === 'news'} />}
         </div>
 
         <div className="min-h-0 flex-1 flex-col" style={{ display: showing('analysis') }}>

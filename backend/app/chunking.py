@@ -101,17 +101,29 @@ def chunk_document(
     counter: TokenCounter,
     target_tokens: int = TARGET_TOKENS,
     max_tokens: int = HARD_LIMIT_TOKENS,
+    heading_label: str | None = None,
 ) -> tuple[Chunk, ...]:
     """Split `text` into embeddable passages, in document order.
 
     `sections` may be empty, and usually is for an 8-K or an exhibit. Passages outside every
     known section are labelled `unknown`, which reports a limit of detection rather than
     claiming the filing has no structure.
+
+    `heading_label` replaces that generated heading entirely, for a corpus whose text is not
+    a filing and has no sections to name. News passes something like `news | AAPL, MSFT`.
+    The default is None, which produces exactly the heading this function produced before
+    the parameter existed -- so every stored SEC chunk is unaffected and `CHUNKING_VERSION`
+    does not move.
     """
     if not text or not text.strip():
         return ()
 
     ordered = sorted(sections, key=lambda item: item.start)
+
+    def heading_for(offset: int) -> str:
+        if heading_label is not None:
+            return _bracket(heading_label)
+        return _heading(form_type, _section_at(offset, ordered))
 
     def measure(span: _Span) -> int:
         """Tokens for a span exactly as the model would receive it.
@@ -120,7 +132,7 @@ def chunk_document(
         span against a token limit, and a bound applied to the passage alone would let the
         heading push the finished input past 512.
         """
-        heading = _heading(form_type, _section_at(span.start, ordered))
+        heading = heading_for(span.start)
         return counter.count_tokens(_embedding_input(heading, text[span.start : span.end]))
 
     pieces: list[_Span] = []
@@ -138,7 +150,7 @@ def chunk_document(
                 if measure(candidate) <= max_tokens:
                     span = candidate
 
-        heading = _heading(form_type, _section_at(span.start, ordered))
+        heading = heading_for(span.start)
         passage = text[span.start : span.end]
         embedding_input = _embedding_input(heading, passage)
         measured = counter.count_tokens(embedding_input)
@@ -378,7 +390,17 @@ def _joined(first: _Span, second: _Span) -> _Span:
 
 
 def _heading(form_type: str, section: str) -> str:
-    return f"[{form_type} | section: {section}]"
+    return _bracket(f"{form_type} | section: {section}")
+
+
+def _bracket(label: str) -> str:
+    """The one place a heading is wrapped, so both callers bracket identically.
+
+    Bracketing is not decoration: the heading is prepended for the model to read and is
+    never part of the passage, and the brackets are what stop it being mistaken for
+    something the document actually said.
+    """
+    return f"[{label}]"
 
 
 def _embedding_input(heading: str, passage: str) -> str:

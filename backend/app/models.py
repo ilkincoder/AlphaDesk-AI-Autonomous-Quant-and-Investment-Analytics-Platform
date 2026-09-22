@@ -31,12 +31,38 @@ class Portfolio(Base):
 
     Money uses NUMERIC, never FLOAT: binary floating point cannot represent values
     like 0.10 exactly, so summing cash in floats drifts by tiny amounts.
+
+    **A portfolio is either linked to a broker account or it is not, and there is no
+    half-way house.** `broker`, `broker_account_id`, `broker_equity` and `last_synced_at`
+    are written together by one successful sync and read together by everything that
+    values the portfolio, so "linked but unpriced" cannot exist to be handled. That is
+    what `ck_portfolios_broker_link_is_whole` asserts.
+
+    `cash_balance` is non-negative only while the portfolio is unlinked. That is the
+    original constraint, kept where it still means something: the placeholder portfolio's
+    cash is a figure this application chose, and a negative one there is a bug. A linked
+    portfolio's cash is whatever the broker reports, and a margin paper account can report
+    a negative balance, so refusing to store it would mean refusing to synchronise at all.
     """
 
     __tablename__ = "portfolios"
     __table_args__ = (
-        CheckConstraint("cash_balance >= 0", name="ck_portfolios_cash_balance_nonnegative"),
         UniqueConstraint("name", name="uq_portfolios_name"),
+        CheckConstraint(
+            "broker IS NOT NULL OR cash_balance >= 0",
+            name="ck_portfolios_unlinked_cash_balance_nonnegative",
+        ),
+        CheckConstraint(
+            "(broker IS NULL) = (broker_account_id IS NULL) "
+            "AND (broker IS NULL) = (broker_equity IS NULL) "
+            "AND (broker IS NULL) = (last_synced_at IS NULL)",
+            name="ck_portfolios_broker_link_is_whole",
+        ),
+        # One broker account binds one portfolio. Without this, two portfolios could
+        # claim the same account and the sync would have to guess which to update.
+        UniqueConstraint(
+            "broker", "broker_account_id", name="uq_portfolios_broker_account"
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -45,6 +71,25 @@ class Portfolio(Base):
     cash_balance: Mapped[Decimal] = mapped_column(Numeric(18, 2))
     currency: Mapped[str] = mapped_column(String(3))
 
+    # --- the broker link, absent until the first successful sync -------------------------
+    #
+    # A source slug such as "alpaca_paper". Unconstrained for the same reason
+    # `daily_prices.provider` is: a second broker should not need a migration.
+    broker: Mapped[str | None] = mapped_column(String(32))
+    # The broker's own account identifier -- Alpaca's account uuid. This is the identity
+    # a sync is checked against, which is what stops a set of credentials pointed at a
+    # different account quietly writing into this portfolio.
+    broker_account_id: Mapped[str | None] = mapped_column(String(64))
+    # The broker's own equity figure, in the portfolio's currency. Kept because it is the
+    # broker's answer to "what is this account worth", and it is not derivable here to the
+    # cent: the account and positions endpoints are two moments, so equity need not equal
+    # positions plus cash exactly.
+    broker_equity: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
+    # When the last sync that actually wrote started reading from the broker. Also the
+    # stale guard: a fetch that began earlier than this is refused rather than allowed to
+    # overwrite newer data.
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
     holdings: Mapped[list["Holding"]] = relationship(
         back_populates="portfolio",
         order_by="Holding.symbol",
@@ -52,13 +97,31 @@ class Portfolio(Base):
 
 
 class Holding(Base):
-    """A long position in one symbol within one portfolio."""
+    """A long position in one symbol within one portfolio.
+
+    `quantity` and `average_buy_price` describe the position; `market_price` and
+    `market_value` are where the broker last priced it. The second pair is NULL on a
+    portfolio that has never been synchronised -- a demo holding has a purchase price and
+    no market price at all, which is a different fact from a market price of zero.
+
+    They are stored rather than derived because the broker reported them: `market_value`
+    is the broker's own number, and computing it here from `quantity * market_price`
+    would replace what was reported with what this application thinks it should be.
+    """
 
     __tablename__ = "holdings"
     __table_args__ = (
         CheckConstraint("quantity > 0", name="ck_holdings_quantity_positive"),
         CheckConstraint(
             "average_buy_price > 0", name="ck_holdings_average_buy_price_positive"
+        ),
+        CheckConstraint(
+            "market_price IS NULL OR market_price >= 0",
+            name="ck_holdings_market_price_nonnegative",
+        ),
+        CheckConstraint(
+            "market_value IS NULL OR market_value >= 0",
+            name="ck_holdings_market_value_nonnegative",
         ),
         UniqueConstraint("portfolio_id", "symbol", name="uq_holdings_portfolio_id_symbol"),
     )
@@ -73,6 +136,11 @@ class Holding(Base):
     # 4 decimal places: this is an average, and averaging can produce more than
     # two decimals (100 / 3), so rounding to cents would quietly lose precision.
     average_buy_price: Mapped[Decimal] = mapped_column(Numeric(18, 4))
+
+    # Unconstrained NUMERIC, for the same reason daily_prices' prices are: what the
+    # provider sent is what gets stored, and no precision is lost on the way in.
+    market_price: Mapped[Decimal | None] = mapped_column(Numeric)
+    market_value: Mapped[Decimal | None] = mapped_column(Numeric)
 
     portfolio: Mapped["Portfolio"] = relationship(back_populates="holdings")
 
@@ -647,6 +715,116 @@ class FinancialFact(Base):
     fiscal_year: Mapped[int | None] = mapped_column()
     fiscal_period: Mapped[str | None] = mapped_column(String(8))
     frame: Mapped[str | None] = mapped_column(String(32))
+
+
+class NewsArticle(Base):
+    """One article, from a market news provider or from an official statistical release.
+
+    **`published_at` and `ingested_at` are two different facts.** The first is when the
+    publisher says the story ran, and it is what a listing is ordered by; the second is when
+    this database first stored it. They coincide only for an article that has just broken.
+    Nothing here ever writes one into the other: an old release ingested today must still
+    read as old, and the timestamp that makes it look new is the one this system controls
+    rather than the one the publisher stated.
+
+    **Identity is `(provider, provider_article_id)`.** `provider_article_id` holds the
+    provider's own identifier, and falls back to the canonical URL when a provider supplies
+    none -- one column, one rule, so there is no second way for two rows to be the same
+    article. `content_sha256` is a *different* question: whether the words changed. A
+    provider that revises a story keeps its id and gets a new hash, which is what makes the
+    stored copy update rather than duplicate, and what tells the indexer to re-embed.
+
+    **The index identity lives here rather than in a manifest table**, which is a deliberate
+    difference from `DocumentIndexManifest`. A filing owns many documents, each separately
+    indexable; a news article *is* the indexed unit, one row to one set of chunks. A separate
+    table would be a join that can only ever return the row it was joined from.
+
+    `indexed_at` NULL is the honest state for an article that is stored but not yet in the
+    search index -- a state an indexing failure leaves behind, and one a retry clears.
+    """
+
+    __tablename__ = "news_articles"
+    __table_args__ = (
+        CheckConstraint(
+            "category IN ('company', 'macro')", name="ck_news_articles_category"
+        ),
+        UniqueConstraint(
+            "provider",
+            "provider_article_id",
+            name="uq_news_articles_provider_provider_article_id",
+        ),
+        # The listing is always "newest first", across every source.
+        Index("ix_news_articles_published_at", "published_at"),
+        Index("ix_news_articles_provider_published_at", "provider", "published_at"),
+        # Symbol filtering, which is what makes a company article findable. A GIN index
+        # rather than a join table: the list is small, read whole, and never queried on its
+        # own.
+        Index(
+            "ix_news_articles_symbols",
+            "symbols",
+            postgresql_using="gin",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    # A source slug such as "alpaca_news" or "official_fed_monetary". Unconstrained for the
+    # same reason `daily_prices.provider` is: a new source should not need a migration.
+    provider: Mapped[str] = mapped_column(String(48))
+    provider_article_id: Mapped[str] = mapped_column(String(512))
+    # The publisher's name as it should be shown -- "benzinga", "Federal Reserve", "BLS".
+    source: Mapped[str] = mapped_column(String(120))
+    canonical_url: Mapped[str] = mapped_column(String(1024))
+    title: Mapped[str] = mapped_column(Text)
+    # The publisher's words, markup removed. Untrusted input, stored as text and read as
+    # text: nothing in this system executes it or resolves anything it mentions.
+    text: Mapped[str] = mapped_column(Text)
+    # A JSONB list rather than a join table. Empty for a macro release, which is a fact about
+    # the article rather than missing data.
+    symbols: Mapped[list] = mapped_column(JSONB)
+    category: Mapped[str] = mapped_column(String(16))
+    published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # The provider's own `updated_at`, when it supplied one. NULL means the provider said
+    # nothing about revisions, which is a different fact from "never revised".
+    provider_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    ingested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # sha256 of the title and body. What "this article changed" means.
+    content_sha256: Mapped[str] = mapped_column(String(64))
+
+    # --- the search index, as far as this article is concerned ---------------------------
+    #
+    # Written together, last, after every point for this article was acknowledged. Any of
+    # them NULL means the article is not completely indexed, and retrieval ignores it --
+    # which is the safe direction to be wrong in.
+    indexed_content_sha256: Mapped[str | None] = mapped_column(String(64))
+    indexed_embedding_model: Mapped[str | None] = mapped_column(String(128))
+    indexed_chunking_version: Mapped[str | None] = mapped_column(String(16))
+    indexed_point_count: Mapped[int | None] = mapped_column()
+    indexed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class NewsIngestionRun(Base):
+    """A receipt for one news ingestion: when it ran, and what each source did.
+
+    It exists for one question a row count cannot answer: **when did this source last
+    succeed?** A feed that was read successfully and had nothing new to say changes no rows
+    at all, and deriving "last success" from `news_articles.ingested_at` would report it as
+    stale forever. So success is recorded here, where a zero-article read is still a row.
+
+    Small on purpose, like `IngestionRun`, and written once per run after every source has
+    been tried -- including the ones that failed, whose error is recorded beside the rest.
+    There is no company to attach it to: a macro release is nobody's filing.
+    """
+
+    __tablename__ = "news_ingestion_runs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # The sources that were asked, in order, so a source that is not mentioned reads as
+    # "never attempted" rather than "attempted and produced nothing".
+    sources: Mapped[list] = mapped_column(JSONB)
+    # Per source: status, counts, and the sanitized error where there was one.
+    results: Mapped[dict] = mapped_column(JSONB)
 
 
 class Conversation(Base):

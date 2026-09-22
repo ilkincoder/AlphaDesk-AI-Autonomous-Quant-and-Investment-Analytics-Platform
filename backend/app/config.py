@@ -43,11 +43,35 @@ class Settings(BaseSettings):
     # The collection holding the filing passages. One collection, filtered by company.
     qdrant_collection: str = "sec_filings"
 
+    # The collection holding news passages. A *second* collection rather than a filter
+    # inside the first: news and filings are different corpora with different lifetimes,
+    # and keeping them apart means either one can be dropped and rebuilt without touching
+    # the other. Both are written with the same embedding model and the same chunker.
+    qdrant_news_collection: str = "news"
+
     # Where FastEmbed keeps the model it downloads. This MUST point at a mounted volume.
     # FastEmbed's own default is `{tempdir}/fastembed_cache` -- /tmp -- which is neither
     # shared with the host nor preserved when the container is recreated, so every
     # `docker compose up --build` would re-download the model.
     fastembed_cache_path: str = "/models/fastembed"
+
+    # --- Alpaca paper trading (Module 2) ------------------------------------------------
+    #
+    # The paper account AlphaDesk synchronises its portfolio from. Both credentials are
+    # optional for the same reason as the keys above: the API must start and serve every
+    # existing endpoint whether or not they are present. Nothing here is read at import
+    # time -- the sync endpoint constructs the client when it is actually called, and a
+    # missing credential is that call's error to report.
+    #
+    # Read from ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY. Never log either, never send
+    # either to the frontend, and never place one in a URL: they travel as request headers.
+    alpaca_api_key_id: str | None = None
+    alpaca_api_secret_key: str | None = None
+
+    # The paper trading host, and the ONLY host this integration will talk to. The client
+    # refused anything else -- see `app/alpaca.py` -- so pointing this at the live account
+    # is a startup-visible error rather than a set of real orders.
+    alpaca_base_url: str = "https://paper-api.alpaca.markets"
 
     # --- Module 1 agent -----------------------------------------------------------------
     #

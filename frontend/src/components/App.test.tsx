@@ -11,6 +11,7 @@ const DEMO: Valuation = {
   portfolio_id: 1,
   currency: 'USD',
   price_source: 'demo',
+  last_synced_at: null,
   cash_balance: '10000.00',
   holdings_value: '6100.00',
   total_value: '16100.00',

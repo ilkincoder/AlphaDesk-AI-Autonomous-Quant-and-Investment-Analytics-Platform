@@ -15,6 +15,7 @@ import {
   formatCurrency,
   formatPercent,
   formatSignedPercent,
+  formatSyncTime,
 } from '../format'
 import { Button } from './Button'
 import { Card } from './Card'
@@ -117,9 +118,7 @@ export function WhatIfPage() {
             Explore how a hypothetical stock price change could affect your portfolio.
           </p>
         </div>
-        <span className="rounded-full bg-selected px-2.5 py-1 text-label text-accent-ink">
-          Demo prices
-        </span>
+        <PriceBadge state={state} />
       </header>
 
       <div className="mt-6">
@@ -155,6 +154,32 @@ export function WhatIfPage() {
         )}
       </div>
     </div>
+  )
+}
+
+/** The same claim the Portfolio page makes about its figures, made here.
+ *
+ * This page shows no badge until it has data, because "no badge" would read as "these are
+ * live prices" — and the form below is only usable once the holdings have loaded anyway.
+ */
+function PriceBadge({ state }: { state: State }) {
+  if (state.phase !== 'ready') return null
+
+  const { price_source: source, last_synced_at: lastSyncedAt } = state.valuation
+  if (source === 'demo') {
+    return (
+      <span className="rounded-full bg-selected px-2.5 py-1 text-label text-accent-ink">
+        Demo prices
+      </span>
+    )
+  }
+
+  const syncedAt = formatSyncTime(lastSyncedAt)
+  return (
+    <span className="rounded-full bg-selected px-2.5 py-1 text-label text-accent-ink">
+      Alpaca Paper
+      {syncedAt === null ? ' · Not synced yet' : ` · Last synced ${syncedAt}`}
+    </span>
   )
 }
 

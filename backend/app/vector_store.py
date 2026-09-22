@@ -198,6 +198,29 @@ class VectorStore:
             ) from exc
         return len(points)
 
+    def delete(self, *, query_filter: models.Filter) -> None:
+        """Remove every point matching `query_filter`, acknowledged before returning.
+
+        For replacing a document's chunks when its text changes. Deleting by *filter* rather
+        than by a list of ids is what makes it complete: the ids of the previous version are
+        not something the caller has to have kept, and a version that produced more chunks
+        than the one replacing it would otherwise leave its tail behind forever.
+
+        `wait=True` for the same reason `upsert` uses it -- a caller that writes new points
+        immediately afterwards must not race the delete it depends on.
+        """
+        try:
+            self.client.delete(
+                collection_name=self._collection,
+                points_selector=models.FilterSelector(filter=query_filter),
+                wait=True,
+            )
+        except Exception as exc:
+            raise VectorStoreError(
+                f"could not delete points from {self._collection!r}: "
+                f"{type(exc).__name__}"
+            ) from exc
+
     # --- reading -------------------------------------------------------------------------
 
     def query(

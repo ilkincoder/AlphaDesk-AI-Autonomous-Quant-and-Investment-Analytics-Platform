@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
-import { ApiError, fetchValuation } from '../api'
+import { ApiError, fetchValuation, syncPortfolio } from '../api'
 import type { Valuation } from '../api'
+import { formatSyncTime } from '../format'
 import { Button } from './Button'
 import { HoldingsCard } from './HoldingsCard'
 import { PortfolioValueCard } from './PortfolioValueCard'
@@ -10,14 +11,24 @@ import { Banner, ErrorNotice, LoadingCards } from './States'
 /** The sections the page will eventually have. Only Overview exists today. */
 const TABS = ['Overview', 'Holdings', 'Performance', 'Allocation', 'History']
 
+/** How often the page re-reads the broker while it is on screen.
+ *
+ * Every tick is a sync, not just a read: the point is to notice a fill, and a stored
+ * snapshot that is only re-read would never change. The backend refuses to run two at once,
+ * so a slow sync and the next tick cannot pile up. */
+const REFRESH_INTERVAL_MS = 30_000
+
 /** One state at a time, so "loading and also showing data" is unrepresentable.
  *
  * `stale` is the important one: a refresh failed but the previous numbers are still
  * on screen. They are kept, and labelled, rather than cleared or passed off as fresh.
+ *
+ * `syncError` on `ready` is the other half of that: the figures loaded, but the broker
+ * read behind them did not happen, so they are as old as the last successful one.
  */
 type State =
   | { phase: 'loading' }
-  | { phase: 'ready'; valuation: Valuation }
+  | { phase: 'ready'; valuation: Valuation; syncError: string | null }
   | { phase: 'stale'; valuation: Valuation; message: string }
   | { phase: 'error'; message: string; portfolioMissing: boolean }
 
@@ -45,18 +56,41 @@ function RefreshIcon() {
   )
 }
 
-export function PortfolioPage() {
+/** `active` is whether this page is the one being shown.
+ *
+ * The shell keeps a visited page mounted and hidden rather than unmounting it, so mounting
+ * is not the same event as "the reader arrived here". The page cannot tell the difference
+ * on its own, and it has to: a hidden page that kept syncing every thirty seconds would
+ * spend the reader's broker quota on a screen nobody is looking at.
+ */
+export function PortfolioPage({ active = true }: { active?: boolean }) {
   const [state, setState] = useState<State>({ phase: 'loading' })
   const [refreshing, setRefreshing] = useState(false)
+  // A ref, not state: this is a guard against a second call, and setting state would not
+  // have taken effect before the second call had already started.
+  const inFlight = useRef(false)
 
   const load = useCallback(async (signal?: AbortSignal) => {
+    if (inFlight.current) return
+    inFlight.current = true
     // Anything already on screen stays on screen while this runs; only a page with
     // nothing to show falls back to the skeletons.
     setRefreshing(true)
 
     try {
+      // Sync first, then read what was stored. A failed sync still leaves a readable
+      // snapshot -- the previous one, unchanged -- so the read goes ahead and the sync's
+      // message is carried as a note rather than replacing the figures.
+      let syncError: string | null = null
+      try {
+        await syncPortfolio(signal)
+      } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') throw error
+        syncError = messageOf(error)
+      }
+
       const valuation = await fetchValuation(signal)
-      setState({ phase: 'ready', valuation })
+      setState({ phase: 'ready', valuation, syncError })
     } catch (error) {
       // An aborted request was replaced by a newer one, or the page is going away.
       if (error instanceof DOMException && error.name === 'AbortError') return
@@ -72,17 +106,37 @@ export function PortfolioPage() {
             },
       )
     } finally {
+      inFlight.current = false
       setRefreshing(false)
     }
   }, [])
 
   useEffect(() => {
+    if (!active) return
+
     const controller = new AbortController()
     void load(controller.signal)
-    // StrictMode runs this twice in development; aborting the first request keeps the
-    // two from racing to set state.
-    return () => controller.abort()
-  }, [load])
+
+    const timer = window.setInterval(() => {
+      // A background tab is not being read, so it does not get synced. The listener below
+      // refreshes on the way back, which is what makes skipping those ticks safe.
+      if (document.visibilityState !== 'visible') return
+      void load(controller.signal)
+    }, REFRESH_INTERVAL_MS)
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') void load(controller.signal)
+    }
+    document.addEventListener('visibilitychange', onVisibilityChange)
+
+    return () => {
+      window.clearInterval(timer)
+      document.removeEventListener('visibilitychange', onVisibilityChange)
+      // StrictMode runs this twice in development; aborting the first request keeps the
+      // two from racing to set state.
+      controller.abort()
+    }
+  }, [active, load])
 
   return (
     <div>
@@ -107,22 +161,22 @@ export function PortfolioPage() {
       <div className="mt-4 flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-line">
         <div role="tablist" aria-label="Portfolio sections" className="flex gap-1">
           {TABS.map((tab, index) => {
-            const active = index === 0
+            const selected = index === 0
             return (
               <button
                 key={tab}
                 id={`portfolio-tab-${index}`}
                 type="button"
                 role="tab"
-                aria-selected={active}
-                aria-controls={active ? 'portfolio-overview' : undefined}
-                disabled={!active}
-                title={active ? undefined : 'Coming soon'}
+                aria-selected={selected}
+                aria-controls={selected ? 'portfolio-overview' : undefined}
+                disabled={!selected}
+                title={selected ? undefined : 'Coming soon'}
                 // -mb-px pulls the 2px underline down over the row's own divider, so
                 // the active tab looks like it interrupts the line rather than
                 // sitting above it.
                 className={`-mb-px border-b-2 px-3 py-2 text-body transition-colors ${
-                  active
+                  selected
                     ? 'border-accent font-medium text-accent-ink'
                     : 'border-transparent text-faint disabled:opacity-70'
                 }`}
@@ -133,9 +187,7 @@ export function PortfolioPage() {
           })}
         </div>
 
-        <span className="mb-2 ml-auto rounded-full bg-selected px-2.5 py-1 text-label text-accent-ink">
-          Demo prices
-        </span>
+        <SourceBadge state={state} />
       </div>
 
       <div
@@ -148,6 +200,34 @@ export function PortfolioPage() {
         <Overview state={state} onRetry={() => void load()} />
       </div>
     </div>
+  )
+}
+
+/** Where the figures came from and how old they are.
+ *
+ * Three states, said in as many words, because "no badge" would read as "these are live".
+ * Before the first successful sync the page is showing the placeholder portfolio, and the
+ * badge is the only thing on screen that says so.
+ */
+function SourceBadge({ state }: { state: State }) {
+  if (state.phase !== 'ready' && state.phase !== 'stale') return null
+
+  const { price_source: source, last_synced_at: lastSyncedAt } = state.valuation
+  const syncedAt = formatSyncTime(lastSyncedAt)
+
+  if (source === 'demo') {
+    return (
+      <span className="mb-2 ml-auto rounded-full bg-selected px-2.5 py-1 text-label text-accent-ink">
+        Demo prices
+      </span>
+    )
+  }
+
+  return (
+    <span className="mb-2 ml-auto rounded-full bg-selected px-2.5 py-1 text-label text-accent-ink">
+      Alpaca Paper
+      {syncedAt === null ? ' · Not synced yet' : ` · Last synced ${syncedAt}`}
+    </span>
   )
 }
 
@@ -170,6 +250,20 @@ function Overview({ state, onRetry }: { state: State; onRetry: () => void }) {
 
   return (
     <div className="space-y-4">
+      {/* The figures below are real and stored; what failed was the broker read that would
+          have refreshed them. Saying so is the difference between a stale number and a
+          wrong one. */}
+      {state.phase === 'ready' && state.syncError !== null && (
+        <Banner>
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+            <span>Showing the last saved values. Could not sync: {state.syncError}</span>
+            <Button className="bg-transparent" onClick={onRetry}>
+              Retry
+            </Button>
+          </div>
+        </Banner>
+      )}
+
       {state.phase === 'stale' && (
         <Banner>
           <div className="flex flex-wrap items-center gap-x-3 gap-y-2">

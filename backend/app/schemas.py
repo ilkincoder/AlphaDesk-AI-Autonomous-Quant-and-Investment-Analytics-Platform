@@ -9,18 +9,28 @@ columns at all -- the calculation quantises them to 2 decimal places itself, so 
 arrive here already rounded and keep that scale.
 """
 
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class HoldingOut(BaseModel):
+    """One stored position.
+
+    `market_price` and `market_value` are the broker's, and are null on a portfolio that
+    has never been synchronised. Null means "nothing has priced this row", which is a
+    different fact from a price of zero -- and the frontend shows a dash for it rather
+    than a figure.
+    """
+
     model_config = ConfigDict(from_attributes=True)
 
     symbol: str
     quantity: Decimal
     average_buy_price: Decimal
+    market_price: Decimal | None = None
+    market_value: Decimal | None = None
 
 
 class PortfolioOut(BaseModel):
@@ -50,7 +60,7 @@ class ValuationHoldingOut(BaseModel):
 
 
 class PortfolioValuationOut(BaseModel):
-    """A portfolio valued against the demo prices.
+    """A portfolio valued against whichever prices describe it.
 
     `allocation_percent` and `cash_allocation_percent` are null when `total_value` is
     zero, because the share is undefined rather than zero.
@@ -59,9 +69,12 @@ class PortfolioValuationOut(BaseModel):
     portfolio_id: int
     currency: str
     # Which prices produced these numbers. "demo" means the fictional constants in
-    # app.valuation, never a live quote -- hence no timestamp: there is no market data
-    # here to have a time.
+    # app.valuation, never a live quote -- hence no timestamp on that path. Any other
+    # value is a broker slug, and `last_synced_at` says how old the figures are.
     price_source: str
+    # When the snapshot behind these numbers was read from the broker. Null on the demo
+    # basis, where there is no market data to have a time.
+    last_synced_at: datetime | None = None
     cash_balance: Decimal
     holdings_value: Decimal
     total_value: Decimal
@@ -95,6 +108,8 @@ class ScenarioOut(BaseModel):
     portfolio_id: int
     currency: str
     price_source: str
+    # As on the valuation: when the broker snapshot behind the "before" column was read.
+    last_synced_at: datetime | None = None
     symbol: str
     price_change_percent: Decimal
     price_before: Decimal
@@ -105,6 +120,147 @@ class ScenarioOut(BaseModel):
     total_value_after: Decimal
     change_value: Decimal
     change_percent: Decimal | None
+
+class PortfolioSyncOut(BaseModel):
+    """The result of one broker sync.
+
+    `applied` is False when a newer snapshot was already stored and this one was refused
+    for being older. The figures below are then the **stored** ones, which is what the
+    portfolio actually holds -- a refused snapshot's numbers would describe a state the
+    database is not in.
+
+    `broker_account_id` is the broker's own account identifier, not a credential. Nothing
+    in this response is secret, and no key is ever echoed into it.
+    """
+
+    applied: bool
+    portfolio_id: int
+    broker: str | None
+    broker_account_id: str | None
+    last_synced_at: datetime | None
+    currency: str
+    cash_balance: Decimal
+    equity: Decimal | None
+    position_count: int
+
+
+# --- news ------------------------------------------------------------------------------------
+#
+# The shapes the News page reads. Two times appear on every article and they are deliberately
+# not interchangeable: `published_at` is when the publisher says the story ran, and
+# `ingested_at` is when this database stored it. A page that showed only one of them would be
+# unable to say whether a story was new or merely newly fetched.
+
+
+class NewsArticleOut(BaseModel):
+    """One article, as a listing shows it."""
+
+    id: int
+    provider: str
+    source: str
+    category: str
+    title: str
+    excerpt: str
+    url: str
+    symbols: list[str]
+    # The publisher's own publication time. Never replaced by our ingestion time.
+    published_at: datetime
+    # The provider's own revision time, when it supplied one. NULL is "the provider said
+    # nothing about revisions", not "never revised".
+    provider_updated_at: datetime | None = None
+    # When this database stored the article, so the two can be told apart on screen.
+    ingested_at: datetime
+    # False while an article is stored but not in the search index, which is the state an
+    # indexing failure leaves behind.
+    indexed: bool
+
+
+class NewsSourceStatusOut(BaseModel):
+    """What one source last did, so the page can show staleness rather than guess at it."""
+
+    source: str
+    last_success_at: datetime | None = None
+
+
+class NewsListOut(BaseModel):
+    """A page of articles, newest first by publication time.
+
+    The source block is returned with the list rather than from its own route: the page needs
+    it even when the list is empty, and two round trips to draw one screen is one more than
+    the screen needs.
+    """
+
+    total: int
+    limit: int
+    offset: int
+    articles: list[NewsArticleOut]
+    sources: list[NewsSourceStatusOut]
+    # Stated once, here, because it is a property of the feed rather than of any article.
+    # Alpaca documents that news is delayed without real-time entitlement, and a successful
+    # request does not prove otherwise -- so nothing in this build claims to be live.
+    timeliness: str
+
+
+class NewsSearchPassageOut(BaseModel):
+    """One retrieved passage and the article it came from.
+
+    `similarity` is a cosine similarity, not a percentage: it says how close two vectors are
+    and nothing about whether the passage answers anything.
+    """
+
+    text: str
+    similarity: float
+    chunk_index: int
+    article: NewsArticleOut
+
+
+class NewsSearchOut(BaseModel):
+    """A semantic search over the stored news.
+
+    `status` is the whole answer: `ok`, `no_matching_results`, `nothing_indexed`,
+    `index_unavailable` or `model_unavailable`. "Nothing matched" and "the index is down"
+    are different things to be told, and collapsing them would report one as the other.
+    """
+
+    status: str
+    reason: str | None = None
+    query: str
+    returned: int
+    passages: list[NewsSearchPassageOut]
+    warnings: list[str] = Field(default_factory=list)
+
+
+class NewsSourceResultOut(BaseModel):
+    """What one source did during an ingestion run."""
+
+    source: str
+    status: str
+    fetched: int
+    new: int
+    updated: int
+    unchanged: int
+    indexed: int
+    failed_index: int
+    error: str | None = None
+    last_success_at: datetime | None = None
+
+
+class NewsIngestOut(BaseModel):
+    """The result of one bounded ingestion.
+
+    A partial failure is a **200**, not an error: the run completed, some sources stored
+    what they fetched, and `sources` says exactly which did and which did not. Only a run in
+    which every source failed is a 503, because that is the case where nothing was read.
+    """
+
+    started_at: datetime
+    completed_at: datetime
+    symbols: list[str]
+    stored: int
+    indexed: int
+    failed_sources: list[str]
+    sources: list[NewsSourceResultOut]
+
 
 # --- the analysis chat ---------------------------------------------------------------------
 #

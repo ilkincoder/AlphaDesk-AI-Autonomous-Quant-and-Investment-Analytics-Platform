@@ -62,6 +62,42 @@ export function isZeroAmount(value: string): boolean {
   return !/[1-9]/.test(value)
 }
 
+/** An ISO timestamp from the API as a local wall-clock time, e.g. `"14:32:07"`.
+ *
+ * `null` is "nothing has been read from the broker", which is a different thing from a
+ * time, so it returns null and the caller decides what to say.
+ *
+ * The date is *parsed* here, unlike every money value on this page, and that is not an
+ * inconsistency: a timestamp is not a money amount, and `Date` is the only thing that
+ * knows the reader's timezone. An unparseable value returns null rather than "Invalid
+ * Date", because a broken timestamp should leave the page without a sync time, not with a
+ * wrong one.
+ */
+export function formatSyncTime(value: string | null): string | null {
+  if (value === null) return null
+  const at = new Date(value)
+  if (Number.isNaN(at.getTime())) return null
+  return at.toLocaleTimeString()
+}
+
+/** An ISO timestamp as a short local date and time, e.g. `"Sep 22, 14:39"`.
+ *
+ * For a news article's publication time, where the date matters and the seconds do not: a
+ * story from three days ago and one from three minutes ago must not look alike. `null`
+ * returns null, and an unparseable value returns null rather than "Invalid Date".
+ */
+export function formatDateTime(value: string | null): string | null {
+  if (value === null) return null
+  const at = new Date(value)
+  if (Number.isNaN(at.getTime())) return null
+  return at.toLocaleString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
 /** Which way a change went, as a word.
  *
  * Returned separately from any colour so that the direction survives without it. Red and

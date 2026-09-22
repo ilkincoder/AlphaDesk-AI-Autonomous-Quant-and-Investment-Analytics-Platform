@@ -47,6 +47,17 @@ services:
       # browser is a key given away.
       TWELVE_DATA_API_KEY: ${TWELVE_DATA_API_KEY:-}
       SEC_USER_AGENT: ${SEC_USER_AGENT:-}
+      # Alpaca paper trading (Module 2). The key pair is a real secret and travels the
+      # same way as the keys above: into the backend container only, never into the
+      # frontend service below. `:-` again, so a machine with no keys still starts and
+      # POST /portfolio/sync is the only thing that reports them as missing.
+      #
+      # The base URL is not a secret, and its only accepted value is the paper host --
+      # see `app/alpaca.py`. It is a variable rather than a constant so the restriction
+      # appears in configuration somewhere a person will actually read it.
+      ALPACA_API_KEY_ID: ${ALPACA_API_KEY_ID:-}
+      ALPACA_API_SECRET_KEY: ${ALPACA_API_SECRET_KEY:-}
+      ALPACA_API_BASE_URL: ${ALPACA_API_BASE_URL:-https://paper-api.alpaca.markets}
       # Module 1 agent (steps 7B and 8). The model name and base URL are not secrets, but
       # they are passed the same way so all the agent's configuration lives in one place.
       # `:-` again, so a machine with no key still starts and `python -m app.run_analysis`

@@ -131,6 +131,8 @@ def calculate_valuation(
     holdings: Iterable[PricedHolding],
     cash_balance: Decimal,
     prices: Mapping[str, Decimal],
+    *,
+    reported_total_value: Decimal | None = None,
 ) -> Valuation:
     """Value `holdings` and `cash_balance` against `prices`.
 
@@ -151,6 +153,13 @@ def calculate_valuation(
     Neither is an error. Both are what "round only the output" costs, and the alternative
     -- rounding every step -- accumulates error instead.
 
+    `reported_total_value` is for a portfolio whose total is already a fact rather than an
+    arithmetic result: a broker's own equity figure. When it is given it *is* the total,
+    and it is what the allocation percentages are a share of, so the parts and the whole
+    stay in one frame. It is not a rounding of the computed total and not a correction to
+    it -- a broker's account and positions are two moments, and equity need not equal
+    positions plus cash to the cent. None (the default) computes the total as above.
+
     Raises MissingPriceError, naming every affected symbol, if any held symbol is absent
     from `prices`. `average_buy_price` is never consulted as a substitute: a purchase
     price is not a valuation price.
@@ -169,7 +178,11 @@ def calculate_valuation(
     holdings_value = sum(
         (quantity * price for _, quantity, price in priced), start=Decimal("0")
     )
-    total_value = holdings_value + cash_balance
+    total_value = (
+        holdings_value + cash_balance
+        if reported_total_value is None
+        else reported_total_value
+    )
 
     return Valuation(
         cash_balance=_round_2dp(cash_balance),
@@ -195,6 +208,8 @@ def calculate_scenario(
     prices: Mapping[str, Decimal],
     symbol: str,
     price_change: Decimal,
+    *,
+    reported_total_value: Decimal | None = None,
 ) -> Scenario:
     """Re-price one holding by `price_change` and report what moves.
 
@@ -241,8 +256,24 @@ def calculate_scenario(
     shocked = dict(prices)
     shocked[symbol] = price_after
 
-    before = calculate_valuation(ordered, cash_balance, prices)
-    after = calculate_valuation(ordered, cash_balance, shocked)
+    # A reported total moves with the one price that moved. Cash, quantities and every
+    # other price are identical on both sides, so the shocked holding's own change is the
+    # only thing the total can have moved by -- whereas handing both sides the same
+    # reported total would report a portfolio whose value did not change when a price did.
+    after_total = (
+        None
+        if reported_total_value is None
+        else reported_total_value
+        + (price_after - price_before)
+        * next(item.quantity for item in ordered if item.symbol == symbol)
+    )
+
+    before = calculate_valuation(
+        ordered, cash_balance, prices, reported_total_value=reported_total_value
+    )
+    after = calculate_valuation(
+        ordered, cash_balance, shocked, reported_total_value=after_total
+    )
 
     holding_before = next(item for item in before.holdings if item.symbol == symbol)
     holding_after = next(item for item in after.holdings if item.symbol == symbol)

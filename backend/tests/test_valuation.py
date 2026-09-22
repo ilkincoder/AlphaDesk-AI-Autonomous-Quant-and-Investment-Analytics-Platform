@@ -23,10 +23,15 @@ class StubHolding:
     Note what is missing: no `average_buy_price`. If the calculation ever fell back to
     the purchase price when a valuation price was absent, every test here would fail
     with an AttributeError instead of passing.
+
+    `market_price` is here for the same reason, from the other side: it is the column a
+    synchronised portfolio stores its broker price in, so a stub without one is a
+    portfolio the price resolution must refuse rather than value.
     """
 
     symbol: str
     quantity: Decimal
+    market_price: Decimal | None = None
 
 
 def holding(symbol: str, quantity: str) -> StubHolding:
@@ -156,6 +161,63 @@ class MissingPriceTest(unittest.TestCase):
             )
 
         self.assertEqual(caught.exception.symbols, ["XYZ", "ZZZ"])
+
+
+class ReportedTotalTest(unittest.TestCase):
+    """A broker's own equity, used as the total instead of the arithmetic.
+
+    The two are different numbers on purpose: the broker's account and its positions are
+    two reads, so equity need not equal positions plus cash to the cent, and the figure the
+    broker states is the one to report.
+    """
+
+    def test_a_reported_total_is_the_total(self):
+        result = calculate_valuation(
+            [holding("AAPL", "5"), holding("NVDA", "10")],
+            Decimal("10000.00"),
+            DEMO_PRICES,
+            reported_total_value=Decimal("12400.00"),
+        )
+
+        self.assertEqual(result.total_value, Decimal("12400.00"))
+        self.assertEqual(result.holdings_value, Decimal("2500.00"))
+        self.assertEqual(result.cash_balance, Decimal("10000.00"))
+
+    def test_allocations_are_shares_of_the_reported_total(self):
+        """The parts and the whole stay in one frame: a percentage taken against the
+        computed total while the headline shows the broker's would not add up on screen."""
+        result = calculate_valuation(
+            [holding("AAPL", "5")],
+            Decimal("10000.00"),
+            DEMO_PRICES,
+            reported_total_value=Decimal("12000.00"),
+        )
+
+        # 1000.00 / 12000.00, not 1000.00 / 11000.00.
+        self.assertEqual(result.holdings[0].allocation_percent, Decimal("8.33"))
+        self.assertEqual(result.cash_allocation_percent, Decimal("83.33"))
+
+    def test_omitting_it_leaves_the_arithmetic_exactly_as_it_was(self):
+        holdings = [holding("AAPL", "5"), holding("NVDA", "10")]
+
+        computed = calculate_valuation(holdings, Decimal("10000.00"), DEMO_PRICES)
+        explicit = calculate_valuation(
+            holdings, Decimal("10000.00"), DEMO_PRICES, reported_total_value=None
+        )
+
+        self.assertEqual(computed, explicit)
+        self.assertEqual(computed.total_value, Decimal("12500.00"))
+
+    def test_a_reported_total_of_zero_is_a_total_not_an_absence(self):
+        result = calculate_valuation(
+            [],
+            Decimal("0.00"),
+            DEMO_PRICES,
+            reported_total_value=Decimal("0.00"),
+        )
+
+        self.assertEqual(result.total_value, Decimal("0.00"))
+        self.assertIsNone(result.cash_allocation_percent)
 
 
 if __name__ == "__main__":

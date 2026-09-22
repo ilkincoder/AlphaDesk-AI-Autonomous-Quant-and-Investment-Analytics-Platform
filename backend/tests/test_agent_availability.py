@@ -182,9 +182,10 @@ class HeldButNotIngestedTests(AvailabilityTestCase):
         from decimal import Decimal
 
         from app.models import Holding, Portfolio
+        from app.portfolio_identity import DEMO_PORTFOLIO_NAME
 
         portfolio = Portfolio(
-            name="AlphaDesk Demo", currency="USD", cash_balance=Decimal("1000.00")
+            name=DEMO_PORTFOLIO_NAME, currency="USD", cash_balance=Decimal("1000.00")
         )
         self.session.add(portfolio)
         self.session.flush()

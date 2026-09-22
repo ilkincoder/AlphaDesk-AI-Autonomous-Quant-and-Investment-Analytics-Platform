@@ -18,10 +18,13 @@ import unittest
 
 from app.models import Base
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 from tests.testdb import alembic_revision, run_alembic, table_names, test_engine
 
-HEAD_REVISION = "0009_conversations"
+HEAD_REVISION = "0011_news"
+REVISION_0010 = "0010_alpaca_broker_link"
+REVISION_0009 = "0009_conversations"
 REVISION_0008 = "0008_form4_scope_rename"
 REVISION_0007 = "0007_document_index_manifest"
 REVISION_0004 = "0004_company_context"
@@ -47,6 +50,7 @@ TABLES_FROM_0004 = frozenset(
 )
 TABLES_FROM_0007 = frozenset({"document_index_manifest"})
 TABLES_FROM_0009 = frozenset({"conversations", "conversation_turns"})
+TABLES_FROM_0011 = frozenset({"news_articles", "news_ingestion_runs"})
 
 # Every table any of our migrations creates, for the checks that only care that they are
 # all there or all gone.
@@ -56,10 +60,17 @@ ALL_INTRODUCED = (
     | TABLES_FROM_0004
     | TABLES_FROM_0007
     | TABLES_FROM_0009
+    | TABLES_FROM_0011
 )
 
 # Untouched by any of them, and the reason every downgrade has to be selective.
 EXISTING_TABLES = frozenset({"portfolios", "holdings"})
+
+# What 0010 adds, and what its downgrade must therefore take away again.
+BROKER_COLUMNS = frozenset(
+    {"broker", "broker_account_id", "broker_equity", "last_synced_at"}
+)
+MARKET_COLUMNS = frozenset({"market_price", "market_value"})
 
 
 class MigrationRoundtripTest(unittest.TestCase):
@@ -71,8 +82,103 @@ class MigrationRoundtripTest(unittest.TestCase):
         # Every test here starts from head, whatever the previous one did.
         run_alembic("upgrade", "head")
 
-    def test_head_is_the_conversation_revision(self):
+    def test_head_is_the_news_revision(self):
         self.assertEqual(alembic_revision(self.engine), HEAD_REVISION)
+
+    def test_downgrading_0011_removes_only_the_news_tables(self):
+        """0011 adds two tables and alters nothing, so its downgrade should be exactly the
+        two tables going and everything else staying."""
+        run_alembic("downgrade", REVISION_0010)
+        try:
+            remaining = table_names(self.engine)
+
+            self.assertEqual(remaining & TABLES_FROM_0011, set())
+            self.assertLessEqual(EXISTING_TABLES, remaining)
+            self.assertLessEqual(
+                TABLES_FROM_0009,
+                remaining,
+                "0011's downgrade reached tables that belong to earlier migrations",
+            )
+            # 0010 is still applied, so its columns are still there.
+            with self.engine.connect() as connection:
+                columns = self._columns(connection, "portfolios")
+            self.assertLessEqual(BROKER_COLUMNS, columns)
+            self.assertEqual(alembic_revision(self.engine), REVISION_0010)
+        finally:
+            run_alembic("upgrade", "head")
+            self.engine.dispose()
+
+        self.assertLessEqual(TABLES_FROM_0011, table_names(self.engine))
+
+    def test_downgrading_0010_replaces_the_cash_check_rather_than_removing_it(self):
+        """0010 adds no table and touches no row, so what is checked is the constraint it
+        swaps and the columns it adds. It is the one migration here whose constraint
+        change is a *replacement*: the original rule survives, scoped to the rows it still
+        applies to."""
+        run_alembic("downgrade", REVISION_0009)
+        try:
+            with self.engine.connect() as connection:
+                columns = self._columns(connection, "portfolios")
+                holdings_columns = self._columns(connection, "holdings")
+                constraints = self._constraints(connection, "portfolios")
+
+            self.assertEqual(columns & BROKER_COLUMNS, set())
+            self.assertEqual(holdings_columns & MARKET_COLUMNS, set())
+            self.assertIn("ck_portfolios_cash_balance_nonnegative", constraints)
+            self.assertNotIn("ck_portfolios_unlinked_cash_balance_nonnegative", constraints)
+            self.assertEqual(alembic_revision(self.engine), REVISION_0009)
+        finally:
+            run_alembic("upgrade", "head")
+            self.engine.dispose()
+
+        with self.engine.connect() as connection:
+            columns = self._columns(connection, "portfolios")
+            constraints = self._constraints(connection, "portfolios")
+
+        self.assertLessEqual(BROKER_COLUMNS, columns)
+        self.assertNotIn("ck_portfolios_cash_balance_nonnegative", constraints)
+        self.assertIn("ck_portfolios_unlinked_cash_balance_nonnegative", constraints)
+
+    def test_the_cash_check_0010_leaves_behind_still_applies_to_an_unlinked_row(self):
+        """The constraint is not decoration: the row it still governs has to be refused.
+
+        A negative balance is legitimate once a broker reports it and a bug before that,
+        and this is what tells the two apart in the database rather than in a comment.
+        """
+        with self.engine.connect() as connection:
+            transaction = connection.begin()
+            try:
+                with self.assertRaises(IntegrityError):
+                    connection.execute(
+                        text(
+                            "INSERT INTO portfolios (name, cash_balance, currency) "
+                            "VALUES ('probe-unlinked', -5.00, 'USD')"
+                        )
+                    )
+            finally:
+                transaction.rollback()
+
+    @staticmethod
+    def _columns(connection, table: str) -> set[str]:
+        return set(
+            connection.scalars(
+                text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = :table"
+                ).bindparams(table=table)
+            )
+        )
+
+    @staticmethod
+    def _constraints(connection, table: str) -> set[str]:
+        return set(
+            connection.scalars(
+                text(
+                    "SELECT constraint_name FROM information_schema.table_constraints "
+                    "WHERE table_name = :table"
+                ).bindparams(table=table)
+            )
+        )
 
     def test_every_introduced_table_exists_at_head(self):
         self.assertLessEqual(ALL_INTRODUCED, table_names(self.engine))

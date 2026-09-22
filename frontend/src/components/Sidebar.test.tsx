@@ -21,7 +21,7 @@ function navLabels() {
 }
 
 describe('Sidebar', () => {
-  it('lists every destination, with What if? directly below Portfolio', () => {
+  it('lists every destination, with News directly below What if?', () => {
     renderSidebar()
 
     expect(navLabels()).toEqual([
@@ -29,26 +29,37 @@ describe('Sidebar', () => {
       'Analysis',
       'Portfolio',
       'What if?',
+      'News',
       'Strategies',
       'Backtest',
       'Orders',
       'Watchlist',
-      'Data & News',
       'Settings',
     ])
   })
 
-  it('marks the current page and disables the seven that have no page', () => {
+  it('marks the current page and disables the six that have no page', () => {
     renderSidebar()
 
     const portfolio = screen.getByRole('button', { name: 'Portfolio' })
     expect(portfolio.getAttribute('aria-current')).toBe('page')
     expect(portfolio.hasAttribute('disabled')).toBe(false)
 
-    // Ten destinations, three built. The seven without a page behind them are genuinely
+    // Ten destinations, four built. The six without a page behind them are genuinely
     // disabled rather than links that navigate nowhere.
-    expect(screen.getAllByTitle('Coming soon')).toHaveLength(7)
+    expect(screen.getAllByTitle('Coming soon')).toHaveLength(6)
     expect(screen.getByRole('button', { name: 'Dashboard' }).hasAttribute('disabled')).toBe(true)
+  })
+
+  it('enables News, and reports it as the chosen destination', () => {
+    const onNavigate = renderSidebar('news')
+
+    const news = screen.getByRole('button', { name: 'News' })
+    expect(news.hasAttribute('disabled')).toBe(false)
+    expect(news.getAttribute('aria-current')).toBe('page')
+
+    fireEvent.click(news)
+    expect(onNavigate).toHaveBeenCalledWith('news')
   })
 
   it('enables Analysis, and marks it current when it is the page', () => {
