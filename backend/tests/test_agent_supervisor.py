@@ -19,9 +19,15 @@ from app.agent.budget import RunBudget
 from app.agent.context import ExplicitArguments, KnownSymbols, RequestInputs
 from app.agent.evidence import EvidenceMap
 from app.agent.module1 import Module1Findings, Module1Outcome
+from app.agent.budget import RunBudget
+from app.agent.evidence import EvidenceMap
+from app.agent.module1 import Module1Outcome
+from app.agent.module2 import ProposalOutcome
 from app.agent.supervisor import (
     MAX_EVIDENCE_IN_PROMPT,
     Destination,
+    SupervisorOutcome,
+    _routing_request,
     SupervisorRoute,
     cited_references,
     compose_request,
@@ -160,16 +166,29 @@ class RoutingTests(unittest.TestCase):
         self.assertIn("Hello", outcome.answer)
 
     def test_every_destination_in_the_closed_set_is_reachable(self):
-        """The four destinations are the whole vocabulary; a fifth cannot be returned."""
+        """The vocabulary, and which half of it the model may choose from.
+
+        `rebalance_proposal` is in the enum and deliberately *not* in the router's set: the only
+        thing that produces a proposal is a person pressing a button, and a model asked to
+        classify one would spend a request learning what the caller already said. What this
+        asserts is that the enum has not grown a member nobody can reach and that the router's
+        half is exactly the four it started with.
+        """
         self.assertEqual(
             {item.value for item in Destination},
             {
                 "module1_analysis",
+                "rebalance_proposal",
                 "clarification_needed",
                 "unsupported_capability",
                 "company_not_stored",
                 "simple_response",
             },
+        )
+        self.assertNotIn(
+            str(Destination.REBALANCE_PROPOSAL),
+            _routing_request(inputs(question="propose a rebalance for the portfolio")),
+            "the router must not be offered a destination it is not allowed to choose",
         )
 
     def test_a_destination_outside_the_set_is_rejected(self):
@@ -599,3 +618,95 @@ class PromptContentTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StatedIntentTests(unittest.TestCase):
+    """A destination the caller states outright, and one the model may never choose.
+
+    Module 2's proposal is dispatched through this graph like everything else, and these are the
+    two halves of what that costs and what it must not: the stated intent skips classification
+    entirely, and a typed question still cannot reach it.
+    """
+
+    def run_with(self, **overrides):
+        outcome = SupervisorOutcome(
+            route=None,
+            answer=None,
+            citations=[],
+            invalid_citations=[],
+            corrected=False,
+            module1=None,
+            module2=None,
+            stopped_by=None,
+        )
+        return outcome
+
+    def test_a_stated_intent_is_dispatched_without_asking_the_model_anything(self):
+        """The button must not spend a model request being classified as a button."""
+        ran = []
+
+        def run_module2():
+            ran.append("module2")
+            return ProposalOutcome(status="proposed")
+
+        client = ScriptedModel([])  # no turns: any model call at all would fail the test
+        outcome = run_supervisor(
+            client=client,
+            inputs=inputs(explicit_intent=Destination.REBALANCE_PROPOSAL),
+            budget=RunBudget(),
+            evidence=EvidenceMap(),
+            run_module1_call=lambda context: pytest_fail("Module 1 must not be reached"),
+            run_module2_call=run_module2,
+        )
+
+        self.assertEqual(outcome.route.destination, Destination.REBALANCE_PROPOSAL)
+        self.assertEqual(ran, ["module2"])
+        self.assertEqual(client.requests, [], "the router was consulted about a stated intent")
+        self.assertEqual(outcome.module2.status, "proposed")
+
+    def test_a_typed_question_still_goes_to_the_router(self):
+        """The stated-intent path is additive: with no intent given, nothing changes."""
+        # The router's turn, then the composition's: the ordinary two-call chat path.
+        client = ScriptedModel([route(), say("NVDA moved over the period asked about.")])
+        outcome = run_supervisor(
+            client=client,
+            inputs=inputs(),
+            budget=RunBudget(),
+            evidence=EvidenceMap(),
+            run_module1_call=lambda context: Module1Outcome(
+                findings=None, executions=[], stopped_by=None, messages=[]
+            ),
+            run_module2_call=lambda: pytest_fail("Module 2 must not be reached"),
+        )
+
+        self.assertEqual(len(client.requests), 2)
+        self.assertEqual(outcome.route.destination, Destination.MODULE1_ANALYSIS)
+        self.assertIsNotNone(outcome.answer)
+
+    def test_the_model_may_not_route_a_question_to_the_rebalance(self):
+        """The enum has a member the router cannot reach, and this is what enforces it."""
+        # Both attempts answer with the forbidden destination.
+        client = ScriptedModel(
+            [
+                route(destination="rebalance_proposal", symbol=None, period="none",
+                      start_date=None, end_date=None),
+                route(destination="rebalance_proposal", symbol=None, period="none",
+                      start_date=None, end_date=None),
+            ]
+        )
+        outcome = run_supervisor(
+            client=client,
+            inputs=inputs(),
+            budget=RunBudget(),
+            evidence=EvidenceMap(),
+            run_module1_call=lambda context: pytest_fail("Module 1 must not be reached"),
+            run_module2_call=lambda: pytest_fail("Module 2 must not be reached"),
+        )
+
+        self.assertIsNone(outcome.route)
+        self.assertIsNotNone(outcome.routing_error)
+        self.assertIn("not a destination that may be chosen", outcome.routing_error)
+
+
+def pytest_fail(message: str):
+    raise AssertionError(message)

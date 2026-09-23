@@ -17,6 +17,7 @@ from sqlalchemy import (
     UniqueConstraint,
     false,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -787,6 +788,13 @@ class NewsArticle(Base):
     # nothing about revisions, which is a different fact from "never revised".
     provider_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     ingested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # When the linked release page was last retrieved from the agency's own site. A third
+    # time, and a third fact: `published_at` is the publisher's, `ingested_at` is when this
+    # database last learned something *new*, and this is when it last *looked*. Only an
+    # official feed's article has a release page, so it is NULL for every other provider and
+    # for an official entry whose own text was substantial enough to index as published.
+    # It is what the recheck interval is measured from -- see `app.news_ingestion`.
+    release_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # sha256 of the title and body. What "this article changed" means.
     content_sha256: Mapped[str] = mapped_column(String(64))
 
@@ -986,3 +994,100 @@ class ConversationTurn(Base):
     failure: Mapped[str | None] = mapped_column(Text)
 
     conversation: Mapped["Conversation"] = relationship(back_populates="turns")
+
+
+class RebalanceProposal(Base):
+    """One rebalance proposal: the snapshot it was computed from, and what it proposed.
+
+    **It is not an order, an approval, or an intent to trade.** Nothing here is submitted to a
+    broker, and there is no column an execution state could be written into. A proposal records
+    what this application *calculated* from a frozen snapshot -- which is what makes it
+    reproducible and checkable, and what keeps "the model suggested something" from being
+    mistaken for "something was decided".
+
+    **The snapshot is frozen on the row, not read live.** Prices and quantities move; a proposal
+    that re-derived them when it was read would show today's portfolio under yesterday's
+    reasoning. So the exact holdings, prices and cash the calculation ran against are stored
+    beside the result, and `snapshot_fingerprint` is the digest a later reader compares against
+    the portfolio to decide whether the proposal is still about the same thing. That comparison
+    is on the *values* rather than on `last_synced_at`: a sync that re-read an unchanged account
+    is not a change, and a timestamp alone cannot tell the two apart.
+
+    **`status` is the run's life, not the user's decision.** `generating` while the workflow
+    runs, then one of `proposed`, `no_change` or `unavailable` -- or `interrupted` if the process
+    died before it finished. There is deliberately no `approved`, no `submitted` and no `filled`:
+    this milestone ends at generation, and a status that could not be reached would be a promise
+    written into the schema.
+
+    `processing_deadline` is what stops an interrupted run blocking the next one for ever. It is
+    recovered lazily, by the next request that touches the table, exactly as a conversation's
+    turn lease is -- see `app.proposals`.
+    """
+
+    __tablename__ = "rebalance_proposals"
+    __table_args__ = (
+        # One request id means one proposal. A retry that arrives while the first is running, or
+        # after it finished, is answered from the row rather than paying for a second workflow.
+        UniqueConstraint("request_id", name="uq_rebalance_proposals_request_id"),
+        # At most one run in flight. The predicate fixes `status`, so uniqueness on the column is
+        # uniqueness of the active row -- enforced by the database rather than by a check this
+        # application could race with.
+        Index(
+            "uq_rebalance_proposals_one_active",
+            "status",
+            unique=True,
+            postgresql_where=text("status = 'generating'"),
+        ),
+        # The latest proposal is read by `created_at`, newest first.
+        Index("ix_rebalance_proposals_created_at", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    # Chosen by the client so it can retry safely, exactly as a conversation turn's is.
+    request_id: Mapped[str] = mapped_column(String(64))
+
+    status: Mapped[str] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # When an unfinished run stops being believed. See the docstring.
+    processing_deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    # The workflow run this proposal is. `thread_id` is the isolated identity one run's LangGraph
+    # state belongs to -- a fresh one per proposal, so two runs can never be confused for one
+    # another. Recorded rather than inferred from the row id, because a resumed or retried run
+    # would be a different thread over the same proposal.
+    run_id: Mapped[str | None] = mapped_column(String(64))
+    thread_id: Mapped[str | None] = mapped_column(String(64))
+
+    # --- what it was computed from --------------------------------------------------------
+    #
+    # Frozen together, and never updated afterwards. See the docstring on why this is stored
+    # rather than read at display time.
+    snapshot: Mapped[dict] = mapped_column(JSONB)
+    snapshot_fingerprint: Mapped[str] = mapped_column(String(64))
+    # The policy the targets were proposed under, stated on the row so a proposal can be read
+    # against the rules that produced it rather than against today's.
+    policy: Mapped[dict] = mapped_column(JSONB)
+
+    # --- what it produced -----------------------------------------------------------------
+    #
+    # The agent's target weights and its prose. `rationale` is text a model wrote and is labelled
+    # as such wherever it is shown: it is not evidence and nothing here corroborates it.
+    targets: Mapped[dict | None] = mapped_column(JSONB)
+    rationale: Mapped[str | None] = mapped_column(Text)
+    # The articles the run actually retrieved, with their ids, URLs and publication dates. The
+    # agent's cited references are validated against this list, so a citation that is not in here
+    # never reaches a reader.
+    evidence: Mapped[list] = mapped_column(JSONB)
+    # The deterministic calculation. Every figure a reader sees comes from here, not from the
+    # prose above it.
+    calculation: Mapped[dict | None] = mapped_column(JSONB)
+    assumptions: Mapped[list] = mapped_column(JSONB)
+    limitations: Mapped[list] = mapped_column(JSONB)
+    usage: Mapped[dict | None] = mapped_column(JSONB)
+    # Why no proposal could be produced, in a sentence a user could be shown. NULL when one was.
+    failure: Mapped[str | None] = mapped_column(Text)
+    # The machine-readable reason beside that sentence, so the application can branch on the
+    # cause without reading the prose.
+    failure_reason: Mapped[str | None] = mapped_column(String(48))

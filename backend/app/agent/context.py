@@ -25,6 +25,10 @@ window.
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, timedelta
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # the destination vocabulary lives with the graph that applies it
+    from app.agent.supervisor import Destination
 
 # The period tokens a routing decision may return. A closed set, so an unrecognised one is a
 # validation failure rather than a silently ignored instruction.
@@ -391,6 +395,11 @@ class RequestInputs:
     explicit: ExplicitArguments
     known: KnownSymbols = KnownSymbols()
     conversation: ConversationContext | None = None
+    # A destination the caller has already decided, applied without asking the model. Set when
+    # something other than a typed question produced this run -- today, the rebalance button --
+    # so that routing is a dispatch rather than a classification. None means the model decides,
+    # as it does for every question typed into the chat.
+    explicit_intent: "Destination | None" = None
 
     def describe_for_prompt(self) -> str:
         lines = [f"Reference date: {self.reference_date.isoformat()}"]

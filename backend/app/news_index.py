@@ -422,6 +422,7 @@ def search_news(
     top_k: int,
     store: VectorStore,
     embedder: Embedder,
+    provider: str | None = None,
     category: str | None = None,
     symbols: Sequence[str] = (),
     published_after: datetime | None = None,
@@ -434,6 +435,7 @@ def search_news(
     against the stored article, because a point can outlive the text it was built from.
     """
     filters = _search_filter(
+        provider=provider,
         category=category,
         symbols=symbols,
         published_after=published_after,
@@ -572,6 +574,7 @@ def _passage(
 
 def _search_filter(
     *,
+    provider: str | None,
     category: str | None,
     symbols: Sequence[str],
     published_after: datetime | None,
@@ -585,6 +588,14 @@ def _search_filter(
     is what serves "everything about the economy".
     """
     must: list[Any] = []
+
+    if provider is not None:
+        # The feed slug the payload carries, which is what the page's Source filter holds.
+        # Matching on `source` here would be the publisher's name and would return nothing
+        # for any slug, while still reporting the search as filtered.
+        must.append(
+            models.FieldCondition(key="provider", match=models.MatchValue(value=provider))
+        )
 
     if category is not None:
         if category not in CATEGORIES:

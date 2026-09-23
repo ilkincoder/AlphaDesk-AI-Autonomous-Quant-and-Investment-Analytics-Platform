@@ -36,6 +36,11 @@ KIND_ROUTING = "routing"
 KIND_TOOL = "tool"
 KIND_FINDINGS = "findings"
 KIND_COMPOSING = "composing"
+# A named stage of a workflow that has no tools and no routing -- the Module 2 proposal run,
+# which synchronises, retrieves, proposes and calculates. It is the same rule as the kinds
+# above: emitted by the code that did the work, for a step the run actually has, never a timer
+# or a percentage.
+KIND_STAGE = "stage"
 # The two terminal events. Exactly one of them ends a stream.
 KIND_DONE = "done"
 KIND_ERROR = "error"
@@ -139,6 +144,7 @@ __all__ = [
     "KIND_ERROR",
     "KIND_FINDINGS",
     "KIND_ROUTING",
+    "KIND_STAGE",
     "KIND_TOOL",
     "NULL_PROGRESS",
     "NullProgress",

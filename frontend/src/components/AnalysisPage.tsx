@@ -487,7 +487,7 @@ export function AnalysisPage() {
     <div className="flex h-full min-h-0 flex-col">
       <header className="flex flex-wrap items-start justify-between gap-3 border-b border-line px-6 py-4">
         <div className="min-w-0">
-          <h1 className="text-page font-bold text-ink">Analysis</h1>
+          <h1 className="text-title font-bold text-ink">Analysis</h1>
           <p className="mt-0.5 max-w-[70ch] text-note text-dim">
             Ask about company filings, insider activity, market data, and your demo portfolio.
           </p>

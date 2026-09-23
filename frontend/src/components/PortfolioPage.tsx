@@ -70,7 +70,7 @@ export function PortfolioPage({ active = true }: { active?: boolean }) {
   // have taken effect before the second call had already started.
   const inFlight = useRef(false)
 
-  const load = useCallback(async (signal?: AbortSignal) => {
+  const load = useCallback(async () => {
     if (inFlight.current) return
     inFlight.current = true
     // Anything already on screen stays on screen while this runs; only a page with
@@ -83,18 +83,14 @@ export function PortfolioPage({ active = true }: { active?: boolean }) {
       // message is carried as a note rather than replacing the figures.
       let syncError: string | null = null
       try {
-        await syncPortfolio(signal)
+        await syncPortfolio()
       } catch (error) {
-        if (error instanceof DOMException && error.name === 'AbortError') throw error
         syncError = messageOf(error)
       }
 
-      const valuation = await fetchValuation(signal)
+      const valuation = await fetchValuation()
       setState({ phase: 'ready', valuation, syncError })
     } catch (error) {
-      // An aborted request was replaced by a newer one, or the page is going away.
-      if (error instanceof DOMException && error.name === 'AbortError') return
-
       const message = messageOf(error)
       setState((current) =>
         current.phase === 'ready' || current.phase === 'stale'
@@ -114,34 +110,38 @@ export function PortfolioPage({ active = true }: { active?: boolean }) {
   useEffect(() => {
     if (!active) return
 
-    const controller = new AbortController()
-    void load(controller.signal)
+    void load()
 
     const timer = window.setInterval(() => {
       // A background tab is not being read, so it does not get synced. The listener below
       // refreshes on the way back, which is what makes skipping those ticks safe.
       if (document.visibilityState !== 'visible') return
-      void load(controller.signal)
+      void load()
     }, REFRESH_INTERVAL_MS)
 
     const onVisibilityChange = () => {
-      if (document.visibilityState === 'visible') void load(controller.signal)
+      if (document.visibilityState === 'visible') void load()
     }
     document.addEventListener('visibilitychange', onVisibilityChange)
 
     return () => {
       window.clearInterval(timer)
       document.removeEventListener('visibilitychange', onVisibilityChange)
-      // StrictMode runs this twice in development; aborting the first request keeps the
-      // two from racing to set state.
-      controller.abort()
+      // Nothing is cancelled here, deliberately, and it is not the same decision the News
+      // page makes. StrictMode runs this effect twice in development, and the guard in
+      // `load` is what stops the second run issuing a second request -- so aborting the
+      // first one would throw away the only sync the effect was ever going to make and
+      // leave the page waiting on a load that never came. It also matters what this
+      // request is: a cancelled POST is not an uncancelled one. Aborting a sync the broker
+      // has already been asked for would not give the quota back, so the guard is the
+      // right place to be one-at-a-time, not the transport.
     }
   }, [active, load])
 
   return (
     <div>
       <header className="flex items-start justify-between gap-4">
-        <h1 className="text-page font-bold text-ink">Portfolio</h1>
+        <h1 className="text-title font-bold text-ink">Portfolio</h1>
 
         {/* aria-disabled rather than disabled: a button that becomes `disabled` while
             focused drops the focus, and a keyboard user would have to find their way

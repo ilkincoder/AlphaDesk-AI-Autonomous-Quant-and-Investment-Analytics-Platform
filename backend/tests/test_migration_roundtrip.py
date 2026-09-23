@@ -22,7 +22,9 @@ from sqlalchemy.exc import IntegrityError
 
 from tests.testdb import alembic_revision, run_alembic, table_names, test_engine
 
-HEAD_REVISION = "0011_news"
+HEAD_REVISION = "0013_rebalance_proposals"
+REVISION_0012 = "0012_news_release_checked_at"
+REVISION_0011 = "0011_news"
 REVISION_0010 = "0010_alpaca_broker_link"
 REVISION_0009 = "0009_conversations"
 REVISION_0008 = "0008_form4_scope_rename"
@@ -51,6 +53,7 @@ TABLES_FROM_0004 = frozenset(
 TABLES_FROM_0007 = frozenset({"document_index_manifest"})
 TABLES_FROM_0009 = frozenset({"conversations", "conversation_turns"})
 TABLES_FROM_0011 = frozenset({"news_articles", "news_ingestion_runs"})
+TABLES_FROM_0013 = frozenset({"rebalance_proposals"})
 
 # Every table any of our migrations creates, for the checks that only care that they are
 # all there or all gone.
@@ -61,16 +64,49 @@ ALL_INTRODUCED = (
     | TABLES_FROM_0007
     | TABLES_FROM_0009
     | TABLES_FROM_0011
+    | TABLES_FROM_0013
 )
 
 # Untouched by any of them, and the reason every downgrade has to be selective.
 EXISTING_TABLES = frozenset({"portfolios", "holdings"})
+
+# LangGraph's checkpointer owns these. They are deliberately not modelled and deliberately not
+# migrated: the library creates them with `setup()`, versions them in its own
+# `checkpoint_migrations` table, and a hand-written copy of its DDL would be a second definition
+# that drifts the first time the library changes.
+CHECKPOINT_TABLES = frozenset(
+    {"checkpoints", "checkpoint_blobs", "checkpoint_writes", "checkpoint_migrations"}
+)
 
 # What 0010 adds, and what its downgrade must therefore take away again.
 BROKER_COLUMNS = frozenset(
     {"broker", "broker_account_id", "broker_equity", "last_synced_at"}
 )
 MARKET_COLUMNS = frozenset({"market_price", "market_value"})
+
+# The columns 0011 gave `news_articles`, so 0012's downgrade can be checked for taking away
+# its own column and nothing else.
+NEWS_ARTICLE_COLUMNS = frozenset(
+    {
+        "provider",
+        "provider_article_id",
+        "source",
+        "canonical_url",
+        "title",
+        "text",
+        "symbols",
+        "category",
+        "published_at",
+        "provider_updated_at",
+        "ingested_at",
+        "content_sha256",
+        "indexed_content_sha256",
+        "indexed_embedding_model",
+        "indexed_chunking_version",
+        "indexed_point_count",
+        "indexed_at",
+    }
+)
 
 
 class MigrationRoundtripTest(unittest.TestCase):
@@ -82,8 +118,53 @@ class MigrationRoundtripTest(unittest.TestCase):
         # Every test here starts from head, whatever the previous one did.
         run_alembic("upgrade", "head")
 
-    def test_head_is_the_news_revision(self):
+    def test_head_is_the_latest_revision(self):
         self.assertEqual(alembic_revision(self.engine), HEAD_REVISION)
+
+    def test_downgrading_0013_removes_only_the_proposal_table(self):
+        """0013 adds one table and alters nothing, so its downgrade should be exactly that table
+        going. Its partial unique index goes with it, which is checked by the table being gone --
+        an index cannot outlive its table."""
+        run_alembic("downgrade", REVISION_0012)
+        try:
+            remaining = table_names(self.engine)
+
+            self.assertEqual(remaining & TABLES_FROM_0013, set())
+            self.assertLessEqual(EXISTING_TABLES, remaining)
+            self.assertLessEqual(
+                TABLES_FROM_0011,
+                remaining,
+                "0013's downgrade reached tables that belong to earlier migrations",
+            )
+            self.assertEqual(alembic_revision(self.engine), REVISION_0012)
+        finally:
+            run_alembic("upgrade", "head")
+            self.engine.dispose()
+
+        self.assertLessEqual(TABLES_FROM_0013, table_names(self.engine))
+
+    def test_downgrading_0012_removes_only_the_release_check_column(self):
+        """0012 adds one nullable column and touches nothing else, so its downgrade should
+        drop that column and leave the table -- and every row in it -- alone."""
+        run_alembic("downgrade", REVISION_0011)
+        try:
+            with self.engine.connect() as connection:
+                columns = self._columns(connection, "news_articles")
+
+            self.assertNotIn("release_checked_at", columns)
+            self.assertLessEqual(
+                NEWS_ARTICLE_COLUMNS,
+                columns,
+                "0012's downgrade reached columns that belong to 0011",
+            )
+            self.assertIn("news_articles", table_names(self.engine))
+            self.assertEqual(alembic_revision(self.engine), REVISION_0011)
+        finally:
+            run_alembic("upgrade", "head")
+            self.engine.dispose()
+
+        with self.engine.connect() as connection:
+            self.assertIn("release_checked_at", self._columns(connection, "news_articles"))
 
     def test_downgrading_0011_removes_only_the_news_tables(self):
         """0011 adds two tables and alters nothing, so its downgrade should be exactly the
@@ -292,13 +373,22 @@ class MigrationRoundtripTest(unittest.TestCase):
     def test_the_models_and_the_migration_describe_the_same_tables(self):
         """Guards the gap `create_all` would have left open.
 
-        The tests build their schema by running the migration, and the application
-        reads it through the models. If the two ever drifted, one of them would be
-        wrong in a way nothing else here would catch.
+        The tests build their schema by running the migration, and the application reads it
+        through the models. If the two ever drifted, one of them would be wrong in a way nothing
+        else here would catch.
+
+        **The checkpointer's tables are named as the one permitted exception.** They belong to
+        LangGraph, not to this application: no model describes them, no migration creates them,
+        and `PostgresSaver.setup()` owns them and their own version table. Excluding them by name
+        is what keeps the guard sharp -- an extra table that is *not* one of these still fails,
+        which is the drift this test exists to catch.
         """
         self.assertEqual(
             set(Base.metadata.tables),
-            table_names(self.engine) - {"alembic_version"},
+            table_names(self.engine)
+            - {"alembic_version"}
+            - CHECKPOINT_TABLES,
+            "the models and the migrations have drifted apart",
         )
 
 

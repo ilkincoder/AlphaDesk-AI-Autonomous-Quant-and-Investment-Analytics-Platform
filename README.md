@@ -2962,5 +2962,96 @@ Still outstanding, unchanged from Step 9:
   back; they do not make a half-finished graph resumable.
 - **A conversation list endpoint**, which is what the History panel cannot see past.
 
-Still not built, and out of scope for Module 1: trading and order approval (Module 2),
-backtesting (Module 3), and any recommendation not grounded in a tool result.
+Still not built, and out of scope for Module 1: backtesting (Module 3), and any recommendation
+not grounded in a tool result.
+
+**Module 2 has since been built, and the rest of this README predates it** — the news ingestion,
+the broker synchronisation and the News & Trading page are not described above. What follows is
+the proposal flow as it actually is.
+
+### The proposal flow
+
+Pressing **Rebalance proposal** on News & Trading runs this, in one request:
+
+```
+POST /rebalance/proposal            (or …/stream, which reports the same stages)
+  └─ app.rebalance_api._claim        recover any abandoned run, then take the one run slot
+      └─ app.proposal_run.generate   the whole run, and the only entry point to it
+          ├─ broker_sync.sync        read the account; a failure here ends the run, it never
+          │                          falls back to older holdings
+          ├─ rebalance_snapshot.capture   freeze the portfolio — prices, quantities, cash, basis
+          └─ run_supervisor(explicit_intent=Destination.REBALANCE_PROPOSAL)
+              └─ "route" node        applies the stated intent in code: **no model request is
+              │                      spent classifying a button click**
+                  └─ "rebalance" node
+                      └─ app.agent.module2.run_proposal
+                          ├─ retrieve     similarity search over the stored news (no model)
+                          ├─ propose      ONE model call: a target weight and a reason per holding
+                          └─ calculate    app.rebalance — whole-share trades, both sides priced
+```
+
+`app.proposal_run` is Module 2's counterpart to `app.agent.run`: the routes own HTTP, it owns the
+run, and both the fresh path and the recovery path go through it rather than through two
+implementations that share a checkpointer.
+
+### Checkpointing and recovery
+
+A proposal's stages are checkpointed to PostgreSQL (`langgraph-checkpoint-postgres`, which needs
+psycopg 3 alongside SQLAlchemy's psycopg2 — see `requirements.txt`). The pool is opened once in
+the application's lifespan, and `setup()` creates the library's four tables; they are deliberately
+not modelled and not migrated, and `test_migration_roundtrip` names them as the one permitted
+exception to "the models and the migrations describe the same tables".
+
+**A restart resumes the run rather than repeating it.** `app.agent.recovery` looks for runs whose
+lease has expired, once at startup on a thread of its own and again before any new run claims the
+slot. Resuming means:
+
+- **between two stages** — the graph continues from its last checkpoint, so the retrieval is not
+  searched again and the targets that were already proposed are not proposed again;
+- **after the last stage but before the row was written** — the completed state is read out of the
+  checkpoint and written to the *same* proposal, running nothing. This is what makes finalization
+  after a crash idempotent rather than a second proposal;
+- **before anything completed, or with no checkpointer at all** — the run is marked `interrupted`
+  with the reason, and is **not** restarted. Starting again would be a new run against a new
+  snapshot, which is the user's decision.
+
+A resumed run completes against the snapshot **stored on its own row**, never a freshly
+synchronised one, and says on its record that it was resumed. What has moved since is reported
+separately, by the freshness comparison below.
+
+Two things it does not claim: a stage that died *during* its work had no checkpoint and does run
+again, so a resume can mean a second model call; and the budget counters lived in the process that
+died, so a resumed run is bounded afresh rather than continuing the original's allowance.
+
+### Freshness, in four states
+
+A proposal is compared against the portfolio when it is *read*, on its values — quantities,
+prices, cash, currency and basis — and never on `last_synced_at`, which moves whenever the broker
+is read even if nothing changed. The broker's own equity is deliberately excluded from the
+comparison: the current allocation is a share of it, so it moves when prices move, and treating
+that as structural would report a re-priced portfolio as one whose holdings had changed.
+
+| State | Meaning | What the page does |
+|---|---|---|
+| `current` | Nothing the proposal depends on has moved | Shows it plainly, however old it is |
+| `prices_updated` | Same positions, same quantities, different prices | Keeps it readable as a snapshot estimate, and says executing anything would need fresh validation |
+| `portfolio_changed` | A position opened or closed, a quantity or the cash moved, or the account or currency changed | Asks for a regeneration |
+| `unknown` | The portfolio could not be read or could not be valued | Says so — never "current", and never "changed" |
+
+A proposal is never recalculated or replaced on read: it keeps the numbers and the snapshot time
+it was generated with.
+
+### What each target says for itself
+
+The agent returns one entry per held symbol, each with its own weight, its own reason, and the
+articles that reason rests on. `app.rebalance` turns those into a schedule showing, per holding
+*and* for cash, the weight **now**, the weight **requested**, and the weight **after whole-share
+rounding** — three numbers, because they are three different facts and the gap between the last
+two is what rounding costs. A line citing articles is reasoned from the news; a line citing none
+is reasoned from the policy or the portfolio's shape. Every weight is presented as a discretionary
+choice within the demo policy: not optimal, not derived from an expected return, and not predicted
+to be profitable.
+
+**Nothing here is an order.** There is no approval, no submission, no simulated fill and no broker
+write of any kind: the proposal table has no column one could be written into, and no route that
+could reach a broker.

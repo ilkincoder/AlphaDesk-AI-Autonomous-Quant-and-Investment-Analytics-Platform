@@ -1,6 +1,8 @@
 """AlphaDesk AI backend."""
 
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from decimal import Decimal
 
 from fastapi import Depends, FastAPI, HTTPException
@@ -15,9 +17,11 @@ from app.alpaca import (
     MalformedResponseError,
     MissingCredentialsError,
 )
+from app.agent import checkpointing, recovery
 from app.analysis_api import router as analysis_router
 from app.db import engine, get_session
 from app.news_api import router as news_router
+from app.rebalance_api import router as rebalance_router
 from app.models import Portfolio
 from app.schemas import (
     PortfolioOut,
@@ -40,7 +44,34 @@ _HUNDRED = Decimal("100")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="AlphaDesk AI")
+@asynccontextmanager
+async def lifespan(application: FastAPI) -> AsyncIterator[None]:
+    """What the process owns for its whole life, rather than per request.
+
+    Two things, and both are deliberate about *when* they happen.
+
+    **The proposal checkpointer's pool is opened once, here.** A pool per request would be a
+    connection storm; a pool built lazily inside the first run would be created on a request
+    thread with no one to close it. It is created before the app serves anything and closed
+    after it stops. If it cannot be started, the application still serves -- see
+    `app.agent.checkpointing`.
+
+    **Interrupted proposals are looked for once the app is up, on a thread of their own.** A
+    run that was in flight when the process died is recovered by being *resumed*, which can mean
+    a model call; doing that inline would hold the server's own startup hostage to a provider.
+    The thread is a daemon and the work is bounded by the run's budget, so a process that is
+    shutting down is not kept alive by it, and a second recovery cannot start while one is
+    running -- see `app.agent.recovery`.
+    """
+    checkpointing.start()
+    recovery.resume_interrupted_in_background()
+    try:
+        yield
+    finally:
+        checkpointing.stop()
+
+
+app = FastAPI(title="AlphaDesk AI", lifespan=lifespan)
 
 # The analysis chat lives in its own module: three routes, their own persistence, and a
 # concurrency ceiling that has nothing to do with portfolios.
@@ -48,6 +79,10 @@ app.include_router(analysis_router)
 
 # News is a second corpus with its own store, its own collection and its own ingestion.
 app.include_router(news_router)
+
+# The rebalance proposal. Its own table, its own single-run slot, and no route that could reach
+# a broker -- it reads the portfolio, proposes targets and prices trades, and stops there.
+app.include_router(rebalance_router)
 
 
 @app.get("/health")

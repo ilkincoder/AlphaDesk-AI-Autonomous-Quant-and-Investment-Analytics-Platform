@@ -43,6 +43,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 
 from app.agent.budget import BudgetExhausted, RunBudget
 from app.agent.context import (
+    PERIOD_NONE,
     PERIOD_TOKENS,
     KnownSymbols,
     RequestInputs,
@@ -52,6 +53,7 @@ from app.agent.context import (
 from app.agent.evidence import EvidenceMap
 from app.agent.llm import ModelClient
 from app.agent.module1 import Module1Outcome
+from app.agent.module2 import ProposalOutcome
 from app.agent.progress import (
     KIND_COMPOSING,
     KIND_ROUTING,
@@ -106,6 +108,12 @@ class Destination(StrEnum):
     """The five things a request can be. A closed set, validated rather than hoped for."""
 
     MODULE1_ANALYSIS = "module1_analysis"
+    # Module 2's portfolio-wide proposal. It is never chosen by the router: the only thing that
+    # produces one is a person pressing a button, and asking a model to classify a button click
+    # would spend a request to learn something the caller already said. It is a destination here
+    # because it is dispatched through the same graph as everything else, not because the model
+    # may pick it.
+    REBALANCE_PROPOSAL = "rebalance_proposal"
     CLARIFICATION_NEEDED = "clarification_needed"
     UNSUPPORTED_CAPABILITY = "unsupported_capability"
     # A definite ticker this system holds nothing for. Its own destination rather than a kind
@@ -203,6 +211,7 @@ class SupervisorOutcome:
     invalid_citations: list[str]
     corrected: bool
     module1: Module1Outcome | None
+    module2: ProposalOutcome | None
     stopped_by: str | None
     context: RunContext | None = None
     routing_error: str | None = None
@@ -550,11 +559,32 @@ def build_supervisor_graph(
     evidence: EvidenceMap,
     run_module1_call,
     outcome: SupervisorOutcome,
+    run_module2_call=None,
     progress: Progress = NULL_PROGRESS,
 ):
-    """The routing graph. `run_module1_call` is injected so a test can drive it directly."""
+    """The routing graph.
+
+    Both module callables are injected so a test can drive either directly. Neither is imported:
+    this module decides *which* one runs, and the caller owns what running one means.
+    """
 
     def route_node(state: SupervisorState) -> SupervisorState:
+        # An intent the caller stated outright is applied here, in code, before the router is
+        # consulted about it -- the same rule `company_not_stored` follows, and for the same
+        # reason: this application already knows the answer, and a model asked to decide it would
+        # be guessing at something written down. It also means the button spends no model request
+        # on being classified as a button.
+        if inputs.explicit_intent is not None:
+            stated = SupervisorRoute(
+                destination=inputs.explicit_intent,
+                reason="the caller stated this intent outright",
+                period=PERIOD_NONE,
+            )
+            outcome.route = stated
+            logger.info("dispatching a stated intent straight to %s", stated.destination)
+            progress(ProgressEvent(KIND_ROUTING, _routing_event_data(stated, outcome)))
+            return {"route": stated.model_dump(mode="json")}
+
         messages = [
             {"role": "system", "content": SUPERVISOR_PROMPT},
             {"role": "user", "content": _routing_request(inputs)},
@@ -596,6 +626,33 @@ def build_supervisor_graph(
                     ]
                 continue
 
+            if (
+                parsed.destination is Destination.REBALANCE_PROPOSAL
+                and inputs.explicit_intent is not Destination.REBALANCE_PROPOSAL
+            ):
+                # The enum has a member the router may not choose, and this is where that is
+                # enforced rather than asked for. A model that returns it for a typed question has
+                # not found a hidden capability -- it has invented one, and a portfolio-wide
+                # rebalance is not an answer to a question about a company.
+                problem = (
+                    f"{parsed.destination} is not a destination that may be chosen here; it is "
+                    "applied only for a request that states it outright, and this one did not"
+                )
+                logger.warning("routing attempt %d returned %s", attempt, parsed.destination)
+                if attempt < ROUTING_ATTEMPTS:
+                    messages = [
+                        *messages,
+                        response.message,
+                        {
+                            "role": "user",
+                            "content": (
+                                f"That decision could not be used: {problem}. Reply with only "
+                                "a JSON object matching the description above."
+                            ),
+                        },
+                    ]
+                continue
+
             settled_route = _settle(parsed, inputs, outcome)
             progress(
                 ProgressEvent(
@@ -622,6 +679,19 @@ def build_supervisor_graph(
         return {
             "module1_findings": findings.model_dump(mode="json") if findings else None
         }
+
+    def rebalance_node(state: SupervisorState) -> SupervisorState:
+        """Module 2's workflow, reached only by a stated intent.
+
+        The callable is injected rather than imported so that this module does not depend on how
+        a proposal is actually produced -- it dispatches, and `app.rebalance_api` owns the
+        snapshot, the providers and the persistence. That is the same boundary `run_module1_call`
+        draws on the other branch, and it is what keeps the two modules from reaching into each
+        other.
+        """
+        assert run_module2_call is not None  # noqa: S101 - only reached by a stated intent
+        outcome.module2 = run_module2_call()
+        return {}
 
     def compose_node(state: SupervisorState) -> SupervisorState:
         # `_settle` guarantees a context on the only path that reaches composition.
@@ -687,6 +757,8 @@ def build_supervisor_graph(
         destination = outcome.route.destination if outcome.route else None
         if destination is Destination.MODULE1_ANALYSIS:
             return "analysis"
+        if destination is Destination.REBALANCE_PROPOSAL:
+            return "rebalance"
         # A company this system holds nothing for is answered without a model request at all.
         # The database settled it; there is nothing for a model to add, and spending a request
         # on it would make the refusal depend on the provider being reachable.
@@ -699,13 +771,19 @@ def build_supervisor_graph(
     graph.add_node("analysis", analysis_node)
     graph.add_node("compose", compose_node)
     graph.add_node("reply", reply_node)
+    graph.add_node("rebalance", rebalance_node)
     graph.add_edge(START, "route")
     graph.add_conditional_edges(
-        "route", after_route, {"analysis": "analysis", "reply": "reply", END: END}
+        "route",
+        after_route,
+        {"analysis": "analysis", "reply": "reply", "rebalance": "rebalance", END: END},
     )
     graph.add_edge("analysis", "compose")
     graph.add_edge("compose", END)
     graph.add_edge("reply", END)
+    # Module 2 ends the run itself: it produces a structured proposal, not prose, and there is
+    # nothing for the composition step to write. Its own record is the output.
+    graph.add_edge("rebalance", END)
     return graph.compile()
 
 
@@ -793,10 +871,15 @@ def run_supervisor(
     budget: RunBudget,
     evidence: EvidenceMap,
     run_module1_call,
+    run_module2_call=None,
     progress: Progress = NULL_PROGRESS,
     recursion_limit: int | None = None,
 ) -> SupervisorOutcome:
-    """Route the request and, when it warrants one, produce the final answer."""
+    """Route the request and, when it warrants one, produce the final answer.
+
+    `run_module2_call` is only reachable through `RequestInputs.explicit_intent`: a question typed
+    into the chat can never be routed to a portfolio-wide rebalance, however it is worded.
+    """
     outcome = SupervisorOutcome(
         route=None,
         answer=None,
@@ -804,6 +887,7 @@ def run_supervisor(
         invalid_citations=[],
         corrected=False,
         module1=None,
+        module2=None,
         stopped_by=None,
     )
     graph = build_supervisor_graph(
@@ -812,6 +896,7 @@ def run_supervisor(
         budget=budget,
         evidence=evidence,
         run_module1_call=run_module1_call,
+        run_module2_call=run_module2_call,
         outcome=outcome,
         progress=progress,
     )

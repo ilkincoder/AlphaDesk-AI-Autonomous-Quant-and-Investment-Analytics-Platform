@@ -28,3 +28,18 @@ langgraph==1.2.11
 # would buy nothing and would be one more thing to go wrong at the network layer. 2.x uses
 # the httpx that is already here.
 openai==2.54.0
+
+# --- Module 2 graph checkpointing ------------------------------------------------------
+#
+# LangGraph's PostgreSQL checkpointer. It is a *second* Postgres driver, and that is
+# deliberate rather than an oversight: `psycopg2-binary` above is SQLAlchemy's, and this
+# package is written against psycopg 3. Swapping the application's driver to satisfy one
+# dependency would change every query in the codebase to save an import, so the two coexist
+# and only the checkpointer uses this one.
+#
+# Pinned as a pair: `langgraph-checkpoint-postgres` requires `psycopg>=3.2` and
+# `psycopg-pool`, and the `[binary]` extra is what supplies libpq. Without it, psycopg falls
+# back to a pure-Python implementation that needs a system libpq, which this image does not
+# have -- the failure is an ImportError at the first checkpoint rather than at build time.
+langgraph-checkpoint-postgres==3.1.0
+psycopg[binary]>=3.2,<4

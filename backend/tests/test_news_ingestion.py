@@ -33,7 +33,7 @@ from app.models import Holding, NewsArticle, NewsIngestionRun, Portfolio
 from app.news import from_alpaca
 from app.news_index import index_articles, search_news
 from app.news_ingestion import ingest, last_success_by_source, portfolio_symbols
-from app.official_feeds import FEEDS_BY_KEY, FeedEntry, OfficialFeedError
+from app.official_feeds import FEEDS_BY_KEY, MIN_SUMMARY_CHARS, FeedEntry, OfficialFeedError
 from app.portfolio_identity import DEMO_PORTFOLIO_NAME
 from app.vector_store import VectorStore, VectorStoreError
 from tests.search_doubles import StubEmbedder
@@ -70,6 +70,46 @@ class FailingEmbedder(StubEmbedder):
         raise EmbeddingUnavailableError("the model is unavailable in this test")
 
 
+# What a release page says when one is "read" below. Long enough to be an article, and
+# obviously not the feed's own summary, so a test can tell the two apart.
+RELEASE_BODY = (
+    "The Federal Reserve issued a statement about monetary policy and the economic outlook, "
+    "which is the whole of what this page says and is recorded here as the release's text."
+)
+
+
+class RecordingEnricher:
+    """Stands in for `enrich_with_release_text`, without leaving the process.
+
+    It mirrors the real function's own rule -- a summary shorter than `MIN_SUMMARY_CHARS` is
+    worth reading the release for -- and records the entry ids it "read", which is the number
+    these tests are about.
+
+    `fail_for` models a page the agency did not serve: the entry comes back exactly as the
+    feed published it, which is how the real function reports a release it could not read.
+    """
+
+    def __init__(self, *, fail_for: tuple[str, ...] = ()) -> None:
+        self.read: list[str] = []
+        self._fail_for = set(fail_for)
+
+    def __call__(self, entries, **kwargs):
+        enriched = []
+        for entry in entries:
+            if len(entry.summary) >= MIN_SUMMARY_CHARS or entry.entry_id in self._fail_for:
+                enriched.append(entry)
+                continue
+            self.read.append(entry.entry_id)
+            enriched.append(dataclasses.replace(entry, text=RELEASE_BODY))
+        return enriched
+
+
+def never_read_a_release(entries, **kwargs):
+    """The default double: every entry comes back as the feed published it, so the article
+    is the feed's own summary. Used by every test that is not about release freshness."""
+    return entries
+
+
 def alpaca_item(
     article_id: str = "61923311",
     *,
@@ -91,15 +131,21 @@ def alpaca_item(
     )
 
 
-def feed_entry(entry_id: str = "monetary20260916a", *, title: str = "FOMC statement") -> FeedEntry:
+def feed_entry(
+    entry_id: str = "monetary20260916a",
+    *,
+    title: str = "FOMC statement",
+    summary: str = "The Federal Reserve issued a statement about monetary policy and the "
+    "economic outlook, which this summary states at a length that is worth indexing.",
+    provider_updated_at: datetime | None = None,
+) -> FeedEntry:
     return FeedEntry(
         entry_id=entry_id,
         title=title,
         url=f"https://www.federalreserve.gov/newsevents/pressreleases/{entry_id}.htm",
-        summary="The Federal Reserve issued a statement about monetary policy and the "
-        "economic outlook, which this summary states at a length that is worth indexing.",
+        summary=summary,
         published_at=PUBLISHED,
-        provider_updated_at=None,
+        provider_updated_at=provider_updated_at,
         text=None,
     )
 
@@ -164,7 +210,7 @@ class IngestionTestCase(unittest.TestCase):
 
     # --- running ---------------------------------------------------------------------
 
-    def run_ingest(self, **overrides):
+    def run_ingest(self, enricher=None, **overrides):
         """One ingestion, with the providers replaced.
 
         `enrich_with_release_text` is replaced too, and that is not optional: it is the
@@ -172,11 +218,14 @@ class IngestionTestCase(unittest.TestCase):
         short makes the ingestion fetch the linked release from the agency's site, which is
         right in production and a live request to a .gov domain from a test. Leaving it in
         makes the suite depend on two government websites being up.
+
+        `enricher` replaces the default double, which reads nothing. The freshness tests pass
+        a recorder that reads every thin entry, which is what the real function does.
         """
         with mock.patch.object(
             news_ingestion,
             "enrich_with_release_text",
-            side_effect=lambda entries, **kwargs: entries,
+            side_effect=enricher if enricher is not None else never_read_a_release,
         ):
             return ingest(
                 self.session,
@@ -278,6 +327,184 @@ class StorageTests(IngestionTestCase):
         )
         self.assertEqual(summary.stored, 0)
         self.assertEqual(sum(1 for r in summary.results if r.ok), len(summary.results))
+
+
+class ReleaseFreshnessTests(IngestionTestCase):
+    """Reading a release page once, and not reading it again for nothing.
+
+    The Fed's feed carries its headline as its description, so the release page behind an
+    entry is what there is to index -- and re-reading it on every run for an article nothing
+    has changed is a request to a public service with no result. What is checked here is which
+    entries the ingestion decides to ask for, and that a decision not to ask leaves what is
+    stored exactly as it was.
+
+    Only the Fed feed is populated, so a count in these tests is a count about one feed.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.add_portfolio("MSFT")
+
+    def _run(self, entries, *, enricher, now=None):
+        with (
+            mock.patch.object(news_ingestion, "fetch_news", return_value=[]),
+            mock.patch.object(
+                news_ingestion,
+                "fetch_feed",
+                side_effect=lambda feed, **kwargs: (
+                    list(entries) if feed.key == FED.key else []
+                ),
+            ),
+        ):
+            return self.run_ingest(enricher=enricher, now=now)
+
+    @staticmethod
+    def _fed(summary):
+        return next(
+            result for result in summary.results if result.source == f"official_{FED.key}"
+        )
+
+    def test_an_unchanged_entry_is_read_once_and_not_again(self):
+        first = RecordingEnricher()
+        self._run([feed_entry()], enricher=first)
+        (stored,) = self.articles()
+        embedded_once = self.embedder.passages_embedded
+
+        second = RecordingEnricher()
+        summary = self._run(
+            [feed_entry()],
+            enricher=second,
+            now=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+
+        self.assertEqual(first.read, ["monetary20260916a"])
+        self.assertEqual(
+            second.read, [], "the release page was read again for an unchanged entry"
+        )
+        self.assertEqual(self._fed(summary).releases_read, 0)
+        self.assertEqual(self._fed(summary).unchanged, 1)
+
+        (still,) = self.articles()
+        self.assertEqual(still.text, stored.text)
+        self.assertEqual(
+            still.release_checked_at,
+            stored.release_checked_at,
+            "a page that was not read was stamped as though it had been",
+        )
+        self.assertEqual(
+            self.embedder.passages_embedded,
+            embedded_once,
+            "a release that was not read was embedded again",
+        )
+
+    def test_a_changed_entry_is_read_again_and_the_article_is_replaced(self):
+        self._run([feed_entry()], enricher=RecordingEnricher())
+
+        corrected = RecordingEnricher()
+        summary = self._run(
+            [feed_entry(title="FOMC statement (corrected)")], enricher=corrected
+        )
+
+        self.assertEqual(corrected.read, ["monetary20260916a"])
+        self.assertEqual(self._fed(summary).updated, 1)
+        (article,) = self.articles()
+        self.assertEqual(article.title, "FOMC statement (corrected)")
+        # And the replacement is indexed in the same run rather than left un-indexed.
+        self.assertIsNotNone(article.indexed_at)
+
+    def test_an_entries_own_update_marker_is_enough_to_read_it_again(self):
+        self._run([feed_entry()], enricher=RecordingEnricher())
+
+        revised = RecordingEnricher()
+        self._run(
+            [
+                feed_entry(
+                    provider_updated_at=PUBLISHED + timedelta(hours=2)
+                )
+            ],
+            enricher=revised,
+            now=datetime.now(timezone.utc) + timedelta(minutes=5),
+        )
+
+        self.assertEqual(
+            revised.read,
+            ["monetary20260916a"],
+            "the feed said the entry was revised and the release was not re-read",
+        )
+
+    def test_a_release_is_read_again_once_the_recheck_interval_lapses(self):
+        self._run([feed_entry()], enricher=RecordingEnricher())
+
+        later = RecordingEnricher()
+        summary = self._run(
+            [feed_entry()],
+            enricher=later,
+            now=datetime.now(timezone.utc)
+            + news_ingestion.RELEASE_RECHECK_INTERVAL
+            + timedelta(minutes=1),
+        )
+
+        self.assertEqual(later.read, ["monetary20260916a"])
+        self.assertEqual(self._fed(summary).releases_read, 1)
+        # Re-reading a page that says the same thing is not a change to the article.
+        self.assertEqual(self._fed(summary).unchanged, 1)
+
+    def test_a_release_that_could_not_be_read_is_read_again_next_run(self):
+        self._run(
+            [feed_entry()], enricher=RecordingEnricher(fail_for=("monetary20260916a",))
+        )
+
+        (article,) = self.articles()
+        self.assertIsNone(
+            article.release_checked_at,
+            "a page that was never retrieved was recorded as having been read",
+        )
+
+        retry = RecordingEnricher()
+        self._run([feed_entry()], enricher=retry)
+
+        self.assertEqual(retry.read, ["monetary20260916a"])
+        (article,) = self.articles()
+        self.assertIsNotNone(article.release_checked_at)
+
+    def test_an_article_whose_body_is_missing_is_read_again(self):
+        # An entry the feed published with no text of its own, whose release page could not
+        # be read either: the article is stored with nothing in it, and not indexed.
+        self._run(
+            [feed_entry(summary="")],
+            enricher=RecordingEnricher(fail_for=("monetary20260916a",)),
+        )
+        (article,) = self.articles()
+        self.assertEqual(article.text, "")
+        self.assertIsNone(article.indexed_at)
+
+        again = RecordingEnricher()
+        self._run([feed_entry()], enricher=again)
+
+        self.assertEqual(
+            again.read,
+            ["monetary20260916a"],
+            "an article with no stored body was not read for",
+        )
+        (article,) = self.articles()
+        self.assertEqual(article.text, RELEASE_BODY)
+        self.assertIsNotNone(article.indexed_at)
+
+    def test_a_release_body_is_never_replaced_by_the_feeds_own_summary(self):
+        self._run([feed_entry()], enricher=RecordingEnricher())
+
+        # A summary that has since grown past the length worth indexing on its own. Nothing
+        # about the entry changed except that, and the release page is what is stored.
+        long_summary = "The Federal Reserve issued a statement. " * 12
+        self.assertGreater(len(long_summary), MIN_SUMMARY_CHARS)
+        self._run([feed_entry(summary=long_summary)], enricher=RecordingEnricher())
+
+        (article,) = self.articles()
+        self.assertEqual(
+            article.text,
+            RELEASE_BODY,
+            "a release page was replaced by the feed's summary of it",
+        )
 
 
 class ChangeTests(IngestionTestCase):

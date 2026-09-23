@@ -298,14 +298,42 @@ class NotConfiguredTests(ToolTestCase):
         self.assertTrue(any("DEEPSEEK_API_KEY" in w for w in result.warnings))
 
     def test_the_api_still_starts_with_no_key(self):
-        """Nothing in the agent package may be imported by the API, or reach for a key."""
-        import app.main  # noqa: F401 - the import is the test
+        """The API must come up with no model key configured.
+
+        This used to be checked by asserting the string "agent" appeared nowhere in `app.main` --
+        a blunt proxy for "the API does not pull the agent in". That proxy is gone: Module 2's
+        checkpointer and recovery are wired through the application's lifespan, so `app.main`
+        imports from `app.agent` deliberately. The *property* it stood for is checked here
+        instead, and more directly, by importing the application in a process whose environment
+        has no key in it at all. A module that reached for one at import time would fail there.
+        """
+        import os
+        import subprocess
+        import sys
 
         from pathlib import Path
 
+        import app.main  # noqa: F401 - the in-process import is part of the test
+
         source = Path(app.main.__file__).read_text()
         self.assertNotIn("run_analysis", source)
-        self.assertNotIn("agent", source.replace("management", ""))
+        # The entry points that *do* need a key: the API may reach the agent package for the
+        # checkpointer and for recovery, and must not reach these.
+        for forbidden in ("build_client", "DeepSeekClient", "run_supervisor"):
+            self.assertNotIn(forbidden, source)
+
+        environment = {**os.environ}
+        environment.pop("DEEPSEEK_API_KEY", None)
+        result = subprocess.run(
+            [sys.executable, "-c", "import app.main; print('started')"],
+            capture_output=True,
+            text=True,
+            env=environment,
+            cwd=Path(__file__).resolve().parents[1],
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("started", result.stdout)
 
 
 class ReadsOnlyTests(RunAnalysisTestCase):

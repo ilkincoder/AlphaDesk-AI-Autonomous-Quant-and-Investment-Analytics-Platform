@@ -13,6 +13,15 @@ load, a collection that will not accept the vectors -- leaves articles that are 
 readable, and marked as not indexed. The next run indexes exactly those and skips the rest,
 because an article whose content hash and configuration already match is not embedded again.
 
+**A release page that was read once is not read again on every run.** The feed is always
+re-read -- that is how a new entry is found -- but the release *behind* an entry already held
+is a request to an agency's website, and repeating it for an article nothing has changed is
+work with no result. `_keep_stored` decides per entry: a body is already stored, the feed's
+own markers do not say the entry changed, and the page was read inside
+`RELEASE_RECHECK_INTERVAL`. Anything else is read, and a page whose read fails leaves no
+`release_checked_at`, so the next run tries it again rather than treating the failure as a
+fresh copy.
+
 **The symbols come from the portfolio, and the macro feeds do not.** Company news is read for
 what is actually held, looked up from PostgreSQL rather than written down here. The Fed and
 BLS feeds are read regardless of what anybody holds: a rate decision or a CPI print is not
@@ -23,7 +32,7 @@ No scheduler, and nothing here runs on its own. One call is one bounded run.
 
 import logging
 import threading
-from collections.abc import Iterator, Sequence
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -39,7 +48,7 @@ from app.news import NewsArticle as NormalizedArticle
 from app.news import from_alpaca, from_feed_entry
 from app.news_index import OUTCOME_FAILED, OUTCOME_INDEXED, OUTCOME_UNCHANGED
 from app.news_index import index_articles
-from app.official_feeds import FEEDS, Feed, OfficialFeedError
+from app.official_feeds import FEEDS, MIN_SUMMARY_CHARS, Feed, FeedEntry, OfficialFeedError
 from app.official_feeds import enrich_with_release_text, fetch_feed
 from app.portfolio_identity import find as find_portfolio
 from app.vector_store import VectorStore, VectorStoreError
@@ -60,6 +69,18 @@ DEFAULT_DAYS = 7
 # anything to index.
 DEFAULT_MAX_RELEASES = 10
 
+# How long a release page that was read once is trusted before it is read again.
+#
+# Reading it is a request to a public service, and an official release is a published
+# document rather than a live one: the Fed's RSS entries carry no revision marker at all, so
+# without an interval the only two choices are "read the page on every run" and "never read it
+# again". A day is the bound -- long enough that pressing Refresh costs nothing, short enough
+# that a correction is picked up the next day.
+#
+# A feed that *does* mark revisions is not waited on this long: an entry whose update marker
+# or title has changed is read immediately, because the publisher has said it changed.
+RELEASE_RECHECK_INTERVAL = timedelta(hours=24)
+
 # Per source, in the result.
 STATUS_OK = "ok"
 STATUS_FAILED = "failed"
@@ -78,8 +99,10 @@ class SourceResult:
     """What one source did, in the terms a person would ask about it.
 
     `fetched` is what the provider returned; `new` and `updated` are what that changed in
-    the database; `unchanged` is what it did not. `error` is a sentence fit to show, and
-    never a credential or a traceback.
+    the database; `unchanged` is what it did not. `releases_read` is how many release pages
+    were actually retrieved on top of the feed itself -- the number that a repeat run should
+    drive to zero for entries it already holds. `error` is a sentence fit to show, and never
+    a credential or a traceback.
     """
 
     source: str
@@ -90,6 +113,7 @@ class SourceResult:
     unchanged: int = 0
     indexed: int = 0
     failed_index: int = 0
+    releases_read: int = 0
     error: str | None = None
     last_success_at: datetime | None = None
 
@@ -107,6 +131,7 @@ class SourceResult:
             "unchanged": self.unchanged,
             "indexed": self.indexed,
             "failed_index": self.failed_index,
+            "releases_read": self.releases_read,
             "error": self.error,
             "last_success_at": (
                 None if self.last_success_at is None else self.last_success_at.isoformat()
@@ -227,6 +252,7 @@ def ingest(
                     feed=feed,
                     max_entries=max_feed_entries,
                     max_releases=max_releases,
+                    now=began,
                 )
             )
 
@@ -297,11 +323,14 @@ def _read_feed(
     feed: Feed,
     max_entries: int,
     max_releases: int,
+    now: datetime,
 ) -> SourceResult:
     source = f"official_{feed.key}"
     try:
         entries = fetch_feed(feed, limit=max_entries)
-        entries = enrich_with_release_text(entries, max_releases=max_releases)
+        stored = _stored_by_entry(session, source, entries)
+        to_read, reused = _plan_releases(entries, stored, now)
+        read = enrich_with_release_text(to_read, max_releases=max_releases)
     except OfficialFeedError as exc:
         logger.warning("feed %s could not be read: %s", feed.key, type(exc).__name__)
         return SourceResult(
@@ -311,9 +340,11 @@ def _read_feed(
             last_success_at=_last_success(session, source),
         )
 
-    articles, problems = _normalize(
-        entries, lambda entry: from_feed_entry(entry, feed)
-    )
+    articles, problems = _normalize(read, lambda entry: from_feed_entry(entry, feed))
+    # The entries kept as stored are offered to storage as the article they already are,
+    # rather than being rebuilt from the feed's own summary -- see `_stored_article`.
+    articles.extend(_stored_article(row) for row in reused)
+
     return _store_and_index(
         session,
         store=store,
@@ -322,6 +353,128 @@ def _read_feed(
         articles=articles,
         problems=problems,
         fetched=len(entries),
+        # Only an entry that came back with a body was actually read. `enrich_with_release_text`
+        # reports a page it could not retrieve by handing the entry back as the feed published
+        # it, so a missing `text` there means nothing was fetched -- and an entry whose own
+        # summary was substantial enough was never fetched either.
+        releases_read=frozenset(
+            entry.entry_id for entry in read if entry.text is not None
+        ),
+    )
+
+
+def _stored_by_entry(
+    session: Session, source: str, entries: Sequence[FeedEntry]
+) -> dict[str, NewsArticle]:
+    """The stored rows for these entries, keyed the way the table identifies an article.
+
+    One query for the whole feed rather than one per entry: ten entries asked about one at a
+    time is ten round trips to answer a question a single `IN` answers.
+
+    Keyed by `provider_article_id`, which for a feed entry is the entry's own id -- the
+    fallback to the URL cannot apply, because `fetch_feed` refuses an entry that has no id.
+    """
+    ids = [entry.entry_id for entry in entries if entry.entry_id]
+    if not ids:
+        return {}
+    rows = session.scalars(
+        select(NewsArticle).where(
+            NewsArticle.provider == source,
+            NewsArticle.provider_article_id.in_(ids),
+        )
+    ).all()
+    return {row.provider_article_id: row for row in rows}
+
+
+def _plan_releases(
+    entries: Sequence[FeedEntry], stored: Mapping[str, NewsArticle], now: datetime
+) -> tuple[list[FeedEntry], list[NewsArticle]]:
+    """Split a feed's entries into the release pages to read and the articles to keep as stored.
+
+    An entry that has never been seen is offered to enrichment and its own rule decides:
+    `MIN_SUMMARY_CHARS` is what says whether the feed's summary is worth indexing on its own.
+    An entry that *has* been seen is decided here, because the answer depends on what is
+    stored rather than on the feed alone.
+    """
+    to_read: list[FeedEntry] = []
+    reused: list[NewsArticle] = []
+    for entry in entries:
+        row = stored.get(entry.entry_id)
+        if row is not None and _keep_stored(entry, row, now):
+            reused.append(row)
+        else:
+            to_read.append(entry)
+    return to_read, reused
+
+
+def _keep_stored(entry: FeedEntry, stored: NewsArticle, now: datetime) -> bool:
+    """Whether the stored article is kept instead of this entry's release page being read.
+
+    True only when there is a body to keep, the page was read once already, and neither the
+    feed nor the clock says to look again.
+    """
+    if not stored.text.strip():
+        # Stored with nothing readable in it -- an earlier read that came back empty. There
+        # is nothing to reuse, so the entry goes back to enrichment and is read if its own
+        # summary is thin.
+        return False
+    if stored.release_checked_at is None:
+        # The page has never been read for this article, so this is the run that reads it.
+        # NULL is also what a *failed* read leaves behind, which is what makes one retryable.
+        return False
+    if len(entry.summary) >= MIN_SUMMARY_CHARS:
+        # The article's body came from a release page, and the feed's own text has since
+        # grown to a length worth indexing. Keeping the stored body is the deliberate
+        # choice: a release page is never traded for the feed's summary of it.
+        return True
+    if _entry_changed(entry, stored):
+        return False
+    return now - stored.release_checked_at < RELEASE_RECHECK_INTERVAL
+
+
+def _entry_changed(entry: FeedEntry, stored: NewsArticle) -> bool:
+    """Whether the feed itself says this entry is no longer what was stored.
+
+    Two markers, and neither is a guess. An Atom feed's `updated` is the publisher saying the
+    entry changed -- the Fed's RSS has no such field, and `provider_updated_at` is NULL for
+    every one of its entries. A title that no longer matches is the entry being a different
+    entry under an id that was reused. Nothing is inferred from the summary text, which is
+    exactly the field that changes without the article changing.
+    """
+    if (
+        entry.provider_updated_at is not None
+        and entry.provider_updated_at != stored.provider_updated_at
+    ):
+        return True
+    return not _same_title(entry, stored)
+
+
+def _same_title(entry: FeedEntry, stored: NewsArticle) -> bool:
+    """Compared the way the title was normalized when it was stored, so a difference in
+    whitespace alone is not reported as a change."""
+    return " ".join(entry.title.split()) == stored.title
+
+
+def _stored_article(row: NewsArticle) -> NormalizedArticle:
+    """A stored row re-offered to storage as the article it already is.
+
+    Reusing the row rather than rebuilding it from the feed entry is what makes "unchanged"
+    exact. The content hash is carried across, so `_upsert` cannot mistake a body that was
+    read from a release page for the one-line summary the feed is carrying today, and the
+    comparison is a comparison of what is actually stored.
+    """
+    return NormalizedArticle(
+        provider=row.provider,
+        provider_article_id=row.provider_article_id,
+        source=row.source,
+        canonical_url=row.canonical_url,
+        title=row.title,
+        text=row.text,
+        symbols=tuple(row.symbols or ()),
+        category=row.category,
+        published_at=row.published_at,
+        provider_updated_at=row.provider_updated_at,
+        content_sha256=row.content_sha256,
     )
 
 
@@ -356,11 +509,16 @@ def _store_and_index(
     articles: Sequence[NormalizedArticle],
     problems: Sequence[str],
     fetched: int,
+    releases_read: Collection[str] = (),
 ) -> SourceResult:
     """Write one source's articles, then index them, in that order.
 
     Storage commits before indexing begins, so an article that could not be embedded is
     still an article -- stored, readable on the page, and indexed by the next run.
+
+    `releases_read` names the articles whose release page was retrieved during this run, by
+    `provider_article_id`. It is what stamps `release_checked_at`, the time the recheck
+    interval is measured from.
     """
     new = updated = unchanged = 0
 
@@ -369,7 +527,11 @@ def _store_and_index(
         # back, and this failing cannot roll another back.
         with _own_transaction(session):
             for article in articles:
-                tally = _upsert(session, article)
+                tally = _upsert(
+                    session,
+                    article,
+                    release_read=article.provider_article_id in releases_read,
+                )
                 if tally == "new":
                     new += 1
                 elif tally == "updated":
@@ -422,12 +584,19 @@ def _store_and_index(
         unchanged=unchanged,
         indexed=indexed,
         failed_index=failed_index + len(problems),
+        releases_read=sum(
+            1
+            for article in articles
+            if article.provider_article_id in releases_read
+        ),
         error=index_error,
         last_success_at=datetime.now(timezone.utc),
     )
 
 
-def _upsert(session: Session, article: NormalizedArticle) -> str:
+def _upsert(
+    session: Session, article: NormalizedArticle, *, release_read: bool = False
+) -> str:
     """Insert or update one article. Returns "new", "updated" or "unchanged".
 
     The dedupe key is `(provider, provider_article_id)` -- the same one the table's unique
@@ -435,6 +604,10 @@ def _upsert(session: Session, article: NormalizedArticle) -> str:
     decides whether the stored copy changes; `ingested_at` is refreshed only when the words
     did, because it is the time this database last learned something new about the article,
     not the time it last looked at it.
+
+    `release_read` is the other half of that distinction, and is why an unchanged article can
+    still write a row: `release_checked_at` records when the release page was last retrieved,
+    which is true whether or not the page said anything new.
     """
     row = session.scalars(
         select(NewsArticle).where(
@@ -459,6 +632,7 @@ def _upsert(session: Session, article: NormalizedArticle) -> str:
                 provider_updated_at=article.provider_updated_at,
                 ingested_at=now,
                 content_sha256=article.content_sha256,
+                release_checked_at=now if release_read else None,
             )
         )
         session.flush()
@@ -466,7 +640,12 @@ def _upsert(session: Session, article: NormalizedArticle) -> str:
 
     if row.content_sha256 == article.content_sha256:
         # The provider may have moved `updated_at`, or re-sent the same story twice in one
-        # feed read. Neither is a change to the article.
+        # feed read. Neither is a change to the article -- but a release page that was read
+        # and said the same thing is still a page that was read, and the time it was read is
+        # what the next run's recheck interval is measured from.
+        if release_read:
+            row.release_checked_at = now
+            session.flush()
         return "unchanged"
 
     row.source = article.source
@@ -479,6 +658,8 @@ def _upsert(session: Session, article: NormalizedArticle) -> str:
     row.provider_updated_at = article.provider_updated_at
     row.ingested_at = now
     row.content_sha256 = article.content_sha256
+    if release_read:
+        row.release_checked_at = now
     # The old index describes text that is no longer stored. Clearing the identity now is
     # what makes the row read as "not indexed" until the replacement's points are written,
     # so a crash in between cannot leave a stale vector being served as current.

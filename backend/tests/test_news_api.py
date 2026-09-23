@@ -243,8 +243,11 @@ class ListingTests(NewsApiTestCase):
 
         self.assertEqual(caught.exception.status_code, 422)
 
-    def test_a_source_filter_selects_one_provider(self):
-        listing = get_news(session=self.session, source="Federal Reserve")
+    def test_a_provider_filter_selects_one_feed(self):
+        """The slug, not the publisher's name -- which is what the page's Source filter holds
+        and what `sources` reports, and the only thing that can tell the two BLS feeds apart.
+        Filtering on the name returned nothing at all for every option the page offers."""
+        listing = get_news(session=self.session, provider="official_fed_monetary")
 
         self.assertEqual([a.title for a in listing.articles], ["Release a"])
 
@@ -295,6 +298,16 @@ class SearchEndpointTests(NewsApiTestCase):
             return get_news_search(
                 session=self.session, store=self.store, q=query, **kwargs
             )
+
+    def test_the_search_carries_the_provider_filter_to_the_index(self):
+        """A filter the page sets and this route dropped would return passages from every
+        feed while the form still showed the filter as applied."""
+        result = self.search("data centre spending", provider="official_fed_monetary")
+
+        self.assertEqual(
+            {passage.article.provider for passage in result.passages},
+            {"official_fed_monetary"},
+        )
 
     def test_a_search_returns_passages_with_the_article_they_came_from(self):
         result = self.search("data centre spending")

@@ -8,6 +8,8 @@
  * test that hands out a single response is testing a page that no longer exists.
  */
 
+import { StrictMode } from 'react'
+
 import { act, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -117,6 +119,47 @@ function stubLoads(...valuations: Response[]) {
   return mock
 }
 
+/** A `fetch` that answers only when the test says so, and that honours the request's abort
+ *  signal the way a real one does.
+ *
+ * `stubLoads` resolves whatever happens to the signal, and that is exactly why no test here
+ * caught the page cancelling its own request: a cancelled fetch that reports success anyway
+ * is indistinguishable from a working page. `release` is the test letting the answers
+ * through, in whatever order it wants them to land.
+ */
+function controllableFetch(respond: (url: string) => unknown) {
+  const calls: string[] = []
+  const release: Array<() => void> = []
+  const mock = vi.fn((url: string, init?: RequestInit) => {
+    calls.push(url)
+    return new Promise<Response>((resolve, reject) => {
+      const signal = init?.signal
+      const onAbort = () => reject(new DOMException('aborted', 'AbortError'))
+      if (signal?.aborted) {
+        onAbort()
+        return
+      }
+      signal?.addEventListener('abort', onAbort, { once: true })
+      release.push(() => resolve(jsonResponse(respond(url))))
+    })
+  })
+  vi.stubGlobal('fetch', mock)
+  return { mock, calls, release }
+}
+
+/** Let every answer through, including the ones that are only asked for once an earlier
+ *  answer lands -- a portfolio load is a sync and then a read, and a refresh is an
+ *  ingestion and then a listing. `release` grows as it is drained, so the loop re-reads it.
+ */
+async function releaseAll(release: Array<() => void>) {
+  await act(async () => {
+    for (let index = 0; index < release.length; index++) {
+      release[index]()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+  })
+}
+
 /** Wait until `text` is on screen.
  *
  * `findAllBy` rather than `findBy`, because several figures legitimately appear more
@@ -145,6 +188,24 @@ describe('PortfolioPage', () => {
 
     expect(screen.getByText('Loading portfolio data')).toBeTruthy()
     expect(screen.queryByText('$16,100.00')).toBeNull()
+  })
+
+  it('loads on the first render, with StrictMode running the effect twice', async () => {
+    // The bug this pins: the effect aborted its own sync when StrictMode ran it a second
+    // time, and the in-flight guard then refused to start another -- so opening the app
+    // left the page on "Loading portfolio data" until the thirty-second tick happened to
+    // rescue it. Nothing here rendered under StrictMode before, and the other doubles
+    // ignore the abort signal, so a cancelled request looked like a successful one.
+    const api = controllableFetch((url) => (url.includes('sync') ? SYNC_OK : DEMO))
+
+    render(
+      <StrictMode>
+        <PortfolioPage />
+      </StrictMode>,
+    )
+    await releaseAll(api.release)
+
+    await expectVisible('$16,100.00')
   })
 
   it('renders every figure from the API response', async () => {

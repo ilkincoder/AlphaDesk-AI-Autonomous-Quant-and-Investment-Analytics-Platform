@@ -31,7 +31,11 @@
   --text-note: 0.8125rem; /* 13px, secondary lines */
   --text-body: 0.875rem; /* 14px, the default */
   --text-heading: 0.9375rem; /* 15px, card headings */
-  --text-page: 1.625rem; /* 26px, the page heading */
+  /* 26px, the page heading. Deliberately not `--text-page`: that key collides with
+     `--color-page` above, and Tailwind emits one `text-page` class for both -- which
+     resolves to the colour, so the size never applied and every page heading was painted
+     in the page background. Two namespaces, one name, and the colour won. */
+  --text-title: 1.625rem;
   --text-figure: 1.875rem; /* 30px, the headline portfolio value */
 
   --radius-card: 10px;

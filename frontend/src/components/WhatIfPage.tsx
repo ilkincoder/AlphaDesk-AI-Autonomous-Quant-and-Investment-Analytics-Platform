@@ -113,7 +113,7 @@ export function WhatIfPage() {
     <div>
       <header className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2">
         <div>
-          <h1 className="text-page font-bold text-ink">What if?</h1>
+          <h1 className="text-title font-bold text-ink">What if?</h1>
           <p className="mt-1 text-note text-dim">
             Explore how a hypothetical stock price change could affect your portfolio.
           </p>

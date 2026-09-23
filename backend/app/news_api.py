@@ -139,7 +139,7 @@ def get_news(
     session: Session = Depends(get_session),
     limit: Annotated[int, Query(ge=1, le=MAX_PAGE_SIZE)] = DEFAULT_PAGE_SIZE,
     offset: Annotated[int, Query(ge=0)] = 0,
-    source: Annotated[str | None, Query(max_length=120)] = None,
+    provider: Annotated[str | None, Query(max_length=48)] = None,
     category: Annotated[str | None, Query(max_length=16)] = None,
     symbol: Annotated[str | None, Query(max_length=20)] = None,
     published_after: datetime | None = None,
@@ -150,12 +150,17 @@ def get_news(
     Ordered by `published_at` and never by `ingested_at`: a release published a month ago and
     read this morning belongs where it was published, not at the top of the page.
 
+    `provider` selects one feed -- `alpaca_news`, `official_fed_monetary` and so on, the same
+    slugs `sources` reports. It is what the page's Source filter sends, and it is what
+    distinguishes the two BLS feeds, which share a publisher name and so cannot be told apart
+    by `NewsArticle.source`.
+
     A `symbol` filter matches the articles tagged with it. Macro releases carry no symbols and
     are therefore absent from a filtered listing -- deliberately, because they are not about
     that company -- and are found by filtering on `category=macro` or by not filtering at all.
     """
     conditions = _listing_conditions(
-        source=source,
+        provider=provider,
         category=category,
         symbol=symbol,
         published_after=published_after,
@@ -189,6 +194,7 @@ def get_news_search(
     store: VectorStore = Depends(news_store),
     q: Annotated[str, Query(min_length=1, max_length=500)] = ...,
     top_k: Annotated[int, Query(ge=1, le=MAX_TOP_K)] = DEFAULT_TOP_K,
+    provider: Annotated[str | None, Query(max_length=48)] = None,
     category: Annotated[str | None, Query(max_length=16)] = None,
     symbol: Annotated[str | None, Query(max_length=20)] = None,
     published_after: datetime | None = None,
@@ -200,6 +206,11 @@ def get_news_search(
     the query, which is also why it can return something that shares none of its words. The
     status says which of "nothing matched", "nothing is indexed" and "the index is down"
     happened, because those are three different things to be told.
+
+    The filters are the listing's, applied inside Qdrant before it picks anything, so a
+    filtered-out article cannot occupy one of the `top_k` places. A filter the page sets and
+    this route ignored would return passages from every feed while the form still showed the
+    filter as applied, which is the one outcome worse than refusing the request.
     """
     query = q.strip()
     if not query:
@@ -212,6 +223,7 @@ def get_news_search(
             top_k=top_k,
             store=store,
             embedder=get_embedder(),
+            provider=provider,
             category=category,
             symbols=[symbol] if symbol else [],
             published_after=published_after,
@@ -258,15 +270,18 @@ def get_news_search(
 
 def _listing_conditions(
     *,
-    source: str | None,
+    provider: str | None,
     category: str | None,
     symbol: str | None,
     published_after: datetime | None,
     published_before: datetime | None,
 ) -> list:
     conditions = []
-    if source:
-        conditions.append(NewsArticle.source == source.strip())
+    if provider:
+        # The feed slug, not the publisher's name. Filtering on the name would merge the two
+        # BLS feeds into one option and would match nothing at all for a caller passing the
+        # slug -- which is what `sources` reports and what the page's filter holds.
+        conditions.append(NewsArticle.provider == provider.strip())
     if category:
         if category not in CATEGORIES:
             # Refused rather than ignored. A filter that quietly did nothing would return

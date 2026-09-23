@@ -6,13 +6,9 @@
  * exactly 100 — Day 3 rounds each percentage independently and says so.
  */
 
-import { formatPercent } from '../format'
+import { allocationAssets, nothingToAllocate } from '../allocation'
 import type { ValuationHolding } from '../api'
-
-/** Purple shades for holdings, in API order. Cycled, so a portfolio with more
- *  holdings than shades repeats rather than running out and rendering nothing. */
-const HOLDING_SHADES = ['#8B5CF6', '#A78BFA', '#7C3AED', '#6D28D9', '#C4B5FD']
-const CASH_SHADE = 'var(--color-cash)'
+import { formatPercent } from '../format'
 
 export function AllocationBar({
   holdings,
@@ -21,25 +17,13 @@ export function AllocationBar({
   holdings: ValuationHolding[]
   cashAllocationPercent: string | null
 }) {
-  const segments = [
-    ...holdings.map((holding, index) => ({
-      key: holding.symbol,
-      label: holding.symbol,
-      percent: holding.allocation_percent,
-      colour: HOLDING_SHADES[index % HOLDING_SHADES.length],
-    })),
-    {
-      key: 'CASH',
-      label: 'Cash',
-      percent: cashAllocationPercent,
-      colour: CASH_SHADE,
-    },
-  ]
+  // The palette and the segment order come from `allocation.ts`, so this bar and the
+  // proposal's donuts cannot disagree about what colour a holding is.
+  const segments = allocationAssets(holdings, cashAllocationPercent)
 
   // A zero-value portfolio has no denominator, so the API sends null for every
   // percentage. Drawing an empty bar with no explanation would look like a bug.
-  const nothingToShow = segments.every((segment) => segment.percent === null)
-  if (nothingToShow) {
+  if (nothingToAllocate(segments)) {
     return (
       <div>
         <div className="h-2 w-full rounded-full bg-line" aria-hidden="true" />

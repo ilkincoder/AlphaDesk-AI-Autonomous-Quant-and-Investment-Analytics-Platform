@@ -21,7 +21,7 @@ function navLabels() {
 }
 
 describe('Sidebar', () => {
-  it('lists every destination, with News directly below What if?', () => {
+  it('lists every destination, with News & Trading directly below What if?', () => {
     renderSidebar()
 
     expect(navLabels()).toEqual([
@@ -29,7 +29,7 @@ describe('Sidebar', () => {
       'Analysis',
       'Portfolio',
       'What if?',
-      'News',
+      'News & Trading',
       'Strategies',
       'Backtest',
       'Orders',
@@ -51,10 +51,10 @@ describe('Sidebar', () => {
     expect(screen.getByRole('button', { name: 'Dashboard' }).hasAttribute('disabled')).toBe(true)
   })
 
-  it('enables News, and reports it as the chosen destination', () => {
+  it('enables News & Trading, and reports it as the chosen destination', () => {
     const onNavigate = renderSidebar('news')
 
-    const news = screen.getByRole('button', { name: 'News' })
+    const news = screen.getByRole('button', { name: 'News & Trading' })
     expect(news.hasAttribute('disabled')).toBe(false)
     expect(news.getAttribute('aria-current')).toBe('page')
 

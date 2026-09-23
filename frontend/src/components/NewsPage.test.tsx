@@ -9,10 +9,13 @@
  * would be wrong about two of them.
  */
 
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { StrictMode } from 'react'
+
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { NewsIngest, NewsList, NewsSearch } from '../api'
+import { aProposal, sseResponse } from '../testing'
 import { NewsPage } from './NewsPage'
 
 const PUBLISHED = '2026-09-22T14:00:00+00:00'
@@ -122,24 +125,100 @@ function jsonResponse(body: unknown, status = 200): Response {
   } as Response
 }
 
+/** The same listing narrowed to one feed, as `?provider=` returns it. */
+const FED_ONLY: NewsList = {
+  ...LIST,
+  total: 1,
+  articles: LIST.articles.filter((article) => article.provider === 'official_fed_monetary'),
+}
+
+/** A `fetch` that answers only when the test says so, and that honours the request's abort
+ *  signal the way a real one does.
+ *
+ * `stubApi` resolves whatever happens to the signal, and that is exactly why no test here
+ * caught either bug: a page that cancelled its own request still looked like it had loaded,
+ * and a request that had been superseded still delivered its answer. `release` is the test
+ * letting the answers through, in whatever order it wants them to land.
+ */
+function controllableApi(respond: (url: string) => unknown) {
+  const calls: string[] = []
+  const proposal: unknown = { proposal: null }
+  const release: Array<() => void> = []
+  const mock = vi.fn((url: string, init?: RequestInit) => {
+    calls.push(url)
+    return new Promise<Response>((resolve, reject) => {
+      const signal = init?.signal
+      const onAbort = () => reject(new DOMException('aborted', 'AbortError'))
+      if (signal?.aborted) {
+        onAbort()
+        return
+      }
+      signal?.addEventListener('abort', onAbort, { once: true })
+      const body = url.startsWith('/api/rebalance/proposal') ? proposal : respond(url)
+      release.push(() => resolve(jsonResponse(body)))
+    })
+  })
+  vi.stubGlobal('fetch', mock)
+  return { mock, calls, release }
+}
+
+/** Let every answer through, including the ones that are only asked for once an earlier
+ *  answer lands -- a portfolio load is a sync and then a read, and a refresh is an
+ *  ingestion and then a listing. `release` grows as it is drained, so the loop re-reads it.
+ */
+async function releaseAll(release: Array<() => void>) {
+  await act(async () => {
+    for (let index = 0; index < release.length; index++) {
+      release[index]()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+  })
+}
+
+const listingCalls = (calls: string[]) => calls.filter((url) => url.startsWith('/api/news?'))
+const proposalReads = (urls: string[]) =>
+  urls.filter((url) => url === '/api/rebalance/proposal')
+const proposalRuns = (urls: string[]) =>
+  urls.filter((url) => url.startsWith('/api/rebalance/proposal/stream'))
+
+
 type Route = () => Response | Promise<Response>
 
-/** Route by URL, because this page calls three endpoints and the order they are reached
- *  depends on what the reader does. */
-function stubApi(routes: { list?: Route; search?: Route; ingest?: Route } = {}) {
+/** Route by URL, because this page calls four endpoints and the order they are reached
+ *  depends on what the reader does.
+ *
+ * The proposal route answers "there is none" by default, which is what a fresh install returns
+ * and what most of these tests are about: the page reads it on mount, and a test that forgot to
+ * route it would be testing a page that crashed on load rather than the thing it meant to.
+ */
+function stubApi(
+  routes: { list?: Route; search?: Route; ingest?: Route; proposal?: Route; generate?: Route } = {},
+) {
   const calls: string[] = []
-  const mock = vi.fn((url: string) => {
+  // The same calls with their request bodies, for the few assertions that are about what was
+  // *sent* rather than where. `calls` stays a list of URLs because most of this file filters it.
+  const requests: Array<{ url: string; init?: RequestInit }> = []
+  const mock = vi.fn((url: string, init?: RequestInit) => {
     calls.push(url)
+    requests.push({ url, init })
     if (url.startsWith('/api/news/ingest')) {
       return Promise.resolve((routes.ingest ?? (() => jsonResponse(INGEST)))())
     }
     if (url.startsWith('/api/news/search')) {
       return Promise.resolve((routes.search ?? (() => jsonResponse(SEARCH)))())
     }
+    if (url.startsWith('/api/rebalance/proposal/stream')) {
+      return Promise.resolve(
+        (routes.generate ?? (() => sseResponse([{ event: 'done', proposal: aProposal() }])))()
+      )
+    }
+    if (url.startsWith('/api/rebalance/proposal')) {
+      return Promise.resolve((routes.proposal ?? (() => jsonResponse({ proposal: null })))())
+    }
     return Promise.resolve((routes.list ?? (() => jsonResponse(LIST)))())
   })
   vi.stubGlobal('fetch', mock)
-  return { mock, calls }
+  return { mock, calls, requests }
 }
 
 async function renderLoaded(routes = {}) {
@@ -160,6 +239,80 @@ describe('NewsPage', () => {
     render(<NewsPage />)
 
     expect(screen.getByText('Loading news…')).toBeTruthy()
+  })
+
+  it('loads on the first visit, with StrictMode running the effect twice', async () => {
+    // The bug this pins: the effect aborted its own request on StrictMode's second run and
+    // the in-flight guard refused to start another, so the page waited for ever. No test
+    // here rendered under StrictMode, and the other doubles ignore the abort signal.
+    const api = controllableApi(() => LIST)
+
+    render(
+      <StrictMode>
+        <NewsPage />
+      </StrictMode>,
+    )
+    await releaseAll(api.release)
+
+    expect(await screen.findByText('Analyst Sees More Upside for Microsoft')).toBeTruthy()
+  })
+
+  it('asks again when a filter changes while a request is still in flight', async () => {
+    // The bug this pins: the second change was dropped because the first request had not
+    // finished, so the listing showed the previous selection's articles underneath the new
+    // selection's controls -- and nothing on screen said so.
+    const api = controllableApi((url) =>
+      url.includes('provider=official_fed_monetary') ? FED_ONLY : LIST,
+    )
+
+    render(<NewsPage />)
+    fireEvent.change(screen.getByLabelText('Source'), {
+      target: { value: 'official_fed_monetary' },
+    })
+
+    await waitFor(() => expect(listingCalls(api.calls)).toHaveLength(2))
+    expect(listingCalls(api.calls)[1]).toContain('provider=official_fed_monetary')
+
+    // The first request is answered late, after the selection moved on. It was asked for
+    // with the previous selection, so its answer must not land on top of the newer one.
+    await releaseAll(api.release)
+
+    expect(
+      await screen.findByText('Federal Reserve issues FOMC statement'),
+    ).toBeTruthy()
+    expect(screen.queryByText('Analyst Sees More Upside for Microsoft')).toBeNull()
+  })
+
+  it('reads the listing back with the filter as it is when a refresh finishes', async () => {
+    // A refresh is started by the render that was on screen when the button was pressed, so
+    // the selection can move while it runs. Reading the listing back with the selection it
+    // started with is how the page ends up disagreeing with its own controls.
+    const api = controllableApi((url) => {
+      if (url.includes('/news/ingest')) return INGEST
+      return url.includes('provider=official_fed_monetary') ? FED_ONLY : LIST
+    })
+
+    render(<NewsPage />)
+    await releaseAll(api.release)
+    await screen.findByText('Analyst Sees More Upside for Microsoft')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh news' }))
+    fireEvent.change(screen.getByLabelText('Source'), {
+      target: { value: 'official_fed_monetary' },
+    })
+
+    await waitFor(() => expect(api.calls.some((url) => url.includes('/news/ingest'))).toBe(true))
+    await releaseAll(api.release)
+
+    await waitFor(() => {
+      const listing = listingCalls(api.calls)
+      expect(listing[listing.length - 1]).toContain('provider=official_fed_monetary')
+    })
+    expect(await screen.findByText('Federal Reserve issues FOMC statement')).toBeTruthy()
+    expect(screen.queryByText('Analyst Sees More Upside for Microsoft')).toBeNull()
+    // And the run still reports what it did -- read back with the selection as it is now,
+    // the notice is a fact about the run and outlives the listing underneath it.
+    expect(screen.getByText(/Read 2 sources: 3 stored, 3 indexed/)).toBeTruthy()
   })
 
   it('renders every article with its source, headline, excerpt and link', async () => {
@@ -332,21 +485,21 @@ describe('NewsPage', () => {
     expect(await screen.findByText(/No news has been indexed yet/)).toBeTruthy()
   })
 
-  it('sends the source and category filters with the listing', async () => {
+  it('sends the provider and category filters with the listing', async () => {
     const { calls } = await renderLoaded()
 
     fireEvent.change(screen.getByLabelText('Source'), {
       target: { value: 'official_fed_monetary' },
     })
     await waitFor(() =>
-      expect(calls.some((url) => url.includes('source=official_fed_monetary'))).toBe(true),
+      expect(calls.some((url) => url.includes('provider=official_fed_monetary'))).toBe(true),
     )
 
     fireEvent.change(screen.getByLabelText('Category'), { target: { value: 'macro' } })
     await waitFor(() =>
       expect(
         calls.some(
-          (url) => url.includes('category=macro') && url.includes('source=official_fed_monetary'),
+          (url) => url.includes('category=macro') && url.includes('provider=official_fed_monetary'),
         ),
       ).toBe(true),
     )
@@ -356,7 +509,7 @@ describe('NewsPage', () => {
     const { calls } = await renderLoaded()
 
     const listing = calls.find((url) => url.startsWith('/api/news?'))!
-    expect(listing).not.toContain('source=')
+    expect(listing).not.toContain('provider=')
     expect(listing).not.toContain('category=')
     expect(listing).toContain('limit=20')
   })
@@ -382,6 +535,189 @@ describe('NewsPage', () => {
     expect(calls.some((url) => url.includes('offset=2'))).toBe(true)
     // And it is gone once there is nothing left to fetch.
     expect(screen.queryByRole('button', { name: /Load more/ })).toBeNull()
+  })
+
+  it('names the page News & Trading and keeps the news controls', async () => {
+    await renderLoaded()
+
+    expect(screen.getByRole('heading', { level: 1, name: 'News & Trading' })).toBeTruthy()
+    expect(screen.getByLabelText('Search the stored news')).toBeTruthy()
+    expect(screen.getByLabelText('Source')).toBeTruthy()
+    expect(screen.getByLabelText('Category')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Refresh news' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Rebalance proposal' })).toBeTruthy()
+  })
+
+  it('says nothing about a proposal until there is one', async () => {
+    await renderLoaded()
+
+    // An empty frame on a page whose purpose is news would be a section that says something is
+    // missing, and on a fresh install nothing is.
+    expect(screen.queryByRole('heading', { name: 'Rebalance proposal' })).toBeNull()
+    expect(screen.queryByText(/No orders have been sent/)).toBeNull()
+  })
+
+  it('restores the latest proposal on load, without generating anything', async () => {
+    const { calls } = stubApi({ proposal: () => jsonResponse({ proposal: aProposal() }) })
+
+    render(<NewsPage />)
+
+    expect(await screen.findByRole('heading', { name: 'Rebalance proposal' })).toBeTruthy()
+    // Twice: the panel's status line and the summary card's recorded status.
+    expect(screen.getAllByText('Proposed · Estimates only')).toHaveLength(2)
+    // Restoring is a read. Nothing was generated and nothing was spent.
+    expect(proposalRuns(calls)).toHaveLength(0)
+  })
+
+  it('restores the proposal once under StrictMode, and does not generate one', async () => {
+    const { calls } = stubApi({ proposal: () => jsonResponse({ proposal: aProposal() }) })
+
+    render(
+      <StrictMode>
+        <NewsPage />
+      </StrictMode>,
+    )
+
+    expect(await screen.findByRole('heading', { name: 'Rebalance proposal' })).toBeTruthy()
+    expect(proposalRuns(calls)).toHaveLength(0)
+  })
+
+  it('disables the button and names the stage while a proposal is being generated', async () => {
+    let release: (() => void) | null = null
+    const { calls } = await renderLoaded({
+      generate: () =>
+        new Promise((resolve) => {
+          release = () =>
+            resolve(
+              sseResponse([
+                { event: 'stage', stage: 'retrieving_news' },
+                { event: 'done', proposal: aProposal() },
+              ]),
+            )
+        }) as unknown as Response,
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Rebalance proposal' }))
+
+    const button = await screen.findByRole('button', { name: 'Generating…' })
+    expect((button as HTMLButtonElement).disabled).toBe(true)
+    // The news stays available: the run is not the page.
+    expect(screen.getByText('Analyst Sees More Upside for Microsoft')).toBeTruthy()
+
+    await act(async () => {
+      release?.()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+
+    expect(proposalRuns(calls)).toHaveLength(1)
+  })
+
+  it('never starts a second run for a second click', async () => {
+    const { calls } = await renderLoaded({
+      generate: () =>
+        new Promise(() => {
+          // Never settles: the run is in flight for the whole test.
+        }) as unknown as Response,
+    })
+
+    const button = screen.getByRole('button', { name: 'Rebalance proposal' })
+    fireEvent.click(button)
+    await screen.findByRole('button', { name: 'Generating…' })
+    fireEvent.click(screen.getByRole('button', { name: 'Generating…' }))
+
+    expect(proposalRuns(calls)).toHaveLength(1)
+  })
+
+  it('does not let a news filter narrow the proposal request', async () => {
+    const { calls, requests } = await renderLoaded()
+
+    // Narrow the listing to one feed and one category first.
+    fireEvent.change(screen.getByLabelText('Source'), {
+      target: { value: 'official_fed_monetary' },
+    })
+    fireEvent.change(screen.getByLabelText('Category'), { target: { value: 'macro' } })
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Rebalance proposal' }))
+    await screen.findByRole('heading', { name: 'Rebalance proposal' })
+
+    // The proposal is portfolio-wide. A filter that restricted it would produce a proposal
+    // about a different portfolio than the one the page is showing.
+    const sent = requests.find((call) =>
+      call.url.startsWith('/api/rebalance/proposal/stream'),
+    )
+    expect(sent).toBeTruthy()
+    expect(Object.keys(JSON.parse(String(sent?.init?.body)))).toEqual(['request_id'])
+    // One run, and the one read that restored the page's state on mount.
+    expect(proposalRuns(calls)).toHaveLength(1)
+    expect(proposalReads(calls)).toHaveLength(1)
+  })
+
+  it('shows the proposal once the run finishes', async () => {
+    await renderLoaded()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Rebalance proposal' }))
+
+    expect((await screen.findAllByText('Proposed · Estimates only')).length).toBe(2)
+    // The trades and the target schedule, both rendered from the calculation.
+    expect(screen.getByRole('table', { name: /Proposed whole-share orders/ })).toBeTruthy()
+    expect(screen.getByRole('table', { name: /Target weights per holding/ })).toBeTruthy()
+  })
+
+  it('reports a failed run without losing the news', async () => {
+    const { calls } = await renderLoaded({
+      generate: () => jsonResponse({ detail: 'The proposal run failed.' }, 503),
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Rebalance proposal' }))
+
+    expect(await screen.findByText('Could not generate a proposal.')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Rebalance proposal' })).toBeTruthy()
+    expect(screen.getByText('Analyst Sees More Upside for Microsoft')).toBeTruthy()
+    // A failure is a recorded outcome, not a retry: the page does not ask again on its own.
+    expect(proposalRuns(calls)).toHaveLength(1)
+  })
+
+  it('hides the panel on Dismiss and brings it back on the next run', async () => {
+    await renderLoaded()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Rebalance proposal' }))
+    await screen.findByRole('heading', { name: 'Rebalance proposal' })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
+    expect(screen.queryByRole('heading', { name: 'Rebalance proposal' })).toBeNull()
+
+    // Dismissing hides the panel. It does not delete the stored proposal, and there is no
+    // order behind it to cancel.
+    fireEvent.click(screen.getByRole('button', { name: 'Rebalance proposal' }))
+    expect(await screen.findByRole('heading', { name: 'Rebalance proposal' })).toBeTruthy()
+  })
+
+  it('says a filtered listing matched nothing rather than that the store is empty', async () => {
+    const empty: NewsList = { ...LIST, total: 0, articles: [] }
+    // The listing goes empty once a filter is applied, which is what a filtered query that
+    // matched nothing really returns.
+    let filtered = false
+    stubApi({ list: () => jsonResponse(filtered ? empty : LIST) })
+    render(<NewsPage />)
+    await screen.findByText('Analyst Sees More Upside for Microsoft')
+
+    filtered = true
+    fireEvent.change(screen.getByLabelText('Source'), {
+      target: { value: 'official_fed_monetary' },
+    })
+
+    expect(await screen.findByText('No articles match your filters.')).toBeTruthy()
+  })
+
+  it('says nothing has been stored when there is no filter to blame', async () => {
+    stubApi({ list: () => jsonResponse({ ...LIST, total: 0, articles: [] }) })
+
+    render(<NewsPage />)
+
+    expect(await screen.findByText('No news stored yet.')).toBeTruthy()
   })
 
   it('reads nothing at all while the page is not the one being shown', () => {

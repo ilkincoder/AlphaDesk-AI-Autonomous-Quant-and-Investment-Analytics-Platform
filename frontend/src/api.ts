@@ -180,9 +180,13 @@ export type NewsIngest = {
   sources: NewsSourceResult[]
 }
 
-/** The filters a listing or a search accepts, as the backend spells them. */
+/** The filters a listing or a search accepts, as the backend spells them.
+ *
+ * `provider` is the feed slug -- `alpaca_news`, `official_fed_monetary` -- which is what the
+ * page's Source filter holds and what the route filters on. It is not the publisher's name:
+ * the two BLS feeds share one, so a name could not tell them apart. */
 export type NewsFilters = {
-  source?: string
+  provider?: string
   category?: string
   symbol?: string
 }
@@ -285,4 +289,288 @@ async function readErrorDetail(response: Response): Promise<string> {
     // Not JSON. Use the generic message below.
   }
   return `The API returned ${response.status}.`
+}
+
+/** Mirrors `ProposalPositionOut` in backend/app/schemas.py.
+ *
+ * Every numeric field is a string, as everywhere else in this file: the API computes these in
+ * `Decimal` and hands them over as strings, and parsing one into a number here would undo that
+ * on the first line of component code.
+ */
+export type ProposalPosition = {
+  symbol: string
+  quantity: string
+  price: string
+  holding_value: string
+  /** Null when the allocation's total is zero: a share of nothing is undefined, not zero. */
+  allocation_percent: string | null
+}
+
+/** Mirrors `ProposalAllocationOut`. One complete allocation; `before` and `after` are two. */
+export type ProposalAllocation = {
+  total_value: string
+  cash_balance: string
+  cash_allocation_percent: string | null
+  holdings: ProposalPosition[]
+}
+
+/** Mirrors `ProposalSnapshotOut`. What the proposal was computed from, frozen on the record. */
+export type ProposalSnapshot = {
+  read_at: string
+  price_source: string
+  last_synced_at: string | null
+  currency: string
+  cash_balance: string
+  holdings_value: string
+  total_value: string
+  /** The broker's own equity where there is one. Need not equal positions plus cash. */
+  reported_total_value: string | null
+  cash_allocation_percent: string | null
+  positions: ProposalPosition[]
+}
+
+/** Mirrors `ProposalPolicyOut`. The rules the targets were proposed under. */
+export type ProposalPolicy = {
+  name: string
+  description: string
+  constraints: string[]
+  scenario: { description: string; shock_percent: string }
+}
+
+/** Mirrors `ProposalTradeOut`. One proposed whole-share order, sent nowhere. */
+export type ProposalTrade = {
+  symbol: string
+  /** `"buy"` or `"sell"`. Always shown as a word: colour alone does not carry the direction. */
+  action: string
+  quantity: string
+  reference_price: string
+  estimated_value: string
+  quantity_before: string
+  quantity_after: string
+}
+
+/** Mirrors `ProposalScenarioOut`. The assumed shock, calculated rather than predicted. */
+export type ProposalScenario = {
+  symbol: string
+  price_change_percent: string
+  price_before: string
+  price_after: string
+  holding_value_before: string
+  holding_value_after: string
+  total_value_before: string
+  total_value_after: string
+  change_value: string
+  change_percent: string | null
+}
+
+/** Mirrors `ProposalAllocationLineOut`: one line of the target schedule.
+ *
+ * Three weights rather than one, because they are three different facts. `target_percent` is
+ * what the agent asked for, `achieved_percent` is where whole-share rounding actually leaves
+ * the holding, and `current_percent` is what the portfolio holds now. Showing only the target
+ * would be showing the flattering one.
+ */
+export type ProposalAllocationLine = {
+  /** A held symbol, or `"CASH"`. */
+  symbol: string
+  current_percent: string | null
+  target_percent: string
+  achieved_percent: string | null
+  /** `increase`, `decrease` or `retain`. */
+  movement: string
+  /** The agent's own reason for that specific number. Empty when it gave none. */
+  reason: string
+  /** The retrieved articles the reason rests on; empty for policy-based reasoning. */
+  evidence_refs: string[]
+}
+
+/** Mirrors `ProposalCalculationOut`. Every figure the page shows comes from here. */
+export type ProposalCalculation = {
+  outcome: string
+  trades: ProposalTrade[]
+  targets: Record<string, string>
+  allocations: ProposalAllocationLine[]
+  cash_target: string
+  before: ProposalAllocation
+  after: ProposalAllocation
+  cash_before: string
+  cash_after: string
+  sell_proceeds: string
+  buy_cost: string
+  /** True when the purchases depend on the proposed sales executing first. */
+  buys_depend_on_sells: boolean
+  largest_before: { symbol: string; allocation_percent: string | null }
+  largest_after: { symbol: string; allocation_percent: string | null }
+  scenario: ProposalScenario
+  reconciliation: {
+    reported_total_value: string | null
+    summed_total_value: string
+    difference: string | null
+    note: string
+  }
+}
+
+/** Mirrors `ProposalEvidenceOut`: one retrieved article, as a citation. */
+export type ProposalEvidence = {
+  reference: string
+  article_id: number
+  title: string
+  publisher: string
+  url: string
+  published_at: string
+  category: string
+  symbols: string[]
+  /** A cosine similarity, not a probability. */
+  similarity: number
+  /** False for an article older than the recent window; labelled, never dropped. */
+  recent: boolean
+}
+
+/** Mirrors `RebalanceProposalOut`.
+ *
+ * `status` is `proposed`, `no_change`, `unavailable`, `interrupted`, or `generating`. There is
+ * no approved, submitted or filled status: this milestone ends at generation.
+ */
+export type RebalanceProposal = {
+  proposal_id: string
+  status: string
+  created_at: string
+  completed_at: string | null
+  /** `current`, `prices_updated`, `portfolio_changed` or `unknown`.
+   *
+   * Four states rather than a flag: a price that ticked is not a portfolio that changed, and
+   * a proposal that cannot be checked is not thereby current. */
+  freshness: string
+  freshness_reason: string | null
+  /** The symbols the comparison found a difference in. */
+  freshness_changed: string[]
+  snapshot: ProposalSnapshot | null
+  policy: ProposalPolicy | null
+  calculation: ProposalCalculation | null
+  evidence: ProposalEvidence[]
+  assumptions: string[]
+  limitations: string[]
+  targets: Record<string, string> | null
+  /** Text a model wrote. Presented as such; nothing here corroborates it. */
+  rationale: string | null
+  failure: string | null
+  failure_reason: string | null
+  usage: Record<string, unknown> | null
+}
+
+/** The latest proposal, or an explicit null. A page restoring itself is asking "is there
+ *  one?", and "no" is an answer rather than an error. */
+export type ProposalView = {
+  proposal: RebalanceProposal | null
+}
+
+/** One event from the proposal stream.
+ *
+ * `stage` events name a step the run actually has; the terminal `done` event carries the same
+ * body `GET /rebalance/proposal` returns, so a client whose stream broke has lost nothing.
+ */
+export type ProposalEvent = {
+  event: string
+  stage?: string
+  detail?: string
+  proposal?: RebalanceProposal
+}
+
+/** The latest proposal, as the page reads it on load. */
+export function fetchProposal(signal?: AbortSignal): Promise<ProposalView> {
+  return request<ProposalView>('/api/rebalance/proposal', { signal })
+}
+
+/** Ask for a proposal and report which stage the run is in while it works.
+ *
+ * The request id is the client's, and it is the whole duplicate-suppression story: a retry with
+ * the same id is answered from the run already in flight rather than paying for a second one.
+ *
+ * Read with `fetch` rather than `EventSource`, because `EventSource` cannot POST a body and
+ * this request has one -- the same trade `analysisApi.streamMessage` makes, and the frames are
+ * parsed the same way.
+ */
+export async function streamProposal(
+  requestId: string,
+  onEvent: (event: ProposalEvent) => void,
+  signal?: AbortSignal,
+): Promise<RebalanceProposal> {
+  let response: Response
+  try {
+    response = await fetch('/api/rebalance/proposal/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+      body: JSON.stringify({ request_id: requestId }),
+      signal,
+    })
+  } catch (cause) {
+    if (cause instanceof DOMException && cause.name === 'AbortError') throw cause
+    throw new ApiError('Could not reach the API.', null)
+  }
+
+  // A 200 or a 202 that is not an event stream is a *replayed* request: one already running, or
+  // one already finished, served as ordinary JSON because there is nothing new to report. Both
+  // carry the stored proposal, and reading them as a stream would find no frames and report
+  // "the stream ended without an answer" for a request that has one.
+  const contentType = response.headers.get('content-type') ?? ''
+  if (response.status === 202 || !contentType.startsWith('text/event-stream')) {
+    const body = (await response.json().catch(() => ({}))) as { proposal?: RebalanceProposal }
+    if (body.proposal) return body.proposal
+    throw new ApiError('A proposal is already being generated.', response.status)
+  }
+  if (!response.ok) {
+    throw new ApiError(await readErrorDetail(response), response.status)
+  }
+  if (!response.body) {
+    throw new ApiError('The API returned no stream.', response.status)
+  }
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let proposal: RebalanceProposal | null = null
+  let failure: string | null = null
+
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+
+      // Frames are separated by a blank line; anything after the last separator is partial.
+      let separator = buffer.indexOf('\n\n')
+      while (separator !== -1) {
+        const frame = buffer.slice(0, separator)
+        buffer = buffer.slice(separator + 2)
+        const event = parseProposalFrame(frame)
+        if (event) {
+          onEvent(event)
+          if (event.event === 'done' && event.proposal) proposal = event.proposal
+          if (event.event === 'error') failure = event.detail ?? 'The proposal failed.'
+        }
+        separator = buffer.indexOf('\n\n')
+      }
+    }
+  } finally {
+    reader.cancel().catch(() => {
+      // The stream is already gone. Nothing to do and nothing to report.
+    })
+  }
+
+  if (proposal) return proposal
+  throw new ApiError(failure ?? 'The stream ended without a proposal.', null)
+}
+
+function parseProposalFrame(frame: string): ProposalEvent | null {
+  const dataLines = frame
+    .split('\n')
+    .filter((line) => line.startsWith('data:'))
+    .map((line) => line.slice(5).trimStart())
+
+  if (dataLines.length === 0) return null
+  try {
+    return JSON.parse(dataLines.join('\n')) as ProposalEvent
+  } catch {
+    return null
+  }
 }

@@ -1,8 +1,8 @@
 /** Application shell navigation.
  *
- * Ten destinations, four of which exist. Analysis, Portfolio, What if? and News are real
- * pages; the other six are rendered as genuinely disabled buttons with a "Coming soon"
- * description, because a link that navigates nowhere is worse than a link that says it
+ * Ten destinations, four of which exist. Analysis, Portfolio, What if? and News & Trading
+ * are real pages; the other six are rendered as genuinely disabled buttons with a "Coming
+ * soon" description, because a link that navigates nowhere is worse than a link that says it
  * cannot.
  */
 
@@ -40,7 +40,7 @@ const NAV_ITEMS: NavItem[] = [
   { id: 'analysis', label: 'Analysis', Icon: AnalysisIcon },
   { id: 'portfolio', label: 'Portfolio', Icon: PortfolioIcon },
   { id: 'what-if', label: 'What if?', Icon: WhatIfIcon },
-  { id: 'news', label: 'News', Icon: DataNewsIcon },
+  { id: 'news', label: 'News & Trading', Icon: DataNewsIcon },
   { label: 'Strategies', Icon: StrategiesIcon },
   { label: 'Backtest', Icon: BacktestIcon },
   { label: 'Orders', Icon: OrdersIcon },
