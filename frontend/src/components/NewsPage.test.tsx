@@ -15,7 +15,7 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { NewsIngest, NewsList, NewsSearch } from '../api'
-import { aProposal, sseResponse } from '../testing'
+import { aDecision, aProposal, sseResponse } from '../testing'
 import { NewsPage } from './NewsPage'
 
 const PUBLISHED = '2026-09-22T14:00:00+00:00'
@@ -192,7 +192,14 @@ type Route = () => Response | Promise<Response>
  * route it would be testing a page that crashed on load rather than the thing it meant to.
  */
 function stubApi(
-  routes: { list?: Route; search?: Route; ingest?: Route; proposal?: Route; generate?: Route } = {},
+  routes: {
+    list?: Route
+    search?: Route
+    ingest?: Route
+    proposal?: Route
+    generate?: Route
+    decision?: Route
+  } = {},
 ) {
   const calls: string[] = []
   // The same calls with their request bodies, for the few assertions that are about what was
@@ -212,6 +219,11 @@ function stubApi(
         (routes.generate ?? (() => sseResponse([{ event: 'done', proposal: aProposal() }])))()
       )
     }
+    // Before the proposal route, which this URL also starts with: `/rebalance/proposal/{id}/
+    // decision` is a different endpoint that happens to share a prefix.
+    if (url.endsWith('/decision')) {
+      return Promise.resolve((routes.decision ?? (() => jsonResponse(anApproval())))())
+    }
     if (url.startsWith('/api/rebalance/proposal')) {
       return Promise.resolve((routes.proposal ?? (() => jsonResponse({ proposal: null })))())
     }
@@ -219,6 +231,44 @@ function stubApi(
   })
   vi.stubGlobal('fetch', mock)
   return { mock, calls, requests }
+}
+
+/** What the decision endpoint answers with when it records an approval. */
+function anApproval(overrides: Record<string, unknown> = {}) {
+  return {
+    outcome: 'approved',
+    detail: 'This proposal was approved for its exact trades.',
+    reason: null,
+    decision: aDecision(),
+    batch_id: 'b'.repeat(32),
+    plan: aDecision().order_plan,
+    price_drift_percent: '0.0000',
+    ...overrides,
+  }
+}
+
+/** What it answers with when the plan's prices have moved and it wants a second click. */
+function aRenewal() {
+  return {
+    outcome: 'renewal_required',
+    detail:
+      'Prices have moved since this proposal was generated: the largest move is 25%, beyond the 1% this approval covers. Approving again confirms the plan at these prices; nothing has been sent.',
+    reason: 'renewal_required',
+    decision: null,
+    batch_id: null,
+    plan: [{ ...aDecision().order_plan[0], estimated_price: '250.00' }],
+    price_drift_percent: '25.0000',
+  }
+}
+
+/** The body of the *last* decision request sent, if one was.
+ *
+ * The last rather than the first: a renewal is two presses, and the second one -- the
+ * confirmation -- is the request whose body the assertion is about.
+ */
+function decisionBody(requests: Array<{ url: string; init?: RequestInit }>) {
+  const sent = requests.filter((item) => item.url.endsWith('/decision')).at(-1)
+  return sent?.init?.body ? JSON.parse(String(sent.init.body)) : null
 }
 
 async function renderLoaded(routes = {}) {
@@ -729,5 +779,139 @@ describe('NewsPage', () => {
     // does. What it renders is the shell's business -- `App` keeps the panel in the DOM
     // with `display: none`, so the placeholder is never on screen.
     expect(mock).not.toHaveBeenCalled()
+  })
+
+  it('approves through the decision endpoint, and opens the Orders page on the batch', async () => {
+    const onOpenOrders = vi.fn()
+    const { requests } = stubApi({ proposal: () => jsonResponse({ proposal: aProposal() }) })
+
+    render(<NewsPage onOpenOrders={onOpenOrders} />)
+    await screen.findByRole('heading', { name: 'Rebalance proposal' })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
+
+    await waitFor(() => expect(onOpenOrders).toHaveBeenCalledWith('b'.repeat(32)))
+    const body = decisionBody(requests)
+    expect(body.decision).toBe('approve')
+    // No quantity, no symbol, no side: what is executed is resolved from the stored proposal.
+    expect(Object.keys(body).sort()).toEqual(['confirm', 'decision', 'idempotency_key'])
+    expect(body.confirm).toBe(false)
+  })
+
+  it('records a rejection and opens nothing', async () => {
+    const onOpenOrders = vi.fn()
+    const { requests } = stubApi({
+      proposal: () => jsonResponse({ proposal: aProposal() }),
+      decision: () =>
+        jsonResponse(
+          anApproval({
+            outcome: 'rejected',
+            detail: 'This proposal was rejected. No orders were created.',
+            decision: aDecision({ decision: 'rejected' }),
+            batch_id: null,
+            plan: [],
+          }),
+        ),
+    })
+
+    render(<NewsPage onOpenOrders={onOpenOrders} />)
+    await screen.findByRole('heading', { name: 'Rebalance proposal' })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Reject' }))
+
+    // Said twice on purpose: the banner carries the server's sentence, and the panel's footer
+    // carries the decision itself.
+    expect((await screen.findAllByText(/This proposal was rejected/)).length).toBeGreaterThan(0)
+    expect(decisionBody(requests).decision).toBe('reject')
+    expect(onOpenOrders).not.toHaveBeenCalled()
+  })
+
+  it('keeps dismissing and rejecting apart', async () => {
+    /* Hiding the panel is a fact about this browser. Rejecting is a decision recorded against
+       the proposal, and one that stops it being executed -- so Dismiss must not send one. */
+    const { requests } = stubApi({ proposal: () => jsonResponse({ proposal: aProposal() }) })
+
+    render(<NewsPage />)
+    await screen.findByRole('heading', { name: 'Rebalance proposal' })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
+
+    expect(screen.queryByRole('heading', { name: 'Rebalance proposal' })).toBeNull()
+    expect(decisionBody(requests)).toBeNull()
+  })
+
+  it("shows a refusal in the server's own words and sends nothing further", async () => {
+    const onOpenOrders = vi.fn()
+    stubApi({
+      proposal: () => jsonResponse({ proposal: aProposal() }),
+      decision: () =>
+        jsonResponse(
+          {
+            outcome: 'refused',
+            reason: 'market_closed',
+            detail:
+              'The US market is closed, so nothing can be executed now. Market orders are only sent during regular trading hours and are never queued overnight.',
+            decision: null,
+            batch_id: null,
+            plan: [],
+            price_drift_percent: null,
+          },
+          400,
+        ),
+    })
+
+    render(<NewsPage onOpenOrders={onOpenOrders} />)
+    await screen.findByRole('heading', { name: 'Rebalance proposal' })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
+
+    expect(await screen.findByText(/US market is closed/)).toBeTruthy()
+    expect(onOpenOrders).not.toHaveBeenCalled()
+  })
+
+  it("asks again, and confirms, when the plan's prices have moved", async () => {
+    const onOpenOrders = vi.fn()
+    let answered = false
+    const { requests } = stubApi({
+      proposal: () => jsonResponse({ proposal: aProposal() }),
+      decision: () => {
+        if (!answered) {
+          answered = true
+          return jsonResponse(aRenewal())
+        }
+        return jsonResponse(anApproval())
+      },
+    })
+
+    render(<NewsPage onOpenOrders={onOpenOrders} />)
+    await screen.findByRole('heading', { name: 'Rebalance proposal' })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
+
+    // The refreshed estimates come back, and nothing was approved by the first press.
+    expect(await screen.findByText(/largest move is 25%/)).toBeTruthy()
+    expect(onOpenOrders).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
+
+    await waitFor(() => expect(onOpenOrders).toHaveBeenCalledWith('b'.repeat(32)))
+    // The second press is the confirmation, and the only thing it says is "yes, at these
+    // prices" -- the orders are the ones already validated, not a fresh resolution.
+    expect(decisionBody(requests).confirm).toBe(true)
+  })
+
+  it('does not offer an approval for a proposal that has no trades', async () => {
+    stubApi({
+      proposal: () =>
+        jsonResponse({
+          proposal: aProposal({ status: 'no_change', calculation: null, targets: null }),
+        }),
+    })
+
+    render(<NewsPage />)
+
+    await screen.findByRole('heading', { name: 'Rebalance proposal' })
+    expect(screen.queryByRole('button', { name: 'Approve' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Reject' })).toBeNull()
   })
 })

@@ -22,7 +22,8 @@ from sqlalchemy.exc import IntegrityError
 
 from tests.testdb import alembic_revision, run_alembic, table_names, test_engine
 
-HEAD_REVISION = "0013_rebalance_proposals"
+HEAD_REVISION = "0014_order_execution"
+REVISION_0013 = "0013_rebalance_proposals"
 REVISION_0012 = "0012_news_release_checked_at"
 REVISION_0011 = "0011_news"
 REVISION_0010 = "0010_alpaca_broker_link"
@@ -54,6 +55,9 @@ TABLES_FROM_0007 = frozenset({"document_index_manifest"})
 TABLES_FROM_0009 = frozenset({"conversations", "conversation_turns"})
 TABLES_FROM_0011 = frozenset({"news_articles", "news_ingestion_runs"})
 TABLES_FROM_0013 = frozenset({"rebalance_proposals"})
+TABLES_FROM_0014 = frozenset(
+    {"rebalance_decisions", "execution_batches", "order_intents"}
+)
 
 # Every table any of our migrations creates, for the checks that only care that they are
 # all there or all gone.
@@ -65,6 +69,7 @@ ALL_INTRODUCED = (
     | TABLES_FROM_0009
     | TABLES_FROM_0011
     | TABLES_FROM_0013
+    | TABLES_FROM_0014
 )
 
 # Untouched by any of them, and the reason every downgrade has to be selective.
@@ -142,6 +147,28 @@ class MigrationRoundtripTest(unittest.TestCase):
             self.engine.dispose()
 
         self.assertLessEqual(TABLES_FROM_0013, table_names(self.engine))
+
+    def test_downgrading_0014_removes_only_the_execution_tables(self):
+        """0014 adds three tables and alters nothing, so its downgrade should be exactly those
+        three going -- including the two partial unique indexes, which cannot outlive their
+        tables."""
+        run_alembic("downgrade", REVISION_0013)
+        try:
+            remaining = table_names(self.engine)
+
+            self.assertEqual(remaining & TABLES_FROM_0014, set())
+            self.assertLessEqual(EXISTING_TABLES, remaining)
+            self.assertLessEqual(
+                TABLES_FROM_0013,
+                remaining,
+                "0014's downgrade reached tables that belong to earlier migrations",
+            )
+            self.assertEqual(alembic_revision(self.engine), REVISION_0013)
+        finally:
+            run_alembic("upgrade", "head")
+            self.engine.dispose()
+
+        self.assertLessEqual(TABLES_FROM_0014, table_names(self.engine))
 
     def test_downgrading_0012_removes_only_the_release_check_column(self):
         """0012 adds one nullable column and touches nothing else, so its downgrade should

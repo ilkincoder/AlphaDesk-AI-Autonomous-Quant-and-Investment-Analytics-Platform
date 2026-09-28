@@ -10,12 +10,28 @@
 import { fireEvent, render, screen, within } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 
-import { aProposal } from '../testing'
+import { aDecision, aProposal } from '../testing'
 import { RebalanceProposal } from './RebalanceProposal'
 
 function renderPanel(overrides = {}, onDismiss = vi.fn()) {
   render(<RebalanceProposal proposal={aProposal(overrides)} onDismiss={onDismiss} />)
   return onDismiss
+}
+
+/** The panel with the decision handlers the News page supplies. */
+function renderDecidable(overrides = {}) {
+  const onApprove = vi.fn()
+  const onReject = vi.fn()
+  const onDismiss = vi.fn()
+  render(
+    <RebalanceProposal
+      proposal={aProposal(overrides)}
+      onDismiss={onDismiss}
+      onApprove={onApprove}
+      onReject={onReject}
+    />,
+  )
+  return { onApprove, onReject, onDismiss }
 }
 
 describe('RebalanceProposal', () => {
@@ -114,16 +130,64 @@ describe('RebalanceProposal', () => {
     expect(screen.getByText('Estimated only. Nothing was sent to a broker.')).toBeTruthy()
   })
 
-  it('offers no approval, submission or trade control, and says why', () => {
-    renderPanel()
+  it('offers approve and reject, and no control that looks like manual trading', () => {
+    const { onApprove, onReject } = renderDecidable()
 
-    // The whole milestone ends at generation. A button that looked like it could execute would
-    // be the single most misleading thing this panel could contain.
-    for (const forbidden of ['Approve', 'Submit', 'Execute', 'Trade', 'Place order']) {
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Reject' }))
+
+    expect(onApprove).toHaveBeenCalledTimes(1)
+    expect(onReject).toHaveBeenCalledTimes(1)
+
+    // What is offered is a decision about the proposal's own orders, never a trade somebody
+    // composes here: this panel has no symbol, quantity or price to fill in.
+    for (const forbidden of ['Submit', 'Execute', 'Place order', 'Edit order', 'Cancel order']) {
       expect(screen.queryByRole('button', { name: new RegExp(forbidden, 'i') })).toBeNull()
     }
-    expect(screen.getByText(/No orders have been sent/)).toBeTruthy()
-    expect(screen.getByText('Approval and execution are not available yet.')).toBeTruthy()
+    expect(screen.getByText(/Nothing has been sent yet/)).toBeTruthy()
+  })
+
+  it('offers no approve or reject when this page gives it no way to decide', () => {
+    renderPanel()
+
+    expect(screen.queryByRole('button', { name: 'Approve' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Reject' })).toBeNull()
+    // Dismiss is always there, and it is not a rejection.
+    expect(screen.getByRole('button', { name: 'Dismiss' })).toBeTruthy()
+  })
+
+  it('shows a recorded decision instead of the buttons', () => {
+    renderDecidable({ decision: aDecision() })
+
+    expect(screen.getByText(/Approved ·/)).toBeTruthy()
+    expect(screen.getByText(/These exact orders were approved/)).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Approve' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Reject' })).toBeNull()
+  })
+
+  it('says a rejection created nothing, and that dismissing is not rejecting', () => {
+    const { onDismiss } = renderDecidable({ decision: aDecision({ decision: 'rejected' }) })
+
+    expect(screen.getByText(/Rejected ·/)).toBeTruthy()
+    // Said in both places on purpose: the action row states what the decision means, and the
+    // summary states that nothing was sent.
+    expect(
+      screen.getByText('No orders were created and nothing was sent to a broker.'),
+    ).toBeTruthy()
+    expect(screen.getByText(/cannot afterwards be approved/)).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
+    expect(onDismiss).toHaveBeenCalledTimes(1)
+  })
+
+  it('asks again rather than offering a first approval when the plan is being renewed', () => {
+    /* A plan whose prices moved comes back for a second confirmation. The panel keeps saying
+       so, and the button still sends a decision -- it does not become a different control. */
+    const { onApprove } = renderDecidable()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
+
+    expect(onApprove).toHaveBeenCalledTimes(1)
   })
 
   it('keeps run identifiers out of the summary', () => {
@@ -226,8 +290,9 @@ describe('RebalanceProposal', () => {
     expect(screen.getAllByText('Unavailable')).toHaveLength(2)
     expect(screen.getByText('No article could be retrieved for this portfolio.')).toBeTruthy()
     expect(screen.queryByRole('table')).toBeNull()
-    // Still said, whatever the outcome: nothing was sent anywhere.
-    expect(screen.getByText(/No orders have been sent/)).toBeTruthy()
+    // There is nothing to approve, and the panel says so rather than offering a button that
+    // would be refused.
+    expect(screen.getByText(/nothing here to approve/i)).toBeTruthy()
   })
 
   it('dismisses on request, and dismissing is all it does', () => {

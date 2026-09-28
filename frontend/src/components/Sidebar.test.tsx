@@ -38,16 +38,16 @@ describe('Sidebar', () => {
     ])
   })
 
-  it('marks the current page and disables the six that have no page', () => {
+  it('marks the current page and disables the five that have no page', () => {
     renderSidebar()
 
     const portfolio = screen.getByRole('button', { name: 'Portfolio' })
     expect(portfolio.getAttribute('aria-current')).toBe('page')
     expect(portfolio.hasAttribute('disabled')).toBe(false)
 
-    // Ten destinations, four built. The six without a page behind them are genuinely
+    // Ten destinations, five built. The five without a page behind them are genuinely
     // disabled rather than links that navigate nowhere.
-    expect(screen.getAllByTitle('Coming soon')).toHaveLength(6)
+    expect(screen.getAllByTitle('Coming soon')).toHaveLength(5)
     expect(screen.getByRole('button', { name: 'Dashboard' }).hasAttribute('disabled')).toBe(true)
   })
 

@@ -11,6 +11,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    Integer,
     Numeric,
     String,
     Text,
@@ -1091,3 +1092,206 @@ class RebalanceProposal(Base):
     # The machine-readable reason beside that sentence, so the application can branch on the
     # cause without reading the prose.
     failure_reason: Mapped[str | None] = mapped_column(String(48))
+
+
+class RebalanceDecision(Base):
+    """A person's decision about one proposal, recorded once and for all.
+
+    **It is a decision, not a request.** What is stored is what was decided and what the decision
+    bound to -- the proposal version and the exact resolved orders -- so a later reader can check
+    what was approved rather than re-deriving it from a proposal that may since have been
+    superseded.
+
+    **The unique constraint on `proposal_id` is the concurrency control.** Two clicks arriving at
+    once, a browser retry, or a resumed workflow all contend for the same row, and the database
+    picks one winner. The loser is told what the decision already is; it cannot overwrite it and
+    it cannot add a second one. A rejection and an approval cannot both exist for one proposal,
+    which is what makes "one durable decision" a fact rather than an intention.
+
+    `order_plan` is the orders exactly as they were resolved **server-side** from the proposal's
+    stored calculation. A client never supplies a quantity, and this row is why it would not
+    matter if it tried: what gets executed is read from here.
+    """
+
+    __tablename__ = "rebalance_decisions"
+    __table_args__ = (
+        # One decision per proposal. See the docstring.
+        UniqueConstraint("proposal_id", name="uq_rebalance_decisions_proposal_id"),
+        # A retry of one click is one decision, exactly as a retried proposal request is one
+        # proposal.
+        UniqueConstraint("idempotency_key", name="uq_rebalance_decisions_idempotency_key"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    proposal_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("rebalance_proposals.id", ondelete="CASCADE")
+    )
+    # 'approved' or 'rejected'.
+    decision: Mapped[str] = mapped_column(String(16))
+    decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    idempotency_key: Mapped[str] = mapped_column(String(64))
+
+    # What the decision bound to. The first is the frozen snapshot's digest, so the decision names
+    # the proposal version it is about; the second digests the resolved orders themselves.
+    proposal_fingerprint: Mapped[str] = mapped_column(String(64))
+    plan_fingerprint: Mapped[str] = mapped_column(String(64))
+    order_plan: Mapped[list] = mapped_column(JSONB)
+
+    # What the plan was validated against at the moment it was approved. All four are NULL on a
+    # rejection: nothing was validated, and there was nothing to validate it against.
+    broker_account_id: Mapped[str | None] = mapped_column(String(64))
+    cash_at_approval: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
+    reserved_cash: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
+    # How far the fresh prices had moved from the proposal's estimates, as a percentage. Recorded
+    # rather than acted on: the policy allows a small move and this is the size of it.
+    price_drift_percent: Mapped[Decimal | None] = mapped_column(Numeric(9, 4))
+
+    # Why a rejection was made, in the person's own words if they gave any. NULL is a complete
+    # answer and is not filled in with a reason they did not state.
+    reason: Mapped[str | None] = mapped_column(Text)
+
+
+class ExecutionBatch(Base):
+    """One attempt to execute one approved plan against one Alpaca paper account.
+
+    **One active batch per account, enforced by a partial unique index** rather than by a rule
+    this application remembers. The predicate pins `status` to the two values that mean work is
+    still outstanding, so uniqueness on the column is uniqueness of the live batch. That is what
+    makes a second approval while one is running a refusal rather than two workers spending the
+    same cash.
+
+    **The portfolio sync is reported separately from the execution.** A sync that failed says
+    nothing about whether an order filled, and a filled order that could not be written into the
+    portfolio is a different problem with a different fix. Two columns, so the two can never be
+    read as one.
+
+    `status` runs `pending` -> `submitting` -> one of `completed`, `partial`, `halted`.
+    `completed` means every order reached the broker's `filled`. `partial` means the batch is over
+    with some orders not filled -- which is reported, never repaired: nothing is resized and no
+    completed fill is undone.
+    """
+
+    __tablename__ = "execution_batches"
+    __table_args__ = (
+        UniqueConstraint("proposal_id", name="uq_execution_batches_proposal_id"),
+        # One live batch per account. See the docstring.
+        Index(
+            "uq_execution_batches_one_active",
+            "broker_account_id",
+            unique=True,
+            postgresql_where=text("status IN ('pending', 'submitting')"),
+        ),
+        Index("ix_execution_batches_created_at", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    proposal_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("rebalance_proposals.id", ondelete="CASCADE")
+    )
+    decision_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("rebalance_decisions.id", ondelete="CASCADE")
+    )
+    portfolio_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("portfolios.id", ondelete="CASCADE")
+    )
+    # The account this batch may be executed against, frozen at approval. Every submission checks
+    # the configured credentials still belong to it.
+    broker_account_id: Mapped[str] = mapped_column(String(64))
+    currency: Mapped[str] = mapped_column(String(3))
+
+    status: Mapped[str] = mapped_column(String(24))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    plan_fingerprint: Mapped[str] = mapped_column(String(64))
+    # What the account held when the plan was approved, and what was set aside for price movement.
+    cash_at_approval: Mapped[Decimal] = mapped_column(Numeric(18, 2))
+    reserved_cash: Mapped[Decimal] = mapped_column(Numeric(18, 2))
+    price_drift_percent: Mapped[Decimal | None] = mapped_column(Numeric(9, 4))
+
+    # Sentences a reader can be shown: waiting for sells, an uncertain submission, a partial
+    # completion. Stored rather than derived, because the reason a batch stopped is a fact about
+    # what happened at the time.
+    notes: Mapped[list] = mapped_column(JSONB)
+    halt_reason: Mapped[str | None] = mapped_column(Text)
+
+    # 'pending', 'ok' or 'failed'.
+    sync_status: Mapped[str] = mapped_column(String(16))
+    sync_error: Mapped[str | None] = mapped_column(Text)
+    sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class OrderIntent(Base):
+    """One planned order, and everything the broker has said about it so far.
+
+    **Written before the request that could create it.** A row saying `planned` exists before any
+    POST is made, and the POST is made under a claim on that row -- so a crash between deciding to
+    submit and the broker receiving it leaves evidence rather than nothing.
+
+    **`client_order_id` is derived, not generated.** It is built from the batch id and the order's
+    sequence in it, so the same order gets the same id after a restart, a replay or a second
+    worker. That is the whole duplicate-prevention mechanism: the broker's own record of a
+    submission can be found by an id this application can reconstruct without having stored
+    anything else.
+
+    **`status` is the broker's word where the broker has spoken.** `unknown` is what an
+    unanswered submission gets -- the outcome genuinely is not known, and it blocks whatever
+    depended on it until reconciliation resolves it. There is deliberately no value meaning
+    "probably accepted", and a single unanswered check does not resolve one.
+    """
+
+    __tablename__ = "order_intents"
+    __table_args__ = (
+        # What the broker is asked about during reconciliation. Unique, because two orders sharing
+        # one client id would make the answer ambiguous in exactly the case it exists for.
+        UniqueConstraint("client_order_id", name="uq_order_intents_client_order_id"),
+        UniqueConstraint("batch_id", "sequence", name="uq_order_intents_batch_sequence"),
+        Index("ix_order_intents_batch_id", "batch_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    batch_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("execution_batches.id", ondelete="CASCADE")
+    )
+    # Sells are numbered before buys, and submitted in this order.
+    sequence: Mapped[int] = mapped_column(Integer)
+
+    symbol: Mapped[str] = mapped_column(String(20))
+    # 'buy' or 'sell'.
+    side: Mapped[str] = mapped_column(String(4))
+    # Whole shares. The stored proposal's own quantity, resolved server-side and never taken from
+    # a client.
+    quantity: Mapped[Decimal] = mapped_column(Numeric(18, 6))
+    order_type: Mapped[str] = mapped_column(String(8))
+    time_in_force: Mapped[str] = mapped_column(String(4))
+    client_order_id: Mapped[str] = mapped_column(String(64))
+
+    # planned, submitting, accepted, partially_filled, filled, rejected, canceled, expired,
+    # unknown, not_found, halted, skipped.
+    status: Mapped[str] = mapped_column(String(24))
+    broker_order_id: Mapped[str | None] = mapped_column(String(64))
+    # The broker's status verbatim, beside the one this application mapped it to. Kept so an
+    # unrecognised status can be read rather than guessed at.
+    broker_status: Mapped[str | None] = mapped_column(String(24))
+
+    # The price the proposal estimated with. An estimate, and labelled as one wherever it is
+    # shown -- it is not a quote and nothing guarantees it.
+    estimated_price: Mapped[Decimal] = mapped_column(Numeric(18, 4))
+    # What the plan was validated against, copied from the decision so that a submission made
+    # later can tell this batch's own fills apart from somebody else's trades. The decision's
+    # `order_plan` remains the authority; this is the same number, placed where the executor
+    # needs it.
+    quantity_before: Mapped[Decimal] = mapped_column(Numeric(18, 6))
+    filled_quantity: Mapped[Decimal] = mapped_column(Numeric(18, 6))
+    # The broker's own average fill price. NULL until something has filled.
+    filled_avg_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
+
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Consecutive reconciliations that found no such order. A single "not found" does not prove an
+    # unanswered submission failed, so this counts rather than concludes.
+    uncertain_checks: Mapped[int] = mapped_column(Integer)
+    error: Mapped[str | None] = mapped_column(Text)

@@ -2,6 +2,7 @@ import { useCallback, useState } from 'react'
 
 import { AnalysisPage } from './components/AnalysisPage'
 import { NewsPage } from './components/NewsPage'
+import { OrdersPage } from './components/OrdersPage'
 import { PortfolioPage } from './components/PortfolioPage'
 import { Sidebar } from './components/Sidebar'
 import type { PageId } from './components/Sidebar'
@@ -27,6 +28,9 @@ import { WhatIfPage } from './components/WhatIfPage'
 export function App() {
   const [page, setPage] = useState<PageId>('portfolio')
   const [visited, setVisited] = useState<ReadonlySet<PageId>>(() => new Set(['portfolio']))
+  // Which batch the Orders page should mark and scroll to. Set by an approval in News & Trading,
+  // which is the one place a batch is created in front of somebody.
+  const [focusBatch, setFocusBatch] = useState<string | null>(null)
 
   const navigate = useCallback((next: PageId) => {
     setPage(next)
@@ -34,6 +38,14 @@ export function App() {
       current.has(next) ? current : new Set([...current, next]),
     )
   }, [])
+
+  const openOrders = useCallback(
+    (batchId: string) => {
+      setFocusBatch(batchId)
+      navigate('orders')
+    },
+    [navigate],
+  )
 
   const showing = (id: PageId) => (page === id ? 'contents' : 'none')
 
@@ -55,7 +67,15 @@ export function App() {
         </div>
 
         <div className="min-h-0 flex-1 flex-col p-6" style={{ display: showing('news') }}>
-          {visited.has('news') && <NewsPage active={page === 'news'} />}
+          {visited.has('news') && (
+            <NewsPage active={page === 'news'} onOpenOrders={openOrders} />
+          )}
+        </div>
+
+        <div className="min-h-0 flex-1 flex-col p-6" style={{ display: showing('orders') }}>
+          {visited.has('orders') && (
+            <OrdersPage active={page === 'orders'} focusBatchId={focusBatch} />
+          )}
         </div>
 
         <div className="min-h-0 flex-1 flex-col" style={{ display: showing('analysis') }}>

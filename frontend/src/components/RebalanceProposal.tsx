@@ -58,12 +58,113 @@ function statusColour(status: string): string {
   return 'text-dim'
 }
 
-export function RebalanceProposal({
+/** What a *decision* reads as. Separate from the proposal's status, which is the run's life:
+ *  an approved proposal is still a `proposed` one. */
+function decisionLabel(decision: string): string {
+  return decision === 'approved' ? 'Approved' : 'Rejected'
+}
+
+function decisionColour(decision: string): string {
+  return decision === 'approved' ? 'text-positive' : 'text-danger'
+}
+
+/** Whether this proposal is one a person may act on at all.
+ *
+ * Only a proposal that completed with trades. A failed, unavailable or still-generating one has
+ * nothing to approve, and the button is not offered for it -- the server refuses it as well,
+ * because an interface is not a place to keep a rule. */
+function isActionable(proposal: Proposal): boolean {
+  return (
+    proposal.status === 'proposed' &&
+    proposal.calculation !== null &&
+    proposal.calculation.trades.length > 0
+  )
+}
+
+/** The action row: approve, reject, dismiss -- or what was already decided.
+ *
+ * **Dismiss is deliberately not reject.** Hiding a panel is a fact about this browser; rejecting
+ * is a decision recorded against the proposal, and one that stops it ever being executed. They
+ * are different buttons for that reason, and the sentence beside them says which is which.
+ */
+function DecisionFooter({
   proposal,
   onDismiss,
+  onApprove,
+  onReject,
+  deciding,
 }: {
   proposal: Proposal
   onDismiss: () => void
+  onApprove?: () => void
+  onReject?: () => void
+  deciding: boolean
+}) {
+  const decision = proposal.decision
+
+  if (decision !== null) {
+    return (
+      <footer className="mt-4 flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <p className={`text-note font-medium ${decisionColour(decision.decision)}`}>
+            {decisionLabel(decision.decision)} ·{' '}
+            {formatDateTime(decision.decided_at) ?? 'at an unknown time'}
+          </p>
+          <p className="mt-0.5 text-label text-faint">
+            {decision.decision === 'approved'
+              ? 'These exact orders were approved. Their progress is on the Orders page.'
+              : 'No orders were created, and a rejected proposal cannot afterwards be approved.'}
+          </p>
+        </div>
+        <Button onClick={onDismiss}>Dismiss</Button>
+      </footer>
+    )
+  }
+
+  const actionable = isActionable(proposal)
+
+  return (
+    <footer className="mt-4 flex flex-wrap items-center justify-between gap-3">
+      <p className="text-note text-dim">
+        {actionable
+          ? 'Nothing has been sent yet. Approving validates the portfolio against the broker and then submits these exact trades; rejecting sends nothing.'
+          : 'There is nothing here to approve: this proposal has no trades to send.'}
+      </p>
+      <div className="flex flex-wrap items-center gap-2">
+        <Button onClick={onDismiss}>Dismiss</Button>
+        {actionable && onReject !== undefined && (
+          <Button onClick={onReject} disabled={deciding}>
+            Reject
+          </Button>
+        )}
+        {actionable && onApprove !== undefined && (
+          <Button variant="primary" onClick={onApprove} disabled={deciding}>
+            {deciding ? 'Approving…' : 'Approve'}
+          </Button>
+        )}
+      </div>
+    </footer>
+  )
+}
+
+export function RebalanceProposal({
+  proposal,
+  onDismiss,
+  onApprove,
+  onReject,
+  deciding = false,
+  notice = null,
+}: {
+  proposal: Proposal
+  onDismiss: () => void
+  /** Ask the server to approve this proposal's exact trades. */
+  onApprove?: () => void
+  onReject?: () => void
+  /** True while a decision is being recorded, so neither button can be pressed twice. */
+  deciding?: boolean
+  /** What the last decision attempt answered, in the server's own words. Shown rather than
+   *  paraphrased: a refusal's sentence is the useful part, and a renewal's is the whole point. */
+  notice?: string | null
 }) {
   const snapshot = proposal.snapshot
   const calculation = proposal.calculation
@@ -114,12 +215,19 @@ export function RebalanceProposal({
         <AssumptionsColumn proposal={proposal} />
       </div>
 
-      <footer className="mt-4 flex flex-wrap items-center justify-between gap-3">
-        <p className="text-note text-dim">
-          No orders have been sent. Approval and execution are not available yet.
-        </p>
-        <Button onClick={onDismiss}>Dismiss</Button>
-      </footer>
+      {notice !== null && (
+        <div className="mt-4">
+          <Banner>{notice}</Banner>
+        </div>
+      )}
+
+      <DecisionFooter
+        proposal={proposal}
+        onDismiss={onDismiss}
+        onApprove={onApprove}
+        onReject={onReject}
+        deciding={deciding}
+      />
     </section>
   )
 }
@@ -502,12 +610,16 @@ function SummaryCard({ proposal }: { proposal: Proposal }) {
       </dl>
 
       <p className="mt-3 text-label font-medium text-ink">
-        Approval and execution are not available yet.
+        {proposal.decision === null
+          ? 'Generating a proposal commits nothing.'
+          : `This proposal was ${proposal.decision.decision}.`}
       </p>
       <p className="mt-1 text-label text-faint">
-        Generating a proposal is not an approval and commits nothing. Nothing was sent to a
-        broker, no order was placed, and no fill is modelled. Executing anything later would
-        need fresh validation of the portfolio and an explicit decision.
+        {proposal.decision === null
+          ? 'Nothing has been sent to a broker and no order exists. Approving validates the portfolio against the broker afresh and then submits these exact trades; the numbers above are estimates, not quotes.'
+          : proposal.decision.decision === 'approved'
+            ? 'What was sent is the set of orders recorded with the decision, not the figures above: a market order fills at whatever the market gives.'
+            : 'No orders were created and nothing was sent to a broker.'}
       </p>
 
       {proposal.limitations.length > 0 && (

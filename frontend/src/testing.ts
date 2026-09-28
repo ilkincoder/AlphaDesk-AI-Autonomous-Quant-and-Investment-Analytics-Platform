@@ -11,7 +11,12 @@
 import { vi } from 'vitest'
 
 import type { ConversationHistory, Turn } from './analysisApi'
-import type { RebalanceProposal } from './api'
+import type {
+  ExecutionBatch,
+  OrderIntent,
+  ProposalDecision,
+  RebalanceProposal,
+} from './api'
 
 /** A JSON response, as `fetch` would give it. */
 export function jsonResponse(body: unknown, status = 200): Response {
@@ -366,6 +371,87 @@ export function aProposal(overrides: Partial<RebalanceProposal> = {}): Rebalance
     failure: null,
     failure_reason: null,
     usage: { model_requests: 1, total_tokens: 1200 },
+    // Undecided, which is what a freshly generated proposal is. A test that wants a decision
+    // passes one in: `aDecision()`.
+    decision: null,
+    batch_id: null,
+    ...overrides,
+  }
+}
+
+/** A recorded decision, and the exact orders it bound to.
+ *
+ * Undecided is the default everywhere else, so this is passed in explicitly by the tests about
+ * approving and rejecting.
+ */
+export function aDecision(overrides: Partial<ProposalDecision> = {}): ProposalDecision {
+  return {
+    decision_id: 'd'.repeat(32),
+    proposal_id: 'a'.repeat(32),
+    decision: 'approved',
+    decided_at: '2026-09-23T12:05:00+00:00',
+    plan_fingerprint: 'f'.repeat(64),
+    price_drift_percent: '0.0000',
+    reason: null,
+    order_plan: [
+      {
+        sequence: 1,
+        symbol: 'AAPL',
+        side: 'sell',
+        quantity: '5',
+        estimated_price: '200.00',
+        estimated_value: '1000.00',
+        quantity_before: '50',
+      },
+    ],
+    ...overrides,
+  }
+}
+
+/** A batch and its orders, as the Orders page reads them. */
+export function aBatch(overrides: Partial<ExecutionBatch> = {}): ExecutionBatch {
+  return {
+    batch_id: 'b'.repeat(32),
+    proposal_id: 'a'.repeat(32),
+    status: 'submitting',
+    created_at: '2026-09-23T12:05:00+00:00',
+    started_at: '2026-09-23T12:05:01+00:00',
+    completed_at: null,
+    currency: 'USD',
+    cash_at_approval: '1000.00',
+    reserved_cash: '18.00',
+    price_drift_percent: '0.0000',
+    notes: ['Whole-share market orders, DAY time in force.'],
+    halt_reason: null,
+    sync_status: 'pending',
+    sync_error: null,
+    sync_at: null,
+    orders: [anOrder()],
+    ...overrides,
+  }
+}
+
+/** One order in a batch, as the Orders page reads it. */
+export function anOrder(overrides: Partial<OrderIntent> = {}): OrderIntent {
+  return {
+    intent_id: 'e'.repeat(32),
+    sequence: 1,
+    symbol: 'AAPL',
+    side: 'sell',
+    quantity: '5.000000',
+    order_type: 'market',
+    time_in_force: 'day',
+    status: 'filled',
+    broker_status: 'filled',
+    estimated_price: '200.00',
+    quantity_before: '50.000000',
+    filled_quantity: '5.000000',
+    filled_avg_price: '199.50',
+    client_order_id: 'ad-0123456789abcdef-001',
+    broker_order_id: 'broker-1',
+    submitted_at: '2026-09-23T12:05:02+00:00',
+    resolved_at: '2026-09-23T12:05:03+00:00',
+    error: null,
     ...overrides,
   }
 }

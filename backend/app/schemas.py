@@ -586,6 +586,35 @@ class ProposalEvidenceOut(BaseModel):
     recent: bool
 
 
+class DecisionOrderOut(BaseModel):
+    """One order as the decision resolved it. Every figure is the server's, not a client's."""
+
+    sequence: int
+    symbol: str
+    # "buy" or "sell", always shown as a word: the colour alone does not carry it.
+    side: str
+    quantity: Decimal
+    estimated_price: Decimal
+    estimated_value: Decimal
+    # What the account held when this plan was validated.
+    quantity_before: Decimal
+
+
+class ProposalDecisionOut(BaseModel):
+    """A recorded decision, as the page reads it back."""
+
+    decision_id: str
+    proposal_id: str
+    # "approved" or "rejected".
+    decision: str
+    decided_at: datetime
+    # The digest of the exact orders this decision bound to.
+    plan_fingerprint: str
+    price_drift_percent: Decimal | None = None
+    reason: str | None = None
+    order_plan: list[DecisionOrderOut] = Field(default_factory=list)
+
+
 class RebalanceProposalOut(BaseModel):
     """One proposal, as the page reads it.
 
@@ -630,6 +659,16 @@ class RebalanceProposalOut(BaseModel):
     failure_reason: str | None = None
     usage: dict | None = None
 
+    # --- the person's decision, when there is one ------------------------------------------
+    #
+    # Separate from `status`, which is the *run's* life. An approved proposal is still a
+    # `proposed` proposal: what changed is that somebody decided something about it, and that is
+    # a different fact recorded in a different place.
+    decision: ProposalDecisionOut | None = None
+    # The batch an approval opened, so a page restoring itself can offer to open Orders without
+    # the browser having kept the id.
+    batch_id: str | None = None
+
 
 class RebalanceProposalRequest(BaseModel):
     """One request for a proposal.
@@ -653,3 +692,125 @@ class RebalanceProposalView(BaseModel):
     """
 
     proposal: RebalanceProposalOut | None = None
+
+
+# --- approvals and execution -------------------------------------------------------------------
+
+
+class ProposalDecisionRequest(BaseModel):
+    """One decision about one proposal.
+
+    The body carries **no trade data at all**, and `extra="forbid"` is doing real work here for
+    the same reason it is on `ChatRequest`: a client that sent a quantity would be refused rather
+    than quietly ignored. What is executed is resolved server-side from the proposal's own stored
+    calculation, and this is the schema that makes that a fact rather than a convention.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # Only these two words. A proposal is approved or rejected; there is no third decision.
+    decision: str = Field(pattern="^(approve|reject)$")
+    # Chosen by the client so a retry is free, exactly as a proposal's `request_id` is.
+    idempotency_key: str = Field(min_length=1, max_length=64)
+    # A second click on a plan whose prices have moved. It is not a permission and it is not
+    # required for an approval that needed no renewal.
+    confirm: bool = False
+    # An optional sentence, kept only on a rejection. It is the person's own words and is never
+    # filled in for them.
+    reason: str | None = Field(default=None, max_length=500)
+
+
+class DecisionOutcomeOut(BaseModel):
+    """What a decision request did.
+
+    `outcome` is the answer rather than the status code, because two of these are not errors:
+    `renewal_required` is a plan whose prices moved and which is waiting for a second
+    confirmation, and `already_decided` is a retry or a double click landing on the decision that
+    already exists. `detail` is always a sentence a person can be shown.
+    """
+
+    outcome: str
+    detail: str
+    # The machine-readable cause, set on a refusal.
+    reason: str | None = None
+    decision: ProposalDecisionOut | None = None
+    # The batch an approval opened. This is what the Orders page is focused on afterwards.
+    batch_id: str | None = None
+    # The orders that were validated. Present on an approval and on a renewal, because both are
+    # showing the person what would be sent.
+    plan: list[DecisionOrderOut] = Field(default_factory=list)
+    price_drift_percent: Decimal | None = None
+
+
+class OrderIntentOut(BaseModel):
+    """One order in a batch, and everything the broker has said about it.
+
+    `estimated_price` is the figure the plan was approved against and is labelled as an estimate
+    wherever it is shown. `filled_avg_price` is the only actual price here, and it is null until
+    something has filled.
+    """
+
+    intent_id: str
+    sequence: int
+    symbol: str
+    side: str
+    # Requested, whole shares. Never resized after approval.
+    quantity: Decimal
+    order_type: str
+    time_in_force: str
+    # planned, submitting, accepted, partially_filled, filled, rejected, canceled, expired,
+    # unknown, not_found, halted.
+    status: str
+    # The broker's own status verbatim, beside the mapped one above.
+    broker_status: str | None = None
+    estimated_price: Decimal
+    quantity_before: Decimal
+    filled_quantity: Decimal
+    filled_avg_price: Decimal | None = None
+    # The stable id this order was submitted under, and the broker's own id for it.
+    client_order_id: str
+    broker_order_id: str | None = None
+    submitted_at: datetime | None = None
+    resolved_at: datetime | None = None
+    error: str | None = None
+
+
+class ExecutionBatchOut(BaseModel):
+    """One execution batch: an approved plan and how far it has got.
+
+    `status` is `pending`, `submitting`, `completed`, `partial` or `halted`. `partial` and
+    `halted` are not failures of the application: they mean the batch stopped, and `halt_reason`
+    and `notes` say why in words.
+
+    `sync_status` is the *portfolio* sync and is deliberately separate from `status`: a filled
+    order that could not be written into the portfolio is a different problem from an order that
+    did not fill, and a reader has to be able to tell them apart.
+    """
+
+    batch_id: str
+    proposal_id: str
+    status: str
+    created_at: datetime
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    currency: str
+    cash_at_approval: Decimal
+    reserved_cash: Decimal
+    price_drift_percent: Decimal | None = None
+    notes: list[str] = Field(default_factory=list)
+    halt_reason: str | None = None
+    sync_status: str
+    sync_error: str | None = None
+    sync_at: datetime | None = None
+    orders: list[OrderIntentOut] = Field(default_factory=list)
+
+
+class OrdersView(BaseModel):
+    """Every batch, newest first, and which one is running.
+
+    History rather than only the latest: a batch that filled yesterday is still what happened, and
+    a page that showed only the most recent one would lose it the moment another was approved.
+    """
+
+    active_batch_id: str | None = None
+    batches: list[ExecutionBatchOut] = Field(default_factory=list)

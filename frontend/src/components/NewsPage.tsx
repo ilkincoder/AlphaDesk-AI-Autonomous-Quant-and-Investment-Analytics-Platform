@@ -25,7 +25,14 @@
 
 import { type FormEvent, useCallback, useEffect, useRef, useState } from 'react'
 
-import { fetchNews, fetchProposal, ingestNews, searchNews, streamProposal } from '../api'
+import {
+  decideProposal,
+  fetchNews,
+  fetchProposal,
+  ingestNews,
+  searchNews,
+  streamProposal,
+} from '../api'
 import type {
   NewsArticle,
   NewsIngest,
@@ -111,7 +118,14 @@ function messageOf(error: unknown): string {
   return 'Something went wrong.'
 }
 
-export function NewsPage({ active = true }: { active?: boolean }) {
+export function NewsPage({
+  active = true,
+  onOpenOrders,
+}: {
+  active?: boolean
+  /** Called with the batch an approval opened, so the shell can show the Orders page. */
+  onOpenOrders?: (batchId: string) => void
+}) {
   const [state, setState] = useState<ListState>({ phase: 'loading' })
   const [search, setSearch] = useState<SearchState>({ phase: 'idle' })
   const [query, setQuery] = useState('')
@@ -146,8 +160,16 @@ export function NewsPage({ active = true }: { active?: boolean }) {
   // stops the user being told about a race they did not need to see.
   const generating = useRef(false)
   // Dismissing hides the panel for this visit. It does not delete the stored proposal, and
-  // nothing about it reaches a broker: there is no order to cancel.
+  // nothing about it reaches a broker -- and it is deliberately not a rejection, which is a
+  // decision recorded against the proposal rather than a fact about this browser.
   const [dismissed, setDismissed] = useState(false)
+  // The decision request, if one is in flight. Neither button is pressable while it is: two
+  // clicks would be two decisions asked for, and the second would be answered with a refusal
+  // the user did not need to see.
+  const [deciding, setDeciding] = useState(false)
+  // What the server said about the last decision attempt, in its own words. A refusal's
+  // sentence, or a renewal's, is the useful part and is shown rather than paraphrased.
+  const [decisionNotice, setDecisionNotice] = useState<string | null>(null)
 
   const load = useCallback(
     async (filters = { provider, category }) => {
@@ -254,6 +276,55 @@ export function NewsPage({ active = true }: { active?: boolean }) {
     })()
     return () => controller.abort()
   }, [active])
+
+  /** Record a decision about the proposal on screen.
+   *
+   * The body carries the decision and nothing else. What gets executed is resolved server-side
+   * from the proposal's own stored calculation, so there is nothing here a browser could send
+   * that would change the orders.
+   *
+   * A plan whose prices have moved comes back as `renewal_required` rather than as an approval:
+   * the refreshed estimates are shown and a second press confirms them. That second press is
+   * `confirm: true` -- the only thing it says is "yes, at these prices".
+   */
+  const decide = useCallback(
+    async (decision: 'approve' | 'reject', confirm = false) => {
+      if (deciding || proposal.phase !== 'ready') return
+      const proposalId = proposal.proposal.proposal_id
+      setDeciding(true)
+      setDecisionNotice(null)
+      try {
+        const outcome = await decideProposal(proposalId, {
+          decision,
+          idempotency_key: `decision-${proposalId}-${Date.now()}-${Math.random()
+            .toString(36)
+            .slice(2, 10)}`,
+          confirm,
+        })
+        setDecisionNotice(outcome.detail)
+        if (outcome.decision !== null) {
+          setProposal({
+            phase: 'ready',
+            proposal: {
+              ...proposal.proposal,
+              decision: outcome.decision,
+              batch_id: outcome.batch_id,
+            },
+          })
+        }
+        if (outcome.outcome === 'approved' && outcome.batch_id !== null) {
+          // The orders are the server's to submit, whether or not anybody is looking. This only
+          // takes the reader to where they can watch them.
+          onOpenOrders?.(outcome.batch_id)
+        }
+      } catch (error) {
+        setDecisionNotice(messageOf(error))
+      } finally {
+        setDeciding(false)
+      }
+    },
+    [deciding, proposal, onOpenOrders],
+  )
 
   /** Ask for a proposal, and say which stage the run is in while it works. */
   const generate = useCallback(async () => {
@@ -488,6 +559,9 @@ export function NewsPage({ active = true }: { active?: boolean }) {
         dismissed={dismissed}
         onDismiss={() => setDismissed(true)}
         onRetry={() => void generate()}
+        deciding={deciding}
+        notice={decisionNotice}
+        onDecide={(decision, confirm) => void decide(decision, confirm)}
       />
     </div>
   )
@@ -503,11 +577,17 @@ function ProposalPanel({
   dismissed,
   onDismiss,
   onRetry,
+  deciding,
+  notice,
+  onDecide,
 }: {
   state: ProposalState
   dismissed: boolean
   onDismiss: () => void
   onRetry: () => void
+  deciding: boolean
+  notice: string | null
+  onDecide: (decision: 'approve' | 'reject', confirm: boolean) => void
 }) {
   if (state.phase === 'restoring' || state.phase === 'idle') return null
 
@@ -548,7 +628,21 @@ function ProposalPanel({
 
   if (dismissed) return null
 
-  return <ProposalSection proposal={state.proposal} onDismiss={onDismiss} />
+  const decided = state.proposal.decision
+  const askedAgain = notice !== null && /refreshed|moved/i.test(notice)
+
+  return (
+    <ProposalSection
+      proposal={state.proposal}
+      onDismiss={onDismiss}
+      deciding={deciding}
+      notice={notice}
+      // A renewal has already been asked once, so the next press is the confirmation. Any
+      // other press is a first decision.
+      onApprove={() => onDecide('approve', askedAgain && decided === null)}
+      onReject={() => onDecide('reject', false)}
+    />
+  )
 }
 
 /** What an ingestion did, in a sentence. A partial failure is reported as one rather than

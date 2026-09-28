@@ -49,6 +49,9 @@ ACCOUNT = {
     "equity": "12345.67",
     "buying_power": "24691.34",
     "status": "ACTIVE",
+    "trading_blocked": False,
+    "account_blocked": False,
+    "trade_suspended_by_user": False,
 }
 
 AAPL = {

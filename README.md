@@ -3052,6 +3052,169 @@ is reasoned from the policy or the portfolio's shape. Every weight is presented 
 choice within the demo policy: not optimal, not derived from an expected return, and not predicted
 to be profitable.
 
-**Nothing here is an order.** There is no approval, no submission, no simulated fill and no broker
-write of any kind: the proposal table has no column one could be written into, and no route that
-could reach a broker.
+**Generating a proposal is not an order, and never was.** There is no submission, no simulated
+fill and no broker write on that path: generation has no column an execution state could be
+written into, and no route that could reach a broker.
+
+**What replaced that sentence is the milestone below.** A proposal can now be approved or
+rejected, and an approval is carried out against the Alpaca paper account — but by a separate
+workflow with its own tables, its own policy and its own record. The proposal table was not
+extended to hold any of it.
+
+## Approving a proposal, and the orders that follow
+
+Pressing **Approve** beside a proposal is the only action in this application that can cause an
+order to exist. It does four things, in this order, and the order is the safety property:
+
+1. **Validate against the broker.** The account and its positions are read afresh, the clock is
+   read, and the orders already working are read. Every quantity comes from the proposal's own
+   stored calculation — never from the browser, which has no field to send one in.
+2. **Interrupt.** The validated orders are written into a LangGraph checkpoint and the workflow
+   pauses.
+3. **Record the decision.** One row in `rebalance_decisions`, bound to the proposal version and
+   to the exact orders, with the batch that will carry them out.
+4. **Submit, on a thread of its own.** `app.order_executor` picks the batch up; the request that
+   approved it returns straight away.
+
+**Reject** records a decision and creates nothing: no batch, no orders, no broker call, and no
+validation — declining is available whatever the market is doing. **Dismiss** is not reject.
+It hides the panel in this browser and records nothing at all.
+
+### The tables
+
+Three, added by migration `0014_order_execution`. `rebalance_proposals` was not altered: its
+`status` is still the *run's* life, and a decision is a different fact about a different actor.
+
+| Table | What one row is | The constraint that matters |
+|---|---|---|
+| `rebalance_decisions` | A person's decision, and the orders it bound to | One per proposal — two clicks, a retry and a resumed workflow all end at the same row |
+| `execution_batches` | One attempt to execute one approved plan | At most one active batch per account, by a partial unique index |
+| `order_intents` | One planned order, written **before** the request that could create it | `client_order_id` is unique, and derived rather than generated |
+
+### The approval interrupt, and why it is a second graph
+
+The proposal graph's job ends when a proposal is recorded, and `app.agent.recovery` resumes its
+threads by looking for rows in `generating`. A proposal waiting for a decision is never in that
+state, so a decision thread is invisible to generation recovery — a crash during generation and a
+wait for a human cannot be confused for one another. It also means **proposals generated before
+this milestone need no compatibility path**: their checkpoints are finished and are never read
+again, because an approval starts a thread of its own and binds to the proposal's *stored record*.
+
+The interrupt is not decoration. It is what makes the validated plan durable: the orders that
+were checked against the market are in the checkpoint, so a confirmation arriving later — from a
+restarted process, minutes later — confirms *those* orders rather than re-resolving them against
+a market that has moved. Approval is refused outright when no checkpointer is available, because
+a graph that cannot be paused cannot be resumed by a decision endpoint.
+
+### Freshness, drift, and the numbers a person actually approved
+
+Reusing the comparison the proposal page already makes. The portfolio's **shape** must be
+untouched; a price that has merely **moved** is a smaller claim with its own rule.
+
+| State | What happens |
+|---|---|
+| `portfolio_changed` | Refused. The arithmetic was computed against something that no longer exists, so the proposal needs regenerating |
+| `unknown` | Refused. A portfolio that cannot be read is not a portfolio that has not changed |
+| `prices_updated`, largest move ≤ **1.00 %** | Proceeds. The drift is recorded on the decision and the batch |
+| `prices_updated`, largest move > 1.00 % | **Not sent.** The refreshed estimates are shown and a second press confirms them |
+
+The tolerance is disclosed here and in the plan's own notes because it is a judgement, not a
+fact: one percent is large enough that ordinary movement between generating a proposal and
+approving it does not force a second click, and small enough that the figure a person approved is
+still the figure they are getting. The confirmation resumes the interrupted thread and sends
+`confirm: true`; it does **not** re-resolve the orders, because a person who confirmed one set of
+orders must not receive another.
+
+### Execution policy
+
+| Rule | Why |
+|---|---|
+| Whole-share **market** orders, `day` time in force | The proposal's own policy, and the simplest thing that can work |
+| Regular trading hours only, via `GET /v2/clock` | Alpaca's calendar, not a locally computed 09:30–16:00 — holidays and early closes are the exchange's business |
+| At least 5 minutes of session left | A DAY order sent in the last minutes expires unfilled, which looks like a failure and is the wrong time of day to have asked |
+| **Cash**, never buying power | Buying power counts margin this workflow does not trade on |
+| A buffer of `max(2 % of the planned buys, $1.00)` held back | A market order is not a guaranteed price; an account that spends its last cent can be overdrawn by a tick |
+| Working orders counted first | Cash and shares another order has already claimed are not available, whether it was placed here or in Alpaca's own interface |
+| Nothing queued overnight | A decision made against this morning's prices should not be executed against tomorrow's |
+
+### Sequencing, and what is never done
+
+**Sells first, and buys only once every sell has *filled*** — not accepted, not partly filled. The
+purchases may be funded by the proceeds, and a sale that has not settled has not produced any.
+
+- A sell that ends rejected, canceled or expired **stops the whole remainder**, because the money
+  the purchases were counting on is not coming.
+- A purchase the account can no longer afford is **halted, not shrunk** — a smaller order is a
+  different order than the one that was approved.
+- A portfolio that moved underneath the batch — a position the plan did not trade — **stops the
+  remainder** rather than executing against a portfolio the plan does not describe.
+- **Nothing is resized and nothing is undone.** What filled stands; a batch that could do only
+  part of what was approved says which part and stops.
+
+### Duplicate prevention
+
+Four mechanisms, and the fourth is the one that matters most.
+
+1. **`client_order_id` is derived, not generated** — `ad-<batch>-<sequence>`, built from the batch
+   id and the order's place in it. The same order carries the same id after a crash, a replay or
+   a restart, so the broker's own record can be found without having stored anything else.
+2. **An intent is written before the request that could create it**, and submission is a
+   compare-and-set on that row (`UPDATE … WHERE status = 'planned'`). Two workers, a retry and a
+   resumed pass cannot both decide it is theirs to send.
+3. **A submission with no answer is not a failure.** `SubmissionUncertainError` means the order
+   *may exist*. It is recorded as `unknown`, never retried, and reconciled by its client id.
+4. **A single "not found" does not settle anything.** Reconciliation must miss twice, at least 60
+   seconds apart, before the order is recorded as never confirmed — and it is **still not resent**.
+   An order that may exist must not be created twice, and a batch that is honestly partial is a
+   better outcome than a duplicate trade.
+
+### Background recovery
+
+Execution is followed by the server, not by a browser: a daemon thread started in the
+application's lifespan calls one pass every four seconds, whether or not the Orders page is open.
+A pass reconciles everything in flight, moves the batch forward by at most one decision, and takes
+a lock so a second pass cannot pile on. There is no queue framework.
+
+A batch still working **eight hours** after it was approved is halted and reported. That is longer
+than the session its DAY orders could have lived through, so it means one of two things — the
+broker has already resolved orders this application has not caught up with, or a submission is
+never going to be confirmed — and neither is worth chasing for ever.
+
+The **portfolio sync is attempted once the batch is over** and its failure is recorded in its own
+columns. A filled order that could not be written into the portfolio is a different problem, with
+a different fix, from an order that did not fill, and the Orders page reports them separately.
+The portfolio is updated from the broker's own report of the fills — never by subtracting this
+application's estimates from its own cash figure.
+
+### Known limitations
+
+- **A never-confirmed order is not resent.** After the grace period it is reported as such and the
+  batch is partial. Recovering it means generating a new proposal.
+- **The orders table scrolls horizontally at phone width.** Ten columns do not fit in 390px; the
+  page itself does not overflow, but the table does.
+- **One batch per account, for now.** A second approval while one is working is refused rather
+  than queued.
+- **No manual trading, no order editing and no cancellation**, and no realised-P&L accounting.
+  Orders are placed here and resolved by the broker.
+- **The reconciliation read is one request per order in flight.** Bounded per pass, but linear in
+  batch size.
+- **The paper host is the only host.** `app.alpaca` refuses anything but
+  `https://paper-api.alpaca.markets`, so a live configuration is a startup-visible error rather
+  than a real order.
+
+### Doing it by hand
+
+There is one manual procedure for watching a real paper order end to end, and it needs a proposal
+that is actionable — generated during regular US market hours, from a synchronised paper account:
+
+1. Open <http://localhost:5173> and go to **News & Trading**.
+2. Press **Rebalance proposal** and wait for the panel to finish.
+3. Press **Approve** beside it. The page moves to **Orders**, focused on the batch it just opened.
+4. Watch the batch: the sales go first, then — once they have filled — the purchases. Statuses
+   update while the page is open and survive a reload.
+5. Return to **Portfolio**; it shows the snapshot the completed batch synchronised.
+
+If the market is closed, the approval is refused with a sentence saying so and nothing is queued.
+If prices have moved more than one percent since the proposal was generated, the refreshed
+estimates are shown and **Approve** asks again before anything is sent.
+

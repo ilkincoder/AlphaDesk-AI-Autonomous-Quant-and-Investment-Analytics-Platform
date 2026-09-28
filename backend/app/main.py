@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app import broker_sync, portfolio_prices
+from app import broker_sync, order_executor, portfolio_prices
 from app.alpaca import (
     AlpacaError,
     DataValidationError,
@@ -19,6 +19,7 @@ from app.alpaca import (
 )
 from app.agent import checkpointing, recovery
 from app.analysis_api import router as analysis_router
+from app.execution_api import router as orders_router
 from app.db import engine, get_session
 from app.news_api import router as news_router
 from app.rebalance_api import router as rebalance_router
@@ -65,9 +66,14 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     """
     checkpointing.start()
     recovery.resume_interrupted_in_background()
+    # Orders are followed by this process, not by a browser. A batch keeps moving while nobody is
+    # looking at it, which is the difference between an execution that finishes and one that
+    # stops because a tab was closed. It is a daemon thread on a timer, with no queue behind it.
+    order_executor.start_background()
     try:
         yield
     finally:
+        order_executor.stop_background()
         checkpointing.stop()
 
 
@@ -80,9 +86,14 @@ app.include_router(analysis_router)
 # News is a second corpus with its own store, its own collection and its own ingestion.
 app.include_router(news_router)
 
-# The rebalance proposal. Its own table, its own single-run slot, and no route that could reach
-# a broker -- it reads the portfolio, proposes targets and prices trades, and stops there.
+# The rebalance proposal. Its own table and its own single-run slot: it reads the portfolio,
+# proposes targets and prices trades, and stops there. Generating one still sends nothing anywhere.
 app.include_router(rebalance_router)
+
+# Approving a proposal, and reading what an approval did. The decision route is the only thing in
+# this application that can cause an order to exist, and it does so by recording a decision and
+# opening a batch -- `app.order_executor` is what submits, from its own thread.
+app.include_router(orders_router)
 
 
 @app.get("/health")

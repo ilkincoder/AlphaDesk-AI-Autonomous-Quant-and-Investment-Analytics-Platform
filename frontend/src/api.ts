@@ -428,8 +428,10 @@ export type ProposalEvidence = {
 
 /** Mirrors `RebalanceProposalOut`.
  *
- * `status` is `proposed`, `no_change`, `unavailable`, `interrupted`, or `generating`. There is
- * no approved, submitted or filled status: this milestone ends at generation.
+ * `status` is `proposed`, `no_change`, `unavailable`, `interrupted`, or `generating` — the
+ * *run's* life, and nothing to do with what a person decided about it. A decision lives beside
+ * the proposal rather than in its status: an approved proposal is still a `proposed` one, and
+ * `decision` below is what says somebody acted on it.
  */
 export type RebalanceProposal = {
   proposal_id: string
@@ -456,6 +458,115 @@ export type RebalanceProposal = {
   failure: string | null
   failure_reason: string | null
   usage: Record<string, unknown> | null
+  /** What a person decided about this proposal, or null if nobody has. */
+  decision: ProposalDecision | null
+  /** The execution batch an approval opened, so a page restoring itself can offer to open it. */
+  batch_id: string | null
+}
+
+/** One order as the decision resolved it. Every figure is the server's, not a browser's. */
+export type DecisionOrder = {
+  sequence: number
+  symbol: string
+  /** "buy" or "sell". Always shown as a word. */
+  side: string
+  quantity: string
+  /** The estimate the plan was approved at. Not a quote. */
+  estimated_price: string
+  estimated_value: string
+  /** What the account held when the plan was validated. */
+  quantity_before: string
+}
+
+/** Mirrors `ProposalDecisionOut`: the recorded decision and the exact orders it bound to. */
+export type ProposalDecision = {
+  decision_id: string
+  proposal_id: string
+  /** "approved" or "rejected". */
+  decision: string
+  decided_at: string
+  plan_fingerprint: string
+  price_drift_percent: string | null
+  reason: string | null
+  order_plan: DecisionOrder[]
+}
+
+/** Mirrors `DecisionOutcomeOut`: what a decision request did.
+ *
+ * `renewal_required` is an answer rather than an error — a plan whose prices moved, waiting for
+ * a second confirmation — and so is `already_decided`, which is a retry or a double click
+ * landing on the decision that already exists.
+ */
+export type DecisionOutcome = {
+  outcome: string
+  detail: string
+  reason: string | null
+  decision: ProposalDecision | null
+  batch_id: string | null
+  plan: DecisionOrder[]
+  price_drift_percent: string | null
+}
+
+/** Mirrors `OrderIntentOut`: one order in a batch, and everything the broker has said about it.
+ *
+ * `estimated_price` is the plan's figure and `filled_avg_price` is the only actual price here.
+ * The two are deliberately separate fields, so a page cannot show one as the other.
+ */
+export type OrderIntent = {
+  intent_id: string
+  sequence: number
+  symbol: string
+  side: string
+  /** Requested, whole shares. Never resized after approval. */
+  quantity: string
+  order_type: string
+  time_in_force: string
+  /** planned, submitting, accepted, partially_filled, filled, rejected, canceled, expired,
+   *  unknown, not_found, halted. */
+  status: string
+  /** The broker's own status verbatim, beside the mapped one. */
+  broker_status: string | null
+  estimated_price: string
+  quantity_before: string
+  filled_quantity: string
+  filled_avg_price: string | null
+  client_order_id: string
+  broker_order_id: string | null
+  submitted_at: string | null
+  resolved_at: string | null
+  error: string | null
+}
+
+/** Mirrors `ExecutionBatchOut`: an approved plan and how far it has got.
+ *
+ * `sync_status` is the *portfolio* sync and is deliberately separate from `status`: a filled
+ * order that could not be written into the portfolio is a different problem from an order that
+ * did not fill.
+ */
+export type ExecutionBatch = {
+  batch_id: string
+  proposal_id: string
+  /** pending, submitting, completed, partial or halted. */
+  status: string
+  created_at: string
+  started_at: string | null
+  completed_at: string | null
+  currency: string
+  cash_at_approval: string
+  reserved_cash: string
+  price_drift_percent: string | null
+  notes: string[]
+  halt_reason: string | null
+  sync_status: string
+  sync_error: string | null
+  sync_at: string | null
+  orders: OrderIntent[]
+}
+
+/** Mirrors `OrdersView`: every batch, newest first, and which one is running. */
+export type OrdersView = {
+  active_batch_id: string | null
+  batches: ExecutionBatch[]
 }
 
 /** The latest proposal, or an explicit null. A page restoring itself is asking "is there
@@ -474,6 +585,39 @@ export type ProposalEvent = {
   stage?: string
   detail?: string
   proposal?: RebalanceProposal
+}
+
+/** Record a decision about one proposal.
+ *
+ * The body carries a decision and nothing else: no quantity, no symbol and no side. What is
+ * executed is resolved server-side from the proposal's own stored calculation, and the server
+ * refuses a body that tries to say otherwise.
+ *
+ * `confirm` is the second click on a plan whose prices moved. It is not a permission, and an
+ * approval that needed no renewal does not need it.
+ */
+export function decideProposal(
+  proposalId: string,
+  body: { decision: 'approve' | 'reject'; idempotency_key: string; confirm?: boolean; reason?: string },
+  signal?: AbortSignal,
+): Promise<DecisionOutcome> {
+  return request<DecisionOutcome>(
+    `/api/rebalance/proposal/${encodeURIComponent(proposalId)}/decision`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal,
+    },
+  )
+}
+
+/** Every execution batch, newest first, and which one is running.
+ *
+ * A read. Statuses are advanced by the server's own execution loop rather than by this call, so
+ * a page that polls sees a batch move without the browser driving anything. */
+export function fetchOrders(signal?: AbortSignal): Promise<OrdersView> {
+  return request<OrdersView>('/api/orders', { signal })
 }
 
 /** The latest proposal, as the page reads it on load. */

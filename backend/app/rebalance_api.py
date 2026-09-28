@@ -45,6 +45,7 @@ from app.agent.progress import (
 )
 from app.agent.recovery import recover_expired
 from app.db import SessionLocal
+from app.execution_api import proposal_decision
 from app.rebalance_snapshot import compare
 from app.schemas import (
     RebalanceProposalOut,
@@ -355,9 +356,15 @@ def _to_out(stored: dict) -> RebalanceProposalOut:
     yesterday's evidence.
     """
     state, reason, changed = _freshness(stored)
+    # The decision is recorded beside the proposal rather than on it, and read here so a page
+    # restoring itself can show that this proposal was approved or rejected without the browser
+    # having kept anything.
+    decision, batch_id = proposal_decision(str(stored["proposal_id"]))
     return RebalanceProposalOut.model_validate(
         {
             **stored,
+            "decision": decision,
+            "batch_id": batch_id,
             # An empty JSONB object is what a row carries before the run has written anything --
             # a refused or interrupted run, or one still in flight. It means "nothing here", and
             # passing it through as an empty *object* would fail validation on fields that a

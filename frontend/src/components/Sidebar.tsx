@@ -25,7 +25,7 @@ import {
 
 /** The pages that exist. Declared here because this file owns the list of destinations;
  *  `App` holds whichever one is current. */
-export type PageId = 'analysis' | 'portfolio' | 'what-if' | 'news'
+export type PageId = 'analysis' | 'portfolio' | 'what-if' | 'news' | 'orders'
 
 type NavItem = {
   label: string
@@ -43,7 +43,7 @@ const NAV_ITEMS: NavItem[] = [
   { id: 'news', label: 'News & Trading', Icon: DataNewsIcon },
   { label: 'Strategies', Icon: StrategiesIcon },
   { label: 'Backtest', Icon: BacktestIcon },
-  { label: 'Orders', Icon: OrdersIcon },
+  { id: 'orders', label: 'Orders', Icon: OrdersIcon },
   { label: 'Watchlist', Icon: WatchlistIcon },
   { label: 'Settings', Icon: SettingsIcon },
 ]
