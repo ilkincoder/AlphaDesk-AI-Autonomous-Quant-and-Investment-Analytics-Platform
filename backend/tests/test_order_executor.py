@@ -118,8 +118,13 @@ class ExecutorTestCase(FailureSafeTransaction, ToolTestCase):
                 proposal_id=proposal_id,
             ),
         )
+        # The same fixed instant the broker's clock answers with, so the session check is a
+        # comparison between two agreed times rather than between a canned clock and the wall.
         outcome = decide(
-            proposal_id=proposal_id, decision="approved", idempotency_key=f"key-{proposal_id}"
+            proposal_id=proposal_id,
+            decision="approved",
+            idempotency_key=f"key-{proposal_id}",
+            now=NOW,
         )
         self.assertEqual(outcome.outcome, OUTCOME_APPROVED, outcome.detail)
         return outcome.batch_id

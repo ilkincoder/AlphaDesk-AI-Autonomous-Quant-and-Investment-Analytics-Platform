@@ -1,6 +1,7 @@
 import { useCallback, useState } from 'react'
 
 import { AnalysisPage } from './components/AnalysisPage'
+import { BacktestPage } from './components/BacktestPage'
 import { NewsPage } from './components/NewsPage'
 import { OrdersPage } from './components/OrdersPage'
 import { PortfolioPage } from './components/PortfolioPage'
@@ -70,6 +71,12 @@ export function App() {
           {visited.has('news') && (
             <NewsPage active={page === 'news'} onOpenOrders={openOrders} />
           )}
+        </div>
+
+        <div className="min-h-0 flex-1 flex-col p-6" style={{ display: showing('backtest') }}>
+          {/* No `active` prop: nothing on this page happens on its own. A backtest is run when
+              somebody presses Run, and it holds no polling. */}
+          {visited.has('backtest') && <BacktestPage />}
         </div>
 
         <div className="min-h-0 flex-1 flex-col p-6" style={{ display: showing('orders') }}>

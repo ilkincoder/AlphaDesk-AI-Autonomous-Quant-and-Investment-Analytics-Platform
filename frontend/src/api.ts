@@ -718,3 +718,279 @@ function parseProposalFrame(frame: string): ProposalEvent | null {
     return null
   }
 }
+
+// --- backtesting -------------------------------------------------------------------------------
+//
+// One strategy is defined by the application, and this file mirrors what the API says about it
+// rather than restating it: the rules, the execution notes and the bounds an entry is checked
+// against all arrive from `GET /backtest/strategies`, so the page cannot drift from the engine.
+
+/** Mirrors `BacktestStrategyOut`.
+ *
+ * The `min_*`/`max_*` bounds are convenience, not the guard: the server re-checks every one of
+ * them. They exist so a typo is caught before a provider request is spent on it.
+ */
+/** One number a strategy is configured with, as the strategy declares it.
+ *
+ * The page renders a field per declaration, so a strategy with three settings of its own -- a
+ * period and two thresholds -- needs no change here. `label` carries the unit in the words a
+ * person reads, and the bounds are what the form refuses an entry against before the round trip.
+ */
+export type BacktestParam = {
+  name: string
+  label: string
+  default: number
+  minimum: number
+  maximum: number
+}
+
+export type BacktestStrategy = {
+  id: string
+  version: string
+  name: string
+  summary: string
+  rules: string[]
+  execution: string[]
+  parameters: BacktestParam[]
+  min_commission_per_share: string
+  max_commission_per_share: string
+  min_slippage_percent: string
+  max_slippage_percent: string
+  max_initial_capital: string
+}
+
+/** Mirrors `BacktestStrategyListOut`. */
+export type BacktestStrategyList = {
+  strategies: BacktestStrategy[]
+}
+
+/** Mirrors `BacktestInstrumentOut`.
+ *
+ * A *listing*, not a ticker: `exchange` is part of the identity, because the same symbol on two
+ * exchanges is two instruments with two price series.
+ */
+export type BacktestInstrument = {
+  symbol: string
+  name: string
+  exchange: string
+  instrument_type: string
+  currency: string
+  country: string
+}
+
+/** Mirrors `BacktestInstrumentListOut`. `query` comes back so the page can tell the results for
+ *  what is in the box from the results for what was typed two keystrokes ago. */
+export type BacktestInstrumentList = {
+  query: string
+  matches: BacktestInstrument[]
+}
+
+/** One date on a curve, marked at that session's close. The first point of every curve is the
+ *  initial capital, dated the requested start date. */
+export type BacktestEquityPoint = {
+  on: string
+  equity: string
+}
+
+/** Mirrors `BacktestTradeOut`. `price` is the price actually paid or received -- the session's
+ *  open moved by the slippage model -- and `gross_value` is `quantity * price`. */
+export type BacktestTrade = {
+  executed_on: string
+  /** `"buy"` or `"sell"`. Always shown as a word. */
+  side: string
+  /** A whole number of shares, so a JSON number rather than a string. */
+  quantity: number
+  price: string
+  gross_value: string
+  commission: string
+  cash_after: string
+  signalled_on: string
+}
+
+/** Mirrors `BacktestOpenPositionOut`. A position still held at the end, marked rather than sold. */
+export type BacktestOpenPosition = {
+  quantity: number
+  entry_date: string
+  entry_price: string
+  mark_date: string
+  mark_price: string
+  market_value: string
+}
+
+/** Mirrors `BacktestPerformanceOut`. `total_return_percent` is signed; `max_drawdown_percent` is
+ *  a positive magnitude, because a drawdown is already a fall. */
+export type BacktestPerformance = {
+  final_value: string
+  total_return_percent: string
+  max_drawdown_percent: string
+}
+
+/** Mirrors `BacktestCoverageOut`. `warmup_sessions` were read and excluded from every figure. */
+export type BacktestCoverage = {
+  first_session: string
+  last_session: string
+  sessions: number
+  warmup_sessions: number
+  data_first_date: string
+  data_last_date: string
+  data_sessions: number
+}
+
+/** Mirrors `BacktestRunOut`.
+ *
+ * Every run here finished: a run that failed is returned as an error and stored nowhere, which
+ * is why there is no status on this type. The two curves are the strategy's and buy-and-hold's
+ * over the same instrument, capital, window and costs.
+ */
+export type BacktestRun = {
+  run_id: string
+  request_id: string
+  created_at: string
+  strategy_id: string
+  strategy_version: string
+  strategy_name: string
+  symbol: string
+  exchange: string
+  instrument_name: string | null
+  instrument_type: string | null
+  currency: string
+  start_date: string
+  end_date: string
+  initial_capital: string
+  /** The strategy's own parameters as it was run with, keyed by the names it declares. */
+  parameters: Record<string, number>
+  commission_per_share: string
+  slippage_percent: string
+  provider: string
+  /** Our vocabulary: `"raw"` or `"adjusted"`. */
+  adjustment_basis: string
+  /** The provider's own mode, e.g. `"splits"`. Kept apart from the word above because it is
+   *  what decides whether these figures are a price return or a total return. */
+  provider_adjust_mode: string
+  data_retrieved_at: string
+  coverage: BacktestCoverage | null
+  equity: BacktestEquityPoint[]
+  benchmark_equity: BacktestEquityPoint[]
+  trades: BacktestTrade[]
+  performance: BacktestPerformance | null
+  benchmark: BacktestPerformance | null
+  cash_remaining: string | null
+  open_position: BacktestOpenPosition | null
+  assumptions: string[]
+  limitations: string[]
+  /** The explanation, when one has been written. `null` is the ordinary state: a run is
+   *  complete without prose, and the model and prompt version say who wrote it and under what
+   *  request. */
+  explanation: string | null
+  explanation_model: string | null
+  explanation_prompt_version: string | null
+}
+
+/** Mirrors `BacktestExplanationOut`.
+ *
+ * `status` is the whole answer: `ok`, or `unavailable` with a `reason`. An explanation that
+ * could not be written is not an error -- the results stand without it -- so both come back
+ * 200 and the page keeps the figures on screen.
+ */
+export type BacktestExplanation = {
+  status: string
+  reason: string | null
+  detail: string | null
+  explanation: string | null
+  model: string | null
+  prompt_version: string | null
+}
+
+/** What `POST /backtest/runs` accepts.
+ *
+ * `exchange` is sent when a search result was chosen and omitted on the portfolio path, which
+ * knows only the ticker -- the server resolves the listing either way. No quantity and no price
+ * are sent: selecting a holding chooses an instrument and nothing else, and the run starts from
+ * `initial_capital`, flat.
+ *
+ * Every money and percentage field is a string, as everywhere else in this file.
+ */
+export type BacktestRunBody = {
+  request_id: string
+  strategy_id: string
+  symbol: string
+  exchange?: string
+  start_date: string
+  end_date: string
+  initial_capital: string
+  /** The chosen strategy's parameters, named as that strategy names them. */
+  parameters: Record<string, number>
+  costs: {
+    commission_per_share: string
+    slippage_percent: string
+  }
+}
+
+/** The strategies this application defines. */
+export function fetchBacktestStrategies(signal?: AbortSignal): Promise<BacktestStrategyList> {
+  return request<BacktestStrategyList>('/api/backtest/strategies', { signal })
+}
+
+/** Find a stock by ticker or company name.
+ *
+ * An empty `matches` list is an answer -- nothing matched -- and not a failure, which arrives as
+ * an `ApiError` instead. The two are shown differently.
+ */
+export function searchBacktestInstruments(
+  q: string,
+  signal?: AbortSignal,
+): Promise<BacktestInstrumentList> {
+  return request<BacktestInstrumentList>(
+    `/api/backtest/instruments?q=${encodeURIComponent(q)}`,
+    { signal },
+  )
+}
+
+/** Run a backtest and store it.
+ *
+ * POST because it fetches prices and writes a run, and because a GET that does either is the
+ * kind of thing a proxy or a prefetch is entitled to replay. The `request_id` is what makes a
+ * retry free: the same id returns the row it already produced rather than paying for the
+ * provider request twice. Nothing is sent to a broker -- this simulates trades over sessions
+ * that have already happened.
+ */
+export function runBacktest(
+  body: BacktestRunBody,
+  signal?: AbortSignal,
+): Promise<BacktestRun> {
+  return request<BacktestRun>('/api/backtest/runs', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    signal,
+  })
+}
+
+/** The most recent stored run, or `null` when nothing has been run.
+ *
+ * This is what the page reads on load so it can put back what it was last showing. `run` is
+ * `null` rather than a 404 when there is nothing to restore: "there is no saved run" is an
+ * answer, not a failure. Nothing is recalculated and no prices are refetched -- the row holds
+ * the resolved instrument, the configuration and the results.
+ */
+export function fetchLatestBacktestRun(
+  signal?: AbortSignal,
+): Promise<{ run: BacktestRun | null }> {
+  return request<{ run: BacktestRun | null }>('/api/backtest/runs/latest', { signal })
+}
+
+/** Ask for an explanation of a stored run.
+ *
+ * POST because the first call writes one: it asks a model to read the run's own figures and
+ * stores the prose beside them. A repeated call is answered from what was stored and costs
+ * nothing, so a retry and a double click are the same as one. Nothing here is sent to a broker.
+ */
+export function explainBacktestRun(
+  runId: string,
+  signal?: AbortSignal,
+): Promise<BacktestExplanation> {
+  return request<BacktestExplanation>(
+    `/api/backtest/runs/${encodeURIComponent(runId)}/explanation`,
+    { method: 'POST', signal },
+  )
+}

@@ -1,9 +1,13 @@
 /** Application shell navigation.
  *
- * Ten destinations, four of which exist. Analysis, Portfolio, What if? and News & Trading
- * are real pages; the other six are rendered as genuinely disabled buttons with a "Coming
- * soon" description, because a link that navigates nowhere is worse than a link that says it
- * cannot.
+ * Seven destinations, six of which exist. Analysis, Portfolio, What if?, News & Trading, Backtest
+ * and Orders are real pages; Dashboard is rendered as a genuinely disabled button with a
+ * "Coming soon" description, because a link that navigates nowhere is worse than a link that
+ * says it cannot.
+ *
+ * The list is what this application can reach, not what it might one day hold: Strategies,
+ * Watchlist and Settings were removed rather than left disabled, because a row that can never be
+ * clicked is a claim about a feature nobody is building. Their icons remain in `icons.tsx`.
  */
 
 import { useEffect, useRef, useState } from 'react'
@@ -17,15 +21,12 @@ import {
   DataNewsIcon,
   OrdersIcon,
   PortfolioIcon,
-  SettingsIcon,
-  StrategiesIcon,
-  WatchlistIcon,
   WhatIfIcon,
 } from './icons'
 
 /** The pages that exist. Declared here because this file owns the list of destinations;
  *  `App` holds whichever one is current. */
-export type PageId = 'analysis' | 'portfolio' | 'what-if' | 'news' | 'orders'
+export type PageId = 'analysis' | 'portfolio' | 'what-if' | 'news' | 'backtest' | 'orders'
 
 type NavItem = {
   label: string
@@ -41,11 +42,8 @@ const NAV_ITEMS: NavItem[] = [
   { id: 'portfolio', label: 'Portfolio', Icon: PortfolioIcon },
   { id: 'what-if', label: 'What if?', Icon: WhatIfIcon },
   { id: 'news', label: 'News & Trading', Icon: DataNewsIcon },
-  { label: 'Strategies', Icon: StrategiesIcon },
-  { label: 'Backtest', Icon: BacktestIcon },
+  { id: 'backtest', label: 'Backtest', Icon: BacktestIcon },
   { id: 'orders', label: 'Orders', Icon: OrdersIcon },
-  { label: 'Watchlist', Icon: WatchlistIcon },
-  { label: 'Settings', Icon: SettingsIcon },
 ]
 
 function Wordmark() {

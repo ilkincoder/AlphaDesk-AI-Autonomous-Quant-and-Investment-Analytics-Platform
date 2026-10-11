@@ -814,3 +814,305 @@ class OrdersView(BaseModel):
 
     active_batch_id: str | None = None
     batches: list[ExecutionBatchOut] = Field(default_factory=list)
+
+
+# --- backtesting -------------------------------------------------------------------------------
+
+
+class BacktestParamOut(BaseModel):
+    """One number a strategy is configured with.
+
+    The strategy declares these, and the page renders a field from each one, so a second
+    strategy -- with its own parameters, its own defaults and its own bounds -- needs no change
+    to the request shape or to the form. `label` carries the unit in the words a person reads.
+    """
+
+    name: str
+    label: str
+    default: int
+    minimum: int
+    maximum: int
+
+
+class BacktestStrategyOut(BaseModel):
+    """One predefined strategy, as the application defines it.
+
+    The rules and the execution notes travel with the strategy rather than being written into the
+    page: a page that explained the rules itself would keep explaining the old ones after they
+    changed, and the whole point of a fixed catalogue is that the definition has one home.
+
+    `parameters` is that home for the numbers too. What a strategy is configured with is a fact
+    about the strategy, not about this API or the form, so it is declared once in
+    `app.backtest` and served from there.
+    """
+
+    id: str
+    version: str
+    name: str
+    summary: str
+    rules: list[str]
+    execution: list[str]
+    parameters: list[BacktestParamOut]
+    # The cost bounds the request is validated against, sent so the form can refuse an entry
+    # before the round trip. The server re-checks all of them; this is a convenience, not the
+    # guard.
+    min_commission_per_share: Decimal
+    max_commission_per_share: Decimal
+    min_slippage_percent: Decimal
+    max_slippage_percent: Decimal
+    max_initial_capital: Decimal
+
+
+class BacktestStrategyListOut(BaseModel):
+    strategies: list[BacktestStrategyOut] = Field(default_factory=list)
+
+
+class BacktestInstrumentOut(BaseModel):
+    """One listing a search resolved to.
+
+    `exchange` is part of the identity, not a detail: the same ticker lists on several exchanges
+    and they are different instruments with different price series. A search result is a listing,
+    which is why it is offered as something to choose rather than as a ticker to copy.
+    """
+
+    symbol: str
+    name: str
+    exchange: str
+    instrument_type: str
+    currency: str
+    country: str
+
+
+class BacktestInstrumentListOut(BaseModel):
+    """What a search found, including the query it was asked.
+
+    `query` comes back so the page can tell "this is the result set for what is in the box" from
+    "this is what was typed two keystrokes ago". An empty list is an answer -- nothing matched --
+    and not the same thing as a failed search, which arrives as an error instead.
+    """
+
+    query: str
+    matches: list[BacktestInstrumentOut] = Field(default_factory=list)
+
+
+class BacktestCostsIn(BaseModel):
+    """The cost model, in explicit units.
+
+    `commission_per_share` is USD per share, charged on each side of a trade.
+    `slippage_percent` is a percentage of the execution price, always against the trade.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    commission_per_share: Decimal = Field(default=Decimal("0.005"), ge=Decimal("0"))
+    slippage_percent: Decimal = Field(default=Decimal("0.05"), ge=Decimal("0"))
+
+
+class BacktestRunRequest(BaseModel):
+    """One backtest to run.
+
+    **The instrument is a ticker plus an optional exchange, and the exchange is resolved here
+    when it is missing.** A portfolio holding carries a ticker and no exchange, so the portfolio
+    path has nothing else to send; a chosen search result carries both, so the search path pins
+    the listing the person actually picked. Resolving server-side is what keeps the two paths
+    from needing a different request shape.
+
+    **No quantity and no price come from the client.** Selecting a holding chooses an instrument
+    and nothing else: the run starts from `initial_capital`, flat, because a backtest that
+    inherited a position would be measuring something else entirely.
+
+    `request_id` is the client's, and it is the duplicate-suppression mechanism: a retry, a double
+    click and a replayed POST carry the same one and resolve to the run that already exists.
+
+    **`parameters` are the strategy's own, named as it names them.** The request does not carry
+    "a fast period and a slow period"; it carries whatever the chosen strategy declares, and the
+    engine validates the set against that strategy's own definitions. A request naming a
+    parameter the strategy does not have is refused rather than ignored, which is what keeps a
+    period sent to an RSI run from quietly doing nothing.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str = Field(min_length=1, max_length=64)
+    strategy_id: str = Field(min_length=1, max_length=48)
+    symbol: str = Field(min_length=1, max_length=20)
+    # Present when a search result was chosen. Absent on the portfolio path, which knows only the
+    # ticker -- and the exchange is then looked up rather than assumed.
+    exchange: str | None = Field(default=None, max_length=32)
+    start_date: date
+    end_date: date
+    initial_capital: Decimal = Field(gt=Decimal("0"))
+    parameters: dict[str, int] = Field(default_factory=dict)
+    costs: BacktestCostsIn = Field(default_factory=BacktestCostsIn)
+
+    @field_validator("strategy_id", "symbol")
+    @classmethod
+    def _strip(cls, value: str) -> str:
+        # Whitespace from a text field is not part of a ticker or a strategy id, and a trailing
+        # space would otherwise make a valid symbol unresolvable.
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("must not be blank")
+        return stripped
+
+
+class BacktestEquityPointOut(BaseModel):
+    """One date on a curve, marked at that session's close. The first point of every curve is the
+    initial capital, dated the requested start date."""
+
+    on: date
+    equity: Decimal
+
+
+class BacktestTradeOut(BaseModel):
+    """One executed trade.
+
+    `price` is the price actually paid or received -- the session's open moved by the slippage
+    model -- and `gross_value` is `quantity * price`. The two are separate columns rather than one
+    derived from the other, so a page cannot show a slippage-adjusted price beside a gross value
+    computed without it.
+    """
+
+    executed_on: date
+    # "buy" or "sell". Always shown as a word, never as a sign.
+    side: str
+    quantity: int
+    price: Decimal
+    gross_value: Decimal
+    commission: Decimal
+    cash_after: Decimal
+    # The session whose close produced this signal. One session earlier than `executed_on` by
+    # construction, and stated so the timing rule is visible rather than asserted.
+    signalled_on: date
+
+
+class BacktestOpenPositionOut(BaseModel):
+    """A position still held when the test ended, marked rather than sold."""
+
+    quantity: int
+    entry_date: date
+    entry_price: Decimal
+    mark_date: date
+    mark_price: Decimal
+    market_value: Decimal
+
+
+class BacktestPerformanceOut(BaseModel):
+    """Final value, total return and maximum drawdown for one curve.
+
+    `total_return_percent` is signed. `max_drawdown_percent` is a positive magnitude: a drawdown
+    is already a fall, and a minus sign in front of it would be a second one.
+    """
+
+    final_value: Decimal
+    total_return_percent: Decimal
+    max_drawdown_percent: Decimal
+
+
+class BacktestCoverageOut(BaseModel):
+    """Which sessions the run actually read and which of them it reported on.
+
+    `warmup_sessions` are the sessions fetched before the test window and excluded from every
+    figure: they exist so the averages have a value on the first reported session. `data_*` covers
+    the whole fetched series, warm-up included, which is what was stored as the run's snapshot.
+    """
+
+    first_session: date
+    last_session: date
+    sessions: int
+    warmup_sessions: int
+    data_first_date: date
+    data_last_date: date
+    data_sessions: int
+
+
+class BacktestRunOut(BaseModel):
+    """One stored run, complete.
+
+    Every run here finished. A run that failed was reported to whoever asked for it and wrote
+    nothing, so there is no `status` and no `failure` to read. Nothing in this schema is computed
+    at read time -- what a page shows is what was recorded, which is the only way a stored run and
+    a fresh one can be compared.
+    """
+
+    run_id: str
+    request_id: str
+    created_at: datetime
+
+    strategy_id: str
+    strategy_version: str
+    strategy_name: str
+
+    symbol: str
+    exchange: str
+    instrument_name: str | None = None
+    instrument_type: str | None = None
+    currency: str
+
+    start_date: date
+    end_date: date
+    initial_capital: Decimal
+    # The strategy's own parameters as it was run with, so a stored run can be put back into the
+    # form that produced it -- whatever those parameters happen to be called.
+    parameters: dict[str, int]
+    commission_per_share: Decimal
+    slippage_percent: Decimal
+
+    provider: str
+    adjustment_basis: str
+    provider_adjust_mode: str
+    data_retrieved_at: datetime
+
+    coverage: BacktestCoverageOut | None = None
+    equity: list[BacktestEquityPointOut] = Field(default_factory=list)
+    benchmark_equity: list[BacktestEquityPointOut] = Field(default_factory=list)
+    trades: list[BacktestTradeOut] = Field(default_factory=list)
+    performance: BacktestPerformanceOut | None = None
+    benchmark: BacktestPerformanceOut | None = None
+    cash_remaining: Decimal | None = None
+    open_position: BacktestOpenPositionOut | None = None
+    assumptions: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+
+    # The explanation, when one has been written for this run. `None` is the ordinary state: a
+    # run is complete without one. The model and prompt version travel with the text because
+    # prose is only meaningful beside the request that produced it.
+    explanation: str | None = None
+    explanation_model: str | None = None
+    explanation_prompt_version: str | None = None
+
+
+class BacktestExplanationOut(BaseModel):
+    """The explanation of one run, or why there is not one.
+
+    `status` is the whole answer: `ok`, or `unavailable` with a `reason`. **An explanation that
+    could not be written is not an error.** The results are complete without it, so this is a
+    200 in both cases and the page keeps the figures on screen either way -- the same shape
+    `NewsSearchOut` uses, and for the same reason.
+
+    `reason` is a stable word rather than a sentence, so the page can decide what to offer: a
+    provider that timed out is worth offering again, and a missing API key is not. `detail`
+    carries the sentence a person can read.
+    """
+
+    status: str
+    reason: str | None = None
+    detail: str | None = None
+    explanation: str | None = None
+    model: str | None = None
+    prompt_version: str | None = None
+
+
+class BacktestRunView(BaseModel):
+    """The latest run, or an explicit null.
+
+    200 with a null body rather than a 404 when nothing has been run: a page restoring itself on
+    load is asking "is there one?", and "no" is an answer rather than an error. Same shape as
+    `RebalanceProposalView`, for the same reason.
+
+    The stored run carries everything a page needs to put itself back -- the strategy and its
+    version, the resolved instrument, the window and costs, and the results -- so restoring is
+    one read and no recalculation.
+    """
+
+    run: BacktestRunOut | None = None

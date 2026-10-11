@@ -1295,3 +1295,118 @@ class OrderIntent(Base):
     # unanswered submission failed, so this counts rather than concludes.
     uncertain_checks: Mapped[int] = mapped_column(Integer)
     error: Mapped[str | None] = mapped_column(Text)
+
+
+class BacktestRun(Base):
+    """One completed backtest: what it was asked, what it read, and what it produced.
+
+    **Completed runs only.** A run that failed wrote nothing. The failure was reported to
+    whoever asked for it, and there is no partial figure worth keeping: a stored run is a record
+    of an answer, and a row with no answer in it is a worse record than no row. That is also why
+    there is no `status` column -- every row here finished.
+
+    **The input bars are stored, not referenced.** `daily_prices` holds the same sessions, but a
+    row there is mutable: the unique key permits an upsert, and a provider that revises its split
+    history rewrites every date it touches. A run that pointed at those rows would change meaning
+    when they changed, and a checksum over them would prove only that they are now different. So
+    `input_snapshot` carries the exact bars this run's arithmetic consumed, warm-up sessions
+    included. That is what makes a stored result reproducible rather than merely dated.
+
+    **`strategy_version` is stored beside `strategy_id`.** A run is only reproducible against the
+    rules that produced it, so the definition is pinned on the row. Editing a strategy's rules in
+    `app.backtest` must not silently restate what every earlier run meant.
+    """
+
+    __tablename__ = "backtest_runs"
+    __table_args__ = (
+        # The client's own id for this request. A retry, a double click and a replayed POST all
+        # carry the same one, so they resolve to the run that already exists instead of paying for
+        # the provider request a second time.
+        UniqueConstraint("request_id", name="uq_backtest_runs_request_id"),
+        Index("ix_backtest_runs_created_at", "created_at"),
+        # These restate the engine's own refusal conditions, so a row describes a configuration
+        # that could actually have run.
+        CheckConstraint("start_date < end_date", name="ck_backtest_runs_dates_ordered"),
+        CheckConstraint("initial_capital > 0", name="ck_backtest_runs_capital_positive"),
+        CheckConstraint(
+            "commission_per_share >= 0", name="ck_backtest_runs_commission_nonnegative"
+        ),
+        CheckConstraint(
+            "slippage_percent >= 0", name="ck_backtest_runs_slippage_nonnegative"
+        ),
+        # The provider's mode is "splits", which is why every figure here is a price return --
+        # dividends are not in these bars. Kept in the same vocabulary the daily-price rows use,
+        # so the two cannot describe the same bars differently.
+        CheckConstraint(
+            "adjustment_basis IN ('raw', 'adjusted')",
+            name="ck_backtest_runs_adjustment_basis",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    request_id: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    # --- the strategy, pinned -----------------------------------------------------------
+    strategy_id: Mapped[str] = mapped_column(String(48))
+    strategy_version: Mapped[str] = mapped_column(String(16))
+
+    # --- the resolved listing -------------------------------------------------------------
+    #
+    # Resolved rather than taken from the request: a portfolio holding carries a ticker and
+    # nothing else, so the exchange is looked up and recorded here. What a run was over is the
+    # listing, not the letters that were typed.
+    symbol: Mapped[str] = mapped_column(String(20))
+    exchange: Mapped[str] = mapped_column(String(32))
+    instrument_name: Mapped[str | None] = mapped_column(String(200))
+    instrument_type: Mapped[str | None] = mapped_column(String(48))
+    currency: Mapped[str] = mapped_column(String(3))
+
+    # --- the test window and its parameters ------------------------------------------------
+    start_date: Mapped[date] = mapped_column(Date)
+    end_date: Mapped[date] = mapped_column(Date)
+    initial_capital: Mapped[Decimal] = mapped_column(Numeric(18, 2))
+    # The strategy's own parameters, keyed by the names it declares -- `{"fast_period": 20,
+    # "slow_period": 50}` for the crossover, `{"period": 14, "entry_threshold": 30,
+    # "exit_threshold": 70}` for RSI. A document rather than columns because the set belongs to
+    # the strategy: naming them here would mean a migration every time one gained a parameter,
+    # and the columns could then describe a configuration the engine refuses. What makes a row
+    # readable is `strategy_id`/`strategy_version` beside it, which say how to read this.
+    parameters: Mapped[dict] = mapped_column(JSONB)
+
+    # --- the cost model, in the units the request stated ------------------------------------
+    commission_per_share: Mapped[Decimal] = mapped_column(Numeric(18, 6))
+    slippage_percent: Mapped[Decimal] = mapped_column(Numeric(9, 4))
+
+    # --- where the bars came from, and what they were ---------------------------------------
+    #
+    # All three adjustment fields are stored, not just the two words this application understands.
+    # A result labelled "adjusted" is only meaningful beside the provider's own mode, and
+    # "splits" rather than "dividends" is exactly what decides whether a figure is a price return
+    # or a total return -- so it belongs on the row, not in a docstring.
+    provider: Mapped[str] = mapped_column(String(32))
+    adjustment_basis: Mapped[str] = mapped_column(String(16))
+    provider_adjust_mode: Mapped[str] = mapped_column(String(16))
+    data_retrieved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    data_first_date: Mapped[date] = mapped_column(Date)
+    data_last_date: Mapped[date] = mapped_column(Date)
+    data_sessions: Mapped[int] = mapped_column(Integer)
+    # The exact bars consumed, warm-up included. See the class docstring.
+    input_snapshot: Mapped[dict] = mapped_column(JSONB)
+
+    # --- what it produced -------------------------------------------------------------------
+    #
+    # Everything the page shows -- both curves, the ledger, the metrics, the prose -- comes from
+    # here, so reading a run back cannot show different arithmetic from the run that was performed.
+    result: Mapped[dict] = mapped_column(JSONB)
+
+    # --- the explanation, if one was asked for -----------------------------------------------
+    #
+    # Nullable, and null for every run nobody explained. Text a model wrote is not evidence, so
+    # the model that wrote it and the prompt version it was written under are stored beside it:
+    # a later prompt might say something else, and a reader is owed the means to tell which
+    # request produced the words in front of them. `app.backtest_explanation` is what writes
+    # these; nothing here is calculated at read time.
+    explanation: Mapped[str | None] = mapped_column(Text)
+    explanation_model: Mapped[str | None] = mapped_column(String(64))
+    explanation_prompt_version: Mapped[str | None] = mapped_column(String(16))

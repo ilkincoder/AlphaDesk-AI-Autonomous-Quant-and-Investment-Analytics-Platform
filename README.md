@@ -3218,3 +3218,106 @@ If the market is closed, the approval is refused with a sentence saying so and n
 If prices have moved more than one percent since the proposal was generated, the refreshed
 estimates are shown and **Approve** asks again before anything is sent.
 
+
+## Backtesting (Module 3)
+
+The **Backtest** page tests a predefined strategy against a stock's past prices. It is the only
+feature here that reads prices and reaches no broker: **there is no route in it that could send
+an order anywhere**, and the trades it reports were never placed. A backtest is a calculation
+over sessions that have already happened.
+
+### Two strategies, and what they actually do
+
+| Strategy | Parameters (defaults) | Buys | Sells |
+|---|---|---|---|
+| Moving Average Crossover | `fast_period` (20), `slow_period` (50) | The fast average crosses above the slow one, while flat | It crosses back below, while holding |
+| RSI Reversion | `period` (14), `entry_threshold` (30), `exit_threshold` (70) | Wilder's RSI falls through the entry threshold, while flat | It rises through the exit threshold, while holding |
+
+Three rules are the same for both, and they are the ones a backtest most easily gets wrong:
+
+- **A signal executes at the *next* session's open**, never at the close that produced it. A
+  signal raised on the final session is discarded — there is no session left to execute it in.
+- **The test starts flat, and a signal is a *crossing*, not a level.** An indicator already past
+  its threshold when the test opens creates no position: the RSI being below 30 is not a buy,
+  and the fast average already above the slow one is not a crossover. Without this, a decline
+  would buy on every session of its way down.
+- **Warm-up history exists only to make the indicator computable.** Sessions before the start
+  date contribute an indicator value and nothing else — no equity point, no trade, no return.
+
+The indicator arithmetic is in `app/backtest.py` and is deliberately Wilder's own: RSI smooths
+each average gain and loss from the one before rather than recomputing over a window, so a long
+series never forgets its past. Two degenerate readings are *defined* rather than left to a
+division by zero — a series with no losses reads 100, one with no gains reads 0, and **a series
+that did not move reads 50**, not the 100 a no-loss rule would give a flat line. Readings are
+quantised to four decimal places, because an RSI is compared against a *threshold* and a reading
+of 24.9999999999999998 would fall on the wrong side of 30.
+
+### Parameters belong to the strategy
+
+A strategy declares the numbers it takes, with a label, a default and bounds — `Param` in
+`app.backtest`. The engine validates a request against those declarations, the catalogue route
+serves them, and the page renders one field per declaration. Nothing anywhere else assumes there
+are two of them called a fast period and a slow period.
+
+That is why migration `0016_backtest_run_parameters` replaced the `fast_period`/`slow_period`
+columns with one `parameters` JSONB document: RSI's three settings do not map onto "fast" and
+"slow" without lying about what the columns mean. Existing rows were converted rather than
+discarded. **A request naming a parameter the strategy does not declare is refused**, so a
+crossover period cannot ride along into an RSI run and quietly do nothing.
+
+### What is stored, and what a reload shows
+
+`backtest_runs` (migration `0015`) holds one completed run: the resolved listing, the
+configuration, the exact bars consumed, and the result. A run that failed writes nothing — a
+row is a record of an answer.
+
+Two consequences worth knowing:
+
+- **The bars are stored, not referenced.** `daily_prices` permits an upsert and a provider that
+  revises its split history rewrites it, so a run pointing there would change meaning when the
+  data changed.
+- **Reading a run back recalculates nothing.** `GET /backtest/runs/latest` is what the page reads
+  on load, and it restores the strategy, the instrument, the configuration and the results from
+  the row — spending no provider credit and showing yesterday's arithmetic under yesterday's
+  evidence. A restore that arrives after you have begun editing the form is **dropped**, because
+  a form being filled in is worth more than a response to a request made before you touched it.
+
+### The explanation, and why it is not a result
+
+**Explain results** asks a model to read the run's own figures and write four short paragraphs:
+what the strategy did, how it ended against buy-and-hold, what the drawdown means, and what the
+figures are not. The fact sheet is assembled in `app/backtest_explanation.facts` from the row —
+no arithmetic happens there and none is asked of the model.
+
+- **It is prose, not a calculation, and it says so.** The page names the model and the prompt
+  version, and says the text is not evidence and not a forecast.
+- **A figure the run does not contain is refused.** The prompt asks the model not to invent a
+  number; `_invented_figures` is what makes it a rule — a percentage or dollar amount in the
+  reply that the run's own row does not contain is discarded rather than stored, because prose
+  that reads like a measurement is worse than no prose. Rounding is allowed; bare integers,
+  years and counts are not checked.
+- **Failure is a state, not an error.** No key, a provider that will not answer, an unusable
+  reply: all come back as `unavailable` with a reason, and **the results stay on screen**. The
+  page offers *Try again* for a provider that might answer next time, and does not for a missing
+  key — which is not worth retrying.
+- **It is written once.** The text, the model and the prompt version are stored on the run
+  (`0017_backtest_explanation`) and reused, so a reload, a retry and a double click are one
+  explanation. A run that could not be explained keeps its nulls, so the next request tries
+  again rather than replaying the failure.
+
+### Doing it by hand
+
+Needs a Twelve Data key (`TWELVE_DATA_API_KEY`) for the price fetch. `DEEPSEEK_API_KEY` is only
+needed for the explanation, and everything else works without it.
+
+1. Open <http://localhost:5173> and go to **Backtest**.
+2. Choose **Moving Average Crossover**, pick a holding, and press **Run backtest**. Read the
+   curve, the buy-and-hold comparison, the drawdown, and the trade ledger.
+3. **Reload the page.** The strategy, the instrument, the dates, the costs and the results come
+   back from the stored run — no new provider request.
+4. Choose **RSI Reversion**. The form now shows period, entry and exit thresholds instead of a
+   fast and slow period, seeded from that strategy's own defaults. Run it.
+5. Press **Explain results** and wait. The paragraphs appear with the model and prompt version
+   under them. Reload: they are still there, without another model call.
+6. If `DEEPSEEK_API_KEY` is unset, step 5 says the explanation could not be written and offers no
+   retry, while every figure above it stays exactly where it was.

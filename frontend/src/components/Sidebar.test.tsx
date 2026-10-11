@@ -30,25 +30,33 @@ describe('Sidebar', () => {
       'Portfolio',
       'What if?',
       'News & Trading',
-      'Strategies',
       'Backtest',
       'Orders',
-      'Watchlist',
-      'Settings',
     ])
   })
 
-  it('marks the current page and disables the five that have no page', () => {
+  it('marks the current page and disables the one that has no page', () => {
     renderSidebar()
 
     const portfolio = screen.getByRole('button', { name: 'Portfolio' })
     expect(portfolio.getAttribute('aria-current')).toBe('page')
     expect(portfolio.hasAttribute('disabled')).toBe(false)
 
-    // Ten destinations, five built. The five without a page behind them are genuinely
-    // disabled rather than links that navigate nowhere.
-    expect(screen.getAllByTitle('Coming soon')).toHaveLength(5)
+    // Seven destinations, six built. The one without a page behind it is genuinely disabled
+    // rather than a link that navigates nowhere.
+    expect(screen.getAllByTitle('Coming soon')).toHaveLength(1)
     expect(screen.getByRole('button', { name: 'Dashboard' }).hasAttribute('disabled')).toBe(true)
+  })
+
+  it('enables Backtest, and reports it as the chosen destination', () => {
+    const onNavigate = renderSidebar('backtest')
+
+    const backtest = screen.getByRole('button', { name: 'Backtest' })
+    expect(backtest.hasAttribute('disabled')).toBe(false)
+    expect(backtest.getAttribute('aria-current')).toBe('page')
+
+    fireEvent.click(backtest)
+    expect(onNavigate).toHaveBeenCalledWith('backtest')
   })
 
   it('enables News & Trading, and reports it as the chosen destination', () => {

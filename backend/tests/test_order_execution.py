@@ -12,6 +12,7 @@ itself the property that "no submission without explicit approval" rests on.
 """
 
 import unittest
+from datetime import timedelta
 from decimal import Decimal
 from unittest import mock
 
@@ -33,6 +34,7 @@ from app.order_execution import (
 from tests.conversation_doubles import SessionProxy
 from tests.execution_doubles import (
     NOW,
+    approval_graph,
     FailureSafeTransaction,
     FakeBroker,
     a_proposal,
@@ -129,9 +131,17 @@ class ApprovalTestCase(FailureSafeTransaction, ToolTestCase):
         payload.update(overrides)
         word = payload.pop("decision")
         return decide(
-            proposal_id="prop-1", decision={"approve": "approved", "reject": "rejected"}[word],
+            proposal_id="prop-1",
+            decision={"approve": "approved", "reject": "rejected"}[word],
+            # The same fixed instant the broker's clock answers with. Everything this suite
+            # asserts about a session, a price drift or a timestamp is relative to it.
+            now=NOW,
             **payload,
         )
+
+    def graph(self):
+        """The approval graph, at the fixture's own clock. See `approval_graph`."""
+        return approval_graph(self.checkpointer)
 
     def stored_decisions(self):
         return list(self.session.query(RebalanceDecision).all())
@@ -371,11 +381,7 @@ class InterruptTest(ApprovalTestCase):
         """The plan that was validated is in the checkpoint, which is what lets a confirmation
         arriving later -- or in another process -- confirm *those* orders."""
         self.store()
-        from app.order_execution import prepare, record
-
-        graph = execution_graph.build_execution_graph(
-            prepare=prepare, record=record, checkpointer=self.checkpointer
-        )
+        graph = self.graph()
 
         state = execution_graph.start(graph, {"proposal_id": "prop-1", "idempotency_key": "k"})
 
@@ -394,11 +400,7 @@ class InterruptTest(ApprovalTestCase):
 
     def test_the_decided_plan_is_the_one_the_interrupt_was_showing(self):
         self.store()
-        from app.order_execution import prepare, record
-
-        graph = execution_graph.build_execution_graph(
-            prepare=prepare, record=record, checkpointer=self.checkpointer
-        )
+        graph = self.graph()
         paused = execution_graph.interrupted(
             execution_graph.start(graph, {"proposal_id": "prop-1", "idempotency_key": "k"})
         )
@@ -451,11 +453,7 @@ class InterruptTest(ApprovalTestCase):
     def test_a_renewal_leaves_the_thread_paused_so_a_confirmation_can_find_it(self):
         self.store()
         self.broker.positions["AAPL"] = ("50", "250.00")
-        from app.order_execution import prepare, record
-
-        graph = execution_graph.build_execution_graph(
-            prepare=prepare, record=record, checkpointer=self.checkpointer
-        )
+        graph = self.graph()
         self.approve()
 
         pending = execution_graph.pending_interrupt(graph, "prop-1")
@@ -467,11 +465,7 @@ class InterruptTest(ApprovalTestCase):
         """Not a permission and not a state: the only thing a decision endpoint can tell the
         graph is whether it is confirmed."""
         self.store()
-        from app.order_execution import prepare, record
-
-        graph = execution_graph.build_execution_graph(
-            prepare=prepare, record=record, checkpointer=self.checkpointer
-        )
+        graph = self.graph()
         execution_graph.start(graph, {"proposal_id": "prop-1", "idempotency_key": "k"})
 
         state = execution_graph.resume(graph, "prop-1", confirmed=True)
@@ -519,7 +513,7 @@ class ReplayTest(ApprovalTestCase):
         self.approve()
 
         second = decide(
-            proposal_id="prop-2", decision="approved", idempotency_key="key-2"
+            proposal_id="prop-2", decision="approved", idempotency_key="key-2", now=NOW
         )
 
         self.assertEqual(second.outcome, OUTCOME_REFUSED)
@@ -550,7 +544,15 @@ class PersistenceTest(ApprovalTestCase):
         self.session.flush()
 
         self.store(proposal_id="prop-2")
-        decide(proposal_id="prop-2", decision="approved", idempotency_key="key-2")
+        # A minute later, because "newest first" is a claim about two approvals made at
+        # different times. Two decisions sharing one instant would make the order a tie, and
+        # what a tie falls back to is a uuid comparison rather than anything about the run.
+        decide(
+            proposal_id="prop-2",
+            decision="approved",
+            idempotency_key="key-2",
+            now=NOW + timedelta(minutes=1),
+        )
 
         history = orders.batches()
         self.assertEqual(len(history), 2)
@@ -645,11 +647,7 @@ class PostgreSQLCheckpointTest(FailureSafeTransaction, ToolTestCase):
     def test_the_paused_plan_is_written_where_another_process_would_find_it(self):
         """A fresh graph object -- a different process, in effect -- reads the interrupt and the
         orders that were validated, and can resume from them."""
-        from app.order_execution import prepare, record
-
-        first = execution_graph.build_execution_graph(
-            prepare=prepare, record=record, checkpointer=self.checkpointer
-        )
+        first = approval_graph(self.checkpointer)
         paused = execution_graph.interrupted(
             execution_graph.start(
                 first,
@@ -662,9 +660,7 @@ class PostgreSQLCheckpointTest(FailureSafeTransaction, ToolTestCase):
         self.assertIsNotNone(paused)
 
         # A second graph, built from nothing the first one held in memory.
-        second = execution_graph.build_execution_graph(
-            prepare=prepare, record=record, checkpointer=self.checkpointer
-        )
+        second = approval_graph(self.checkpointer)
         pending = execution_graph.pending_interrupt(second, self.proposal["proposal_id"])
 
         self.assertIsNotNone(pending, "the interrupt must survive the process that made it")

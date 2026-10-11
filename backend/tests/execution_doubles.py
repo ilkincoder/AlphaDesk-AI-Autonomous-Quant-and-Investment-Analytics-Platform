@@ -608,6 +608,26 @@ _BROKER_TARGETS = {
 }
 
 
+def approval_graph(checkpointer: Any) -> Any:
+    """The approval graph with the fixed clock bound, exactly as `_approve` binds it.
+
+    The tests that drive the graph by hand -- to watch it pause, to read the interrupt back from
+    a second process -- build it themselves rather than going through a decision, because the
+    pause is the thing under test. Binding the clock here is the part that has to match
+    production: `prepare` judges the session and the price drift against it, and `FakeBroker`'s
+    canned clock describes the same instant. Left unbound, a session check would be comparing
+    the broker's answer for a day in September against whatever today happens to be.
+    """
+    from app.agent import execution_graph
+    from app.order_execution import prepare, record
+
+    return execution_graph.build_execution_graph(
+        prepare=lambda state: prepare(state, now=NOW),
+        record=lambda state: record(state, now=NOW),
+        checkpointer=checkpointer,
+    )
+
+
 @contextlib.contextmanager
 def fake_broker(broker: FakeBroker) -> Iterator[FakeBroker]:
     """Answer every Alpaca call from `broker`, in both modules that make them.

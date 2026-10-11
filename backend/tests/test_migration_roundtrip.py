@@ -14,6 +14,7 @@ in those tables yet to lose, and once there is, the answer is a backup, not a te
     docker compose exec backend python -m unittest discover -s tests -t .
 """
 
+import json
 import unittest
 
 from app.models import Base
@@ -22,7 +23,10 @@ from sqlalchemy.exc import IntegrityError
 
 from tests.testdb import alembic_revision, run_alembic, table_names, test_engine
 
-HEAD_REVISION = "0014_order_execution"
+HEAD_REVISION = "0017_backtest_explanation"
+REVISION_0016 = "0016_backtest_run_parameters"
+REVISION_0015 = "0015_backtest_runs"
+REVISION_0014 = "0014_order_execution"
 REVISION_0013 = "0013_rebalance_proposals"
 REVISION_0012 = "0012_news_release_checked_at"
 REVISION_0011 = "0011_news"
@@ -58,6 +62,39 @@ TABLES_FROM_0013 = frozenset({"rebalance_proposals"})
 TABLES_FROM_0014 = frozenset(
     {"rebalance_decisions", "execution_batches", "order_intents"}
 )
+TABLES_FROM_0015 = frozenset({"backtest_runs"})
+
+# The columns 0015 gave `backtest_runs` that neither 0016 nor 0017 removes, so 0017's downgrade
+# can be checked for taking away its own three and nothing else. `fast_period`/`slow_period` are
+# deliberately absent: 0016 replaces them, and the test for 0016 checks that they come back.
+BACKTEST_RUN_COLUMNS = frozenset(
+    {
+        "id",
+        "request_id",
+        "created_at",
+        "strategy_id",
+        "strategy_version",
+        "symbol",
+        "exchange",
+        "instrument_name",
+        "instrument_type",
+        "currency",
+        "start_date",
+        "end_date",
+        "initial_capital",
+        "commission_per_share",
+        "slippage_percent",
+        "provider",
+        "adjustment_basis",
+        "provider_adjust_mode",
+        "data_retrieved_at",
+        "data_first_date",
+        "data_last_date",
+        "data_sessions",
+        "input_snapshot",
+        "result",
+    }
+)
 
 # Every table any of our migrations creates, for the checks that only care that they are
 # all there or all gone.
@@ -70,6 +107,7 @@ ALL_INTRODUCED = (
     | TABLES_FROM_0011
     | TABLES_FROM_0013
     | TABLES_FROM_0014
+    | TABLES_FROM_0015
 )
 
 # Untouched by any of them, and the reason every downgrade has to be selective.
@@ -169,6 +207,117 @@ class MigrationRoundtripTest(unittest.TestCase):
             self.engine.dispose()
 
         self.assertLessEqual(TABLES_FROM_0014, table_names(self.engine))
+
+    def test_downgrading_0015_removes_only_the_backtest_table(self):
+        """0015 adds one table and alters nothing, so its downgrade should be exactly that
+        table going. Its index goes with it, which is checked by the table being gone -- an
+        index cannot outlive its table."""
+        run_alembic("downgrade", REVISION_0014)
+        try:
+            remaining = table_names(self.engine)
+
+            self.assertEqual(remaining & TABLES_FROM_0015, set())
+            self.assertLessEqual(EXISTING_TABLES, remaining)
+            self.assertLessEqual(
+                TABLES_FROM_0014,
+                remaining,
+                "0015's downgrade reached tables that belong to earlier migrations",
+            )
+            self.assertEqual(alembic_revision(self.engine), REVISION_0014)
+        finally:
+            run_alembic("upgrade", "head")
+            self.engine.dispose()
+
+        self.assertLessEqual(TABLES_FROM_0015, table_names(self.engine))
+
+    def test_downgrading_0017_removes_only_the_explanation_columns(self):
+        """0017 adds three nullable columns to a table it does not otherwise touch, so its
+        downgrade takes those three away and leaves the runs themselves alone."""
+        run_alembic("downgrade", REVISION_0016)
+        try:
+            with self.engine.connect() as connection:
+                columns = self._columns(connection, "backtest_runs")
+
+            for column in ("explanation", "explanation_model", "explanation_prompt_version"):
+                self.assertNotIn(column, columns)
+            self.assertLessEqual(
+                BACKTEST_RUN_COLUMNS,
+                columns,
+                "0017's downgrade reached columns that belong to 0015",
+            )
+            self.assertIn("backtest_runs", table_names(self.engine))
+            self.assertEqual(alembic_revision(self.engine), REVISION_0016)
+        finally:
+            run_alembic("upgrade", "head")
+            self.engine.dispose()
+
+        with self.engine.connect() as connection:
+            self.assertIn("explanation", self._columns(connection, "backtest_runs"))
+
+    def test_downgrading_0016_restores_the_period_columns_and_their_checks(self):
+        """0016 replaces two columns with one document, so its downgrade has to put them back
+        -- NOT NULL, with the constraints they carried -- and the upgrade has to convert them
+        back the other way.
+
+        **A row is written first, because moving data is the whole of what this migration
+        does.** Checking only that the columns reappear would pass on a downgrade that recreated
+        them empty, which is the one way this could destroy a run's configuration.
+        """
+        self._insert_run(parameters={"fast_period": 7, "slow_period": 9})
+
+        run_alembic("downgrade", REVISION_0015)
+        try:
+            with self.engine.connect() as connection:
+                columns = self._columns(connection, "backtest_runs")
+                row = connection.execute(
+                    text("SELECT fast_period, slow_period FROM backtest_runs WHERE id = 'roundtrip'")
+                ).one()
+
+            self.assertNotIn("parameters", columns)
+            self.assertLessEqual(BACKTEST_RUN_COLUMNS, columns)
+            # The values came back from the document, not from defaults.
+            self.assertEqual((row.fast_period, row.slow_period), (7, 9))
+            self.assertEqual(alembic_revision(self.engine), REVISION_0015)
+
+            # And the checks the columns carried are back with them.
+            with self.engine.connect() as connection:
+                restored = self._constraints(connection, "backtest_runs")
+            self.assertIn("ck_backtest_runs_fast_before_slow", restored)
+            self.assertIn("ck_backtest_runs_fast_period_min", restored)
+        finally:
+            run_alembic("upgrade", "head")
+            self.engine.dispose()
+
+        with self.engine.connect() as connection:
+            stored = connection.scalar(
+                text("SELECT parameters FROM backtest_runs WHERE id = 'roundtrip'")
+            )
+            columns = self._columns(connection, "backtest_runs")
+
+        self.assertEqual(stored, {"fast_period": 7, "slow_period": 9})
+        self.assertIn("parameters", columns)
+        self.assertNotIn("fast_period", columns)
+
+    def _insert_run(self, parameters: dict) -> None:
+        """One backtest row, complete enough to survive a downgrade and an upgrade."""
+        with self.engine.connect() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO backtest_runs ("
+                    "id, request_id, created_at, strategy_id, strategy_version, symbol, "
+                    "exchange, currency, start_date, end_date, initial_capital, parameters, "
+                    "commission_per_share, slippage_percent, provider, adjustment_basis, "
+                    "provider_adjust_mode, data_retrieved_at, data_first_date, data_last_date, "
+                    "data_sessions, input_snapshot, result"
+                    ") VALUES ("
+                    "'roundtrip', 'req-roundtrip', now(), 'moving_average_crossover', '1', "
+                    "'NVDA', 'NASDAQ', 'USD', '2024-01-05', '2024-01-12', 1000.00, "
+                    "CAST(:parameters AS jsonb), 0.005, 0.05, 'twelve_data', 'adjusted', "
+                    "'splits', now(), '2024-01-01', '2024-01-12', 10, '{}'::jsonb, '{}'::jsonb)"
+                ),
+                {"parameters": json.dumps(parameters)},
+            )
+            connection.commit()
 
     def test_downgrading_0012_removes_only_the_release_check_column(self):
         """0012 adds one nullable column and touches nothing else, so its downgrade should

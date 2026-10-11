@@ -14,6 +14,7 @@ found, and no route takes an account, a symbol or a quantity from the caller.
 
 import json
 import unittest
+from datetime import datetime, timedelta
 from decimal import Decimal
 from unittest import mock
 
@@ -22,6 +23,7 @@ from pydantic import ValidationError
 
 from app import orders
 from app.execution_api import get_batch, get_orders, post_decision
+from app.order_execution import decide
 from app.models import ExecutionBatch, Portfolio
 from app.schemas import ProposalDecisionRequest
 from tests.conversation_doubles import SessionProxy
@@ -85,6 +87,22 @@ class ApiTestCase(FailureSafeTransaction, ToolTestCase):
         )
         self.saver.start()
         self.addCleanup(self.saver.stop)
+
+        # **The route reads the wall clock; this suite's broker answers from a canned one.**
+        # Binding the two together is what makes the session check a comparison between two
+        # agreed instants rather than between a day in September and whatever today is. Only the
+        # clock is supplied -- the real `decide` still runs, so the route is still being driven
+        # through the code it actually calls.
+        #
+        # The instant is read from `self.clock` on every call rather than bound once, so a test
+        # that is *about* time -- two approvals, newest first -- can move it. Every other test
+        # leaves it alone and gets the fixture's instant.
+        self.clock = NOW
+        clock = mock.patch(
+            "app.execution_api.decide", lambda **kwargs: decide(now=self.clock, **kwargs)
+        )
+        clock.start()
+        self.addCleanup(clock.stop)
 
     def add_position(self, symbol: str, quantity: str, price: str) -> None:
         from app.models import Holding
@@ -190,6 +208,42 @@ class ApproveRouteTest(ApiTestCase):
         payload = self.body(response)
         self.assertEqual(payload["reason"], "market_closed")
         self.assertIn("closed", payload["detail"])
+
+    def test_a_session_with_too_little_left_is_a_400(self):
+        """The close is measured against the clock the decision was made at.
+
+        The fixture's broker closes an hour after its own instant, so this refusal only happens
+        if the injected clock is the one `prepare` compares against. Read from the wall clock
+        instead, the subtraction would be about a session that ended months ago -- and a plan
+        approved in the last minutes before a close is a DAY order sent to expire unfilled.
+        """
+        self.store()
+        self.broker.next_close = NOW + timedelta(seconds=30)
+
+        response = self.decide()
+
+        self.assertEqual(response.status_code, 400)
+        payload = self.body(response)
+        self.assertEqual(payload["reason"], "session_too_short")
+        self.assertIsNone(payload["batch_id"])
+        self.assertEqual(self.session.query(ExecutionBatch).count(), 0)
+
+    def test_an_open_market_approves_and_dates_the_decision_at_the_request_s_own_clock(self):
+        """Market open, and the instant the decision carries is the one it was judged at.
+
+        Both halves are the fix. `prepare` approves because an hour of the fixture's session is
+        left, and `record` stamps `decided_at` with that same instant -- one answer to "what time
+        is it" rather than two. A decision dated at some other moment would be one no reader
+        could reproduce from the record.
+        """
+        self.store()
+
+        response = self.decide()
+
+        self.assertEqual(response.status_code, 200)
+        payload = self.body(response)
+        self.assertEqual(payload["outcome"], "approved")
+        self.assertEqual(datetime.fromisoformat(payload["decision"]["decided_at"]), NOW)
 
     def test_an_unreachable_broker_is_reported_as_not_now(self):
         from app.alpaca import ProviderUnavailableError
@@ -323,6 +377,10 @@ class OrdersRouteTest(ApiTestCase):
         self.session.query(ExecutionBatch).one().status = orders.BATCH_COMPLETED
         self.session.flush()
 
+        # A minute later, because "newest first" is a claim about two approvals made at
+        # different times. Two sharing one instant would be a tie, and what a tie falls back to
+        # is a uuid comparison rather than anything about which was agreed to first.
+        self.clock = NOW + timedelta(minutes=1)
         self.store("prop-2")
         self.body(self.decide(proposal_id="prop-2", idempotency_key="key-2"))
 

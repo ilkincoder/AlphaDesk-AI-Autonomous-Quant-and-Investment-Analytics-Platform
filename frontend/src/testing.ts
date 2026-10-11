@@ -12,6 +12,9 @@ import { vi } from 'vitest'
 
 import type { ConversationHistory, Turn } from './analysisApi'
 import type {
+  BacktestInstrument,
+  BacktestRun,
+  BacktestStrategy,
   ExecutionBatch,
   OrderIntent,
   ProposalDecision,
@@ -452,6 +455,172 @@ export function anOrder(overrides: Partial<OrderIntent> = {}): OrderIntent {
     submitted_at: '2026-09-23T12:05:02+00:00',
     resolved_at: '2026-09-23T12:05:03+00:00',
     error: null,
+    ...overrides,
+  }
+}
+
+/** A strategy, as `GET /backtest/strategies` returns one.
+ *
+ * Copied from a real response, so the fields the page reads are the fields the API sends --
+ * including the bounds, which are the API's own numbers rather than anything the page chose.
+ */
+export function aStrategy(overrides: Partial<BacktestStrategy> = {}): BacktestStrategy {
+  return {
+    id: 'moving_average_crossover',
+    version: '1',
+    name: 'Moving Average Crossover',
+    summary:
+      'Buys when a fast simple moving average crosses above a slow one, and sells when it crosses back below.',
+    rules: [
+      'Both averages are simple moving averages of daily closing prices.',
+      'A bullish crossover (fast crossing above slow) is a buy signal while flat.',
+    ],
+    execution: [
+      "A signal executes at the next session's open, never at the close that produced it.",
+      'A final position still open at the end is marked to the last close, not sold.',
+    ],
+    parameters: [
+      { name: 'fast_period', label: 'Fast period (sessions)', default: 20, minimum: 2, maximum: 400 },
+      { name: 'slow_period', label: 'Slow period (sessions)', default: 50, minimum: 2, maximum: 400 },
+    ],
+    min_commission_per_share: '0',
+    max_commission_per_share: '1.00',
+    min_slippage_percent: '0',
+    max_slippage_percent: '5.00',
+    max_initial_capital: '100000000.00',
+    ...overrides,
+  }
+}
+
+/** The RSI strategy, with Wilder's defaults.
+ *
+ * Its three parameters are here rather than a period pair, which is the point: the catalogue
+ * describes a strategy's own settings, and the page renders whatever it is given.
+ */
+export function anRsiStrategy(overrides: Partial<BacktestStrategy> = {}): BacktestStrategy {
+  return aStrategy({
+    id: 'rsi_reversion',
+    name: 'RSI Reversion',
+    summary: 'Buys when Wilder’s RSI falls through an oversold threshold.',
+    parameters: [
+      { name: 'period', label: 'RSI period (sessions)', default: 14, minimum: 2, maximum: 400 },
+      { name: 'entry_threshold', label: 'Entry threshold (buy below this RSI)', default: 30, minimum: 1, maximum: 99 },
+      { name: 'exit_threshold', label: 'Exit threshold (sell above this RSI)', default: 70, minimum: 1, maximum: 99 },
+    ],
+    ...overrides,
+  })
+}
+
+/** One resolved listing, as a search result. */
+export function anInstrument(
+  overrides: Partial<BacktestInstrument> = {},
+): BacktestInstrument {
+  return {
+    symbol: 'NVDA',
+    name: 'NVIDIA Corporation',
+    exchange: 'NASDAQ',
+    instrument_type: 'Common Stock',
+    currency: 'USD',
+    country: 'United States',
+    ...overrides,
+  }
+}
+
+/** A completed run, as `POST /backtest/runs` returns one.
+ *
+ * Every number is a string, exactly as the API sends it, and the two curves are the same length
+ * with the same dates because that is what a run produces: one point per session, plus the
+ * opening balance.
+ */
+export function aBacktestRun(overrides: Partial<BacktestRun> = {}): BacktestRun {
+  return {
+    run_id: 'run-1',
+    request_id: 'req-1',
+    created_at: '2026-10-10T12:00:00+00:00',
+    strategy_id: 'moving_average_crossover',
+    strategy_version: '1',
+    strategy_name: 'Moving Average Crossover',
+    symbol: 'NVDA',
+    exchange: 'NASDAQ',
+    instrument_name: 'NVIDIA Corporation',
+    instrument_type: 'Common Stock',
+    currency: 'USD',
+    start_date: '2024-01-05',
+    end_date: '2024-01-12',
+    initial_capital: '1000.00',
+    parameters: { fast_period: 2, slow_period: 3 },
+    commission_per_share: '0.005',
+    slippage_percent: '0.05',
+    provider: 'twelve_data',
+    adjustment_basis: 'adjusted',
+    provider_adjust_mode: 'splits',
+    data_retrieved_at: '2026-10-10T12:00:00+00:00',
+    coverage: {
+      first_session: '2024-01-05',
+      last_session: '2024-01-12',
+      sessions: 3,
+      warmup_sessions: 4,
+      data_first_date: '2024-01-01',
+      data_last_date: '2024-01-12',
+      data_sessions: 10,
+    },
+    equity: [
+      { on: '2024-01-05', equity: '1000.00' },
+      { on: '2024-01-08', equity: '999.14' },
+      { on: '2024-01-12', equity: '714.43' },
+    ],
+    benchmark_equity: [
+      { on: '2024-01-05', equity: '1000.00' },
+      { on: '2024-01-08', equity: '1165.08' },
+      { on: '2024-01-12', equity: '833.08' },
+    ],
+    trades: [
+      {
+        executed_on: '2024-01-08',
+        side: 'buy',
+        quantity: 71,
+        price: '14.0070',
+        gross_value: '994.50',
+        commission: '0.36',
+        cash_after: '5.14',
+        signalled_on: '2024-01-05',
+      },
+      {
+        executed_on: '2024-01-12',
+        side: 'sell',
+        quantity: 71,
+        price: '9.9950',
+        gross_value: '709.65',
+        commission: '0.36',
+        cash_after: '714.43',
+        signalled_on: '2024-01-11',
+      },
+    ],
+    performance: {
+      final_value: '714.43',
+      total_return_percent: '-28.56',
+      max_drawdown_percent: '37.39',
+    },
+    benchmark: {
+      final_value: '833.08',
+      total_return_percent: '-16.69',
+      max_drawdown_percent: '37.41',
+    },
+    cash_remaining: '714.43',
+    open_position: null,
+    assumptions: [
+      "Signals execute at the next session's open, never at the close that produced them.",
+      'Commission is 0.005 USD per share, charged on each side of a trade.',
+    ],
+    limitations: [
+      'Prices are split-adjusted and not dividend-adjusted, so every figure here is a price return.',
+      'One instrument (NVDA), long only, fully invested or flat.',
+    ],
+    // Null is the ordinary state: a run is complete without an explanation, and one is only
+    // written when it is asked for.
+    explanation: null,
+    explanation_model: null,
+    explanation_prompt_version: null,
     ...overrides,
   }
 }

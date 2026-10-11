@@ -2,10 +2,18 @@
 
 Fetches one US stock's daily OHLCV bars and returns them as validated plain values.
 
-Deliberately free of database imports: `fetch_daily_bars` takes a ticker, an exchange
-and a bar count, and returns dataclasses of `Decimal`s. It writes nothing and stores
-nothing, so it can be tested without PostgreSQL and reused by the Module 1 tools that
-come later. Persisting bars is Step 4's job, not this module's.
+Two ways of asking for bars, because they are two different questions: `fetch_daily_bars`
+takes a ticker, an exchange and a bar *count* and returns the most recent N sessions, while
+`fetch_daily_bars_range` takes a ticker, an exchange and two *dates* and returns every
+session between them. Only the second can reach history that ends in the past, which is what
+a backtest over a chosen period needs. `search_instruments` is the third call here: it turns
+a ticker or a company name into the specific US-dollar listings that match it, which is what
+lets a person choose an instrument rather than type one.
+
+Deliberately free of database imports: every function here takes its arguments and returns
+dataclasses of `Decimal`s. Nothing writes and nothing stores, so it can be tested without
+PostgreSQL and reused by the Module 1 tools that come later. Persisting bars is Step 4's
+job, not this module's.
 
 Three decisions are worth knowing before reading the code:
 
@@ -55,9 +63,28 @@ ADJUSTMENT_BASIS = "adjusted"
 
 API_BASE_URL = "https://api.twelvedata.com"
 TIME_SERIES_PATH = "/time_series"
+SYMBOL_SEARCH_PATH = "/symbol_search"
 
 DEFAULT_BARS = 30
 MAX_BARS = 500
+
+# The ceiling on one date-bounded request. A range is asked for in calendar days and the
+# provider answers with however many sessions fall inside it, so this is the one place a
+# very long backtest could ask for an unreasonable amount of data in a single call. Thirty
+# years is more sessions than any daily strategy here would be run over; the measured cost
+# is that eleven years came back as 2,766 bars in one response.
+MAX_RANGE_SESSIONS = 8000
+
+# How many matches a symbol search returns. The provider's own result set is global and
+# can be long, and a list nobody scrolls to the end of is not more useful for being longer.
+MAX_SEARCH_RESULTS = 20
+
+# The provider's vocabulary for a listing's country and currency. Both are checked when a
+# search result is offered, and again when a ticker with no exchange is resolved: this
+# application backtests one USD-denominated US listing, and a same-ticker row on another
+# exchange is a different instrument with a different price series.
+UNITED_STATES = "United States"
+USD = "USD"
 
 # Asked for on top of the requested count. One slot covers the current session, which the
 # date policy drops; the second covers a provider that reports a date ahead of the
@@ -158,6 +185,41 @@ class DailyPriceSeries:
         return len(self.bars)
 
 
+@dataclass(frozen=True)
+class DailyBarRange:
+    """Validated daily bars for one instrument over a requested *date* range, oldest first.
+
+    A separate type from `DailyPriceSeries` because the two requests are different facts.
+    That one asks for "the most recent N sessions" and its `requested_bars` is a count that
+    the returned bars can be checked against; this one asks for "every session between two
+    dates", where a count is not what was asked for and a returned count is not something
+    the request can be wrong about. Folding the second into the first would leave a
+    `requested_bars` field that means nothing on half its rows.
+
+    The requested dates are kept beside the returned ones because they are usually not the
+    same: `start` and `end` are calendar days and may fall on a weekend or an exchange
+    holiday, so the coverage actually obtained is `bars[0]` to `bars[-1]`, and a caller that
+    wants to report what it used has to say which of the two it means.
+    """
+
+    symbol: str
+    exchange: str
+    currency: str
+    exchange_timezone: str
+    provider: str
+    interval: str
+    adjustment_basis: str
+    provider_adjust_mode: str
+    retrieved_at: datetime
+    requested_start: date
+    requested_end: date
+    bars: tuple[DailyBar, ...]
+
+    @property
+    def returned_bars(self) -> int:
+        return len(self.bars)
+
+
 def redact(text: str, *secrets: str | None) -> str:
     """Replace any of `secrets` appearing in `text` with a fixed marker.
 
@@ -207,7 +269,10 @@ def fetch_daily_bars(
     retrieved_at = now if now is not None else datetime.now(timezone.utc)
 
     payload = _request(
-        resolved_key, normalized_symbol, normalized_exchange, bars, transport
+        resolved_key,
+        TIME_SERIES_PATH,
+        _recent_bars_params(normalized_symbol, normalized_exchange, bars),
+        transport,
     )
 
     meta = payload.get("meta")
@@ -251,6 +316,264 @@ def fetch_daily_bars(
     )
 
 
+def fetch_daily_bars_range(
+    symbol: str,
+    exchange: str,
+    start: date,
+    end: date,
+    *,
+    api_key: str | None = None,
+    transport: httpx.BaseTransport | None = None,
+    now: datetime | None = None,
+) -> DailyBarRange:
+    """Fetch every completed daily bar for `symbol` between `start` and `end`, inclusive.
+
+    Where `fetch_daily_bars` asks for a count, this asks for a period. The provider
+    answers with whatever sessions fall inside it, which is the only way to obtain history
+    that ends in the past -- "the most recent N" cannot express "the year before last".
+
+    The same three guarantees `fetch_daily_bars` makes hold here, through the same code:
+    prices stay exact `Decimal`s, the exchange's current session and any later date are
+    dropped, and two contradictory bars for one date are refused rather than resolved.
+
+    A range that contains no sessions is not an error. It is a real answer -- a weekend, a
+    market holiday, a delisted ticker -- and the caller decides what to say about it.
+    """
+    normalized_symbol = _validate_symbol(symbol)
+    normalized_exchange = _validate_exchange(exchange)
+    _validate_range(start, end)
+
+    resolved_key = api_key if api_key is not None else _configured_api_key()
+    if not resolved_key or not resolved_key.strip():
+        raise MissingApiKeyError(
+            "No Twelve Data API key is configured. Set TWELVE_DATA_API_KEY in .env, "
+            "then run: docker compose up -d backend"
+        )
+
+    retrieved_at = now if now is not None else datetime.now(timezone.utc)
+
+    payload = _request(
+        resolved_key,
+        TIME_SERIES_PATH,
+        _range_bars_params(normalized_symbol, normalized_exchange, start, end),
+        transport,
+    )
+
+    meta = payload.get("meta")
+    if not isinstance(meta, dict):
+        raise MalformedResponseError(
+            "Twelve Data's response has no 'meta' object, so it cannot be checked "
+            "against what was requested"
+        )
+    _verify_meta(meta, normalized_symbol, normalized_exchange)
+
+    raw_values = payload.get("values")
+    if not isinstance(raw_values, list):
+        raise MalformedResponseError(
+            "Twelve Data's response has no 'values' list, so it contains no bars"
+        )
+
+    parsed = [_parse_bar(raw) for raw in raw_values]
+    completed = _drop_incomplete_sessions(
+        _collapse_duplicate_dates(parsed), meta["exchange_timezone"], retrieved_at
+    )
+    completed.sort(key=lambda item: item.trading_date)
+
+    # A bar outside the dates asked for is not kept. The provider is asked for a range and
+    # answers with one, but a caller reporting "the sessions this run used" must be able to
+    # trust that the tuple it was handed is inside the period it named.
+    completed = [bar for bar in completed if start <= bar.trading_date <= end][
+        :MAX_RANGE_SESSIONS
+    ]
+
+    return DailyBarRange(
+        symbol=normalized_symbol,
+        exchange=meta["exchange"].strip().upper(),
+        currency=meta["currency"].strip(),
+        exchange_timezone=meta["exchange_timezone"].strip(),
+        provider=PROVIDER,
+        interval=INTERVAL,
+        adjustment_basis=ADJUSTMENT_BASIS,
+        provider_adjust_mode=ADJUST_MODE,
+        retrieved_at=retrieved_at,
+        requested_start=start,
+        requested_end=end,
+        bars=tuple(completed),
+    )
+
+
+@dataclass(frozen=True)
+class InstrumentMatch:
+    """One listing a symbol search found.
+
+    `country` and `currency` are carried even though the search already filtered on them,
+    because they are what makes the match a US-dollar listing rather than a same-ticker row
+    somewhere else -- and a caller that stores which instrument it resolved should store the
+    reason it is that instrument, not only its name.
+    """
+
+    symbol: str
+    name: str
+    exchange: str
+    instrument_type: str
+    currency: str
+    country: str
+
+
+def search_instruments(
+    query: str,
+    *,
+    limit: int = MAX_SEARCH_RESULTS,
+    api_key: str | None = None,
+    transport: httpx.BaseTransport | None = None,
+) -> tuple[InstrumentMatch, ...]:
+    """Find US-listed, USD-denominated instruments matching `query`, best match first.
+
+    `query` may be a ticker (`"NVDA"`) or a company name (`"nvidia"`) -- the provider
+    matches on either, which is why this endpoint exists rather than a ticker lookup that
+    would have to guess a symbol from a name.
+
+    **The filtering is the point.** The provider's search is global: `"apple"` returns
+    AAPL on NASDAQ, the same ticker on the Mexican and Colombian exchanges, and a London
+    line under a different symbol, in Mexican pesos and Argentine pesos. Everything this
+    application does is USD-denominated, so a match is kept only when its country is the
+    United States *and* its currency is USD. A caller offering a result to a person is
+    offering a specific listing, and this is the filter that makes it specific.
+
+    Results keep the provider's own relevance order. An empty tuple is a real answer: the
+    query matched nothing, which is what an unknown ticker looks like. Nothing is guessed
+    from a near match, and no ticker is synthesised from a name.
+    """
+    normalized = _validate_query(query)
+    capped = _validate_search_limit(limit)
+
+    resolved_key = api_key if api_key is not None else _configured_api_key()
+    if not resolved_key or not resolved_key.strip():
+        raise MissingApiKeyError(
+            "No Twelve Data API key is configured. Set TWELVE_DATA_API_KEY in .env, "
+            "then run: docker compose up -d backend"
+        )
+
+    payload = _request(
+        resolved_key,
+        SYMBOL_SEARCH_PATH,
+        {
+            "symbol": normalized,
+            # Asked for more than will be returned, because the filter below discards a
+            # large share of a global result set: "apple" is mostly non-US listings.
+            "outputsize": capped * 4,
+            "format": "JSON",
+        },
+        transport,
+    )
+
+    raw_matches = payload.get("data")
+    if not isinstance(raw_matches, list):
+        raise MalformedResponseError(
+            "Twelve Data's symbol search has no 'data' list, so it contains no matches"
+        )
+
+    matches: list[InstrumentMatch] = []
+    for raw in raw_matches:
+        match = _parse_match(raw)
+        if match is None:
+            continue
+        if match.country != UNITED_STATES or match.currency != USD:
+            continue
+        matches.append(match)
+        if len(matches) >= capped:
+            break
+
+    return tuple(matches)
+
+
+def _validate_query(query: str) -> str:
+    if not isinstance(query, str) or not query.strip():
+        raise InvalidRequestError(
+            "a symbol search needs something to look for, for example NVDA or nvidia"
+        )
+
+    normalized = query.strip()
+    if len(normalized) > 64:
+        raise InvalidRequestError("a symbol search looks for at most 64 characters")
+    return normalized
+
+
+def _validate_search_limit(limit: int) -> int:
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        raise InvalidRequestError("the search limit must be a whole number")
+    if not 1 <= limit <= MAX_SEARCH_RESULTS:
+        raise InvalidRequestError(
+            f"the search limit must be between 1 and {MAX_SEARCH_RESULTS}, got {limit}"
+        )
+    return limit
+
+
+def _parse_match(raw: Any) -> InstrumentMatch | None:
+    """One search result, or `None` if it does not carry what makes it an instrument.
+
+    A result missing its symbol or its exchange is not one a person could choose between,
+    so it is dropped rather than completed with a blank. A missing country or currency is
+    the same: those two are precisely what the caller filters on, and a row that does not
+    state them cannot be shown to be a US-dollar listing.
+    """
+    if not isinstance(raw, dict):
+        return None
+
+    fields = {
+        "symbol": raw.get("symbol"),
+        "name": raw.get("instrument_name"),
+        "exchange": raw.get("exchange"),
+        "instrument_type": raw.get("instrument_type"),
+        "currency": raw.get("currency"),
+        "country": raw.get("country"),
+    }
+    for value in fields.values():
+        if not isinstance(value, str) or not value.strip():
+            return None
+
+    return InstrumentMatch(
+        symbol=fields["symbol"].strip().upper(),
+        # The provider's own spelling is kept for a name: it is the company's, not this
+        # application's, and title-casing it would be inventing a fact about a company.
+        name=fields["name"].strip(),
+        exchange=fields["exchange"].strip().upper(),
+        instrument_type=fields["instrument_type"].strip(),
+        currency=fields["currency"].strip(),
+        country=fields["country"].strip(),
+    )
+
+
+def _validate_range(start: date, end: date) -> None:
+    if not isinstance(start, date) or not isinstance(end, date):
+        raise InvalidRequestError("a date range needs two dates")
+    if start >= end:
+        raise InvalidRequestError(
+            f"the range start ({start}) must be before its end ({end})"
+        )
+
+
+def _range_bars_params(
+    symbol: str, exchange: str, start: date, end: date
+) -> dict[str, Any]:
+    """The query for every session between two dates.
+
+    No `outputsize` and no `order`: with both bounds given there is nothing ambiguous for
+    either to disambiguate, and sending an `outputsize` would cap a range at a count
+    nobody asked for. The provider answers newest-first here, and the bars are sorted
+    oldest-first afterwards either way.
+    """
+    return {
+        "symbol": symbol,
+        "exchange": exchange,
+        "interval": INTERVAL,
+        "adjust": ADJUST_MODE,
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+        "format": "JSON",
+    }
+
+
 def _configured_api_key() -> str | None:
     """The key from application settings, imported here rather than at module level.
 
@@ -284,24 +607,9 @@ def _validate_exchange(exchange: str) -> str:
     return exchange.strip().upper()
 
 
-def _validate_bar_count(bars: int) -> None:
-    # `bool` is an `int` subclass, and `--bars` reaching here as `True` would silently
-    # mean one bar.
-    if isinstance(bars, bool) or not isinstance(bars, int):
-        raise InvalidRequestError("bars must be a whole number")
-    if not 1 <= bars <= MAX_BARS:
-        raise InvalidRequestError(f"bars must be between 1 and {MAX_BARS}, got {bars}")
-
-
-def _request(
-    api_key: str,
-    symbol: str,
-    exchange: str,
-    bars: int,
-    transport: httpx.BaseTransport | None,
-) -> dict[str, Any]:
-    """Make the one HTTP call, and turn any transport failure into a typed error."""
-    params = {
+def _recent_bars_params(symbol: str, exchange: str, bars: int) -> dict[str, Any]:
+    """The query for the most recent `bars` completed sessions."""
+    return {
         "symbol": symbol,
         "exchange": exchange,
         "interval": INTERVAL,
@@ -314,6 +622,30 @@ def _request(
         "format": "JSON",
     }
 
+
+def _validate_bar_count(bars: int) -> None:
+    # `bool` is an `int` subclass, and `--bars` reaching here as `True` would silently
+    # mean one bar.
+    if isinstance(bars, bool) or not isinstance(bars, int):
+        raise InvalidRequestError("bars must be a whole number")
+    if not 1 <= bars <= MAX_BARS:
+        raise InvalidRequestError(f"bars must be between 1 and {MAX_BARS}, got {bars}")
+
+
+def _request(
+    api_key: str,
+    path: str,
+    params: dict[str, Any],
+    transport: httpx.BaseTransport | None,
+) -> dict[str, Any]:
+    """Make the one HTTP call, and turn any transport failure into a typed error.
+
+    The path and the parameters are the caller's, because more than one endpoint of the same
+    provider is read through here: the two time-series shapes and the symbol search all
+    share this function's authentication, timeout and error mapping rather than repeating
+    them. Nothing about the *response* is endpoint-specific in a way this layer needs to
+    know -- it decodes a JSON object and hands it back.
+    """
     timeout = httpx.Timeout(
         connect=CONNECT_TIMEOUT_SECONDS,
         read=READ_TIMEOUT_SECONDS,
@@ -326,7 +658,7 @@ def _request(
         # nothing is left holding a socket.
         with httpx.Client(transport=transport, timeout=timeout) as client:
             response = client.get(
-                f"{API_BASE_URL}{TIME_SERIES_PATH}",
+                f"{API_BASE_URL}{path}",
                 params=params,
                 headers={
                     "Authorization": f"apikey {api_key}",

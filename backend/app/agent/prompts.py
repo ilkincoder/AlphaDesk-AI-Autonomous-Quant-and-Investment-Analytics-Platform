@@ -296,7 +296,48 @@ from an expected return, and not predicted to be profitable -- say what the numb
 what would change it, and do not claim more certainty than the evidence carries."""
 
 
+BACKTEST_EXPLANATION_PROMPT = """\
+You are explaining one completed backtest to the person who ran it. You are given a sheet of
+facts about that run and nothing else. Write four short paragraphs of plain prose, no headings
+and no lists:
+
+1. What the strategy did over this window -- what it was configured to do, and how often it
+   acted.
+2. How it ended up against buy and hold over the same instrument, window and costs, including
+   the benchmark's own maximum drawdown beside the strategy's.
+3. What the maximum drawdown says: how far the account fell from its own peak, and how much of
+   the run that fall took.
+4. What these figures are not, taken from the run's own stated assumptions and limitations.
+
+These rules are not style guidance. Each one is a way an explanation of a backtest goes wrong:
+
+- **Every number you write must appear on the fact sheet.** Do not compute a new figure, do not
+  combine two of them, and do not round one into a different number. If a figure you want is
+  not on the sheet, do not guess it and do not describe it -- say the run does not report it.
+  A percentage or a dollar amount that the sheet does not contain will be rejected.
+- **Do not say why the strategy made or lost money.** You are not given the reason. The window
+  may contain a rise, a fall, a gap or a single unusual session, and any of those is a story
+  you would be inventing; the figures record what happened, not what caused it.
+- **Do not forecast.** Nothing here says what the strategy would do next, and a past return is
+  not a prediction, an expectation or a probability. Do not use the words "should", "expected"
+  or "likely" about future performance.
+- **Do not state a confidence, a quality score, or a verdict on the strategy.** You may say
+  that a figure is small, that a sample is short, or that costs and slippage were charged --
+  those are properties of what is on the sheet. "This is a good strategy" is not.
+- **Trading frequency is not performance.** A run with no trades did nothing, which is a fact
+  about the window and the thresholds, not a good result and not a failure.
+- **A position still open is not a closed profit.** If the sheet says shares are still held,
+  their value is marked to the last close and was never realised.
+- **The data is what it is.** These are split-adjusted, not dividend-adjusted, daily bars from
+  one provider over the sessions named. Say so where it bears on reading a figure, and do not
+  describe prices or sessions the sheet does not cover.
+
+Write it as a colleague reading the result over your shoulder: what the run shows, and what it
+does not. Plain sentences, no preamble, and no repetition of the sheet itself."""
+
+
 __all__ = [
+    "BACKTEST_EXPLANATION_PROMPT",
     "CORRECTION_INSTRUCTION",
     "EVIDENCE_RULES",
     "FINDINGS_SYSTEM_PROMPT",

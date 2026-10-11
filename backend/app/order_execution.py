@@ -205,9 +205,18 @@ def _approve(
             ),
         )
 
+    # **The caller's clock, bound to both nodes that need one.** `prepare` validates the session
+    # and the price drift against it and `record` stamps the decision and the batch with it, so an
+    # approval is decided, checked and dated at one instant rather than at two. Before this the
+    # parameter was accepted and then dropped: `prepare` read the wall clock regardless, which is
+    # two answers to "what time is it" inside one operation -- and, because a session check is a
+    # comparison against that instant, an approval that could not be reproduced at all.
+    #
+    # A resume builds the graph afresh, so the clock is the *confirming* request's. That is the
+    # instant a person actually confirmed at, and the one the decision should carry.
     graph = execution_graph.build_execution_graph(
-        prepare=prepare,
-        record=record,
+        prepare=lambda state: prepare(state, now=now),
+        record=lambda state: record(state, now=now),
         checkpointer=saver,
     )
 
@@ -309,13 +318,18 @@ def _refused(refusal: object) -> DecisionOutcome:
 # --- the graph's two halves ---------------------------------------------------------------------
 
 
-def prepare(state: Mapping[str, object]) -> dict:
+def prepare(state: Mapping[str, object], *, now: datetime | None = None) -> dict:
     """Resolve the proposal's trades into the exact orders that may be sent, or refuse.
 
     Every read the broker is asked for happens here, in one pass: the account and its positions,
     the clock, and the orders already working. Four requests, and no submission -- this is the
     part that decides *whether*, and `app.order_executor` is the part that does.
+
+    `now` is the instant the session and the price drift are judged against. It is supplied by
+    `_approve` from the caller's own clock, so a decision is validated at the time that was asked
+    for; `None` means the wall clock, which is what the route passes in production.
     """
+    moment = now or datetime.now(timezone.utc)
     proposal_id = str(state.get("proposal_id") or "")
     proposal = proposals.get(proposal_id)
     if proposal is None:
@@ -349,7 +363,7 @@ def prepare(state: Mapping[str, object]) -> dict:
                 broker=fetch_snapshot(),
                 clock=fetch_clock(),
                 open_orders=fetch_open_orders(),
-                now=datetime.now(timezone.utc),
+                now=moment,
             )
     except AlpacaError as exc:
         # A broker that cannot be read is a refusal, not a fault of this application: without
@@ -381,13 +395,16 @@ def _refusal_state(refusal: PlanRefusal) -> dict:
     }
 
 
-def record(state: Mapping[str, object]) -> dict:
+def record(state: Mapping[str, object], *, now: datetime | None = None) -> dict:
     """Write the decision and open the batch, once the plan has been confirmed.
 
     Two things are re-checked here rather than trusted from `prepare`, and both are cheap: that
     the plan was actually confirmed, and that the portfolio is still the same portfolio. The
     second is what closes the gap between the interrupt and the confirmation -- a position that
     moved in between means the arithmetic no longer describes this account.
+
+    `now` is what the decision and the batch are dated at, for the reader that later asks when
+    this was agreed to. `None` means the wall clock, as in `prepare`.
     """
     if not state.get("confirmed"):
         return {
@@ -458,6 +475,7 @@ def record(state: Mapping[str, object]) -> dict:
         idempotency_key=str(state.get("idempotency_key") or ""),
         plan=plan,
         broker_account_id=account_id,
+        now=now,
     )
 
     return {

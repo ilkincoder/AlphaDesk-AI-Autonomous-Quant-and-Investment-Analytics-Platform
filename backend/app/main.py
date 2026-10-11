@@ -19,6 +19,7 @@ from app.alpaca import (
 )
 from app.agent import checkpointing, recovery
 from app.analysis_api import router as analysis_router
+from app.backtest_api import router as backtest_router
 from app.execution_api import router as orders_router
 from app.db import engine, get_session
 from app.news_api import router as news_router
@@ -94,6 +95,11 @@ app.include_router(rebalance_router)
 # this application that can cause an order to exist, and it does so by recording a decision and
 # opening a batch -- `app.order_executor` is what submits, from its own thread.
 app.include_router(orders_router)
+
+# Backtesting. The only feature in this application that reads prices and reaches no broker:
+# it simulates trades over sessions that have already happened, and there is no route in it
+# that could send an order anywhere.
+app.include_router(backtest_router)
 
 
 @app.get("/health")
