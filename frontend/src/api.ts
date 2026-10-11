@@ -66,34 +66,6 @@ export class ApiError extends Error {
   }
 }
 
-/** Mirrors `ScenarioOut` in backend/app/schemas.py. */
-export type Scenario = {
-  portfolio_id: number
-  currency: string
-  price_source: string
-  last_synced_at: string | null
-  symbol: string
-  price_change_percent: string
-  price_before: string
-  price_after: string
-  holding_value_before: string
-  holding_value_after: string
-  total_value_before: string
-  total_value_after: string
-  change_value: string
-  change_percent: string | null
-}
-
-/** What the scenario endpoint accepts.
- *
- * The percentage is a *string*, deliberately: `Decimal` on the far side parses it
- * exactly, whereas a JSON number would have been through a float first.
- */
-export type ScenarioBody = {
-  symbol: string
-  price_change_percent: string
-}
-
 /** Mirrors `NewsArticleOut` in backend/app/schemas.py.
  *
  * Two times on every article, and they are not interchangeable: `published_at` is when the
@@ -259,20 +231,6 @@ export function fetchValuation(signal?: AbortSignal): Promise<Valuation> {
  * positions, and places no orders. */
 export function syncPortfolio(signal?: AbortSignal): Promise<SyncResult> {
   return request<SyncResult>('/api/portfolio/sync', { method: 'POST', signal })
-}
-
-/** POST, because the question has a body rather than a path: "what if *this* symbol
- *  moved by *this* much". Nothing is stored on the server. */
-export function fetchScenario(
-  body: ScenarioBody,
-  signal?: AbortSignal,
-): Promise<Scenario> {
-  return request<Scenario>('/api/portfolio/scenario', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-    signal,
-  })
 }
 
 /** Prefer the backend's own wording.

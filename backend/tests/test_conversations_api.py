@@ -31,6 +31,7 @@ from app.analysis_api import (
     post_conversation,
 )
 from app.analysis_api import get_conversation as get_conversation_route
+from app.analysis_api import get_latest_analysis
 from app.conversations import (
     Busy,
     Claimed,
@@ -924,6 +925,114 @@ class RunsNothingElseTests(ChatTestCase):
             table for table in before if before[table] != after[table]
         }
         self.assertEqual(changed, {"conversations", "conversation_turns"})
+
+
+class LatestAnalysisTests(ChatTestCase):
+    """The one cross-conversation read: what the last completed Module 1 analysis was.
+
+    The Dashboard needs this without knowing which conversation a run happened in. Everything
+    else in the store is scoped to one conversation, so the interesting property here is that
+    "latest" is decided by the row's own facts -- it completed, and it was routed to Module 1 --
+    rather than by anything the caller says.
+    """
+
+    def a_completed_analysis(
+        self,
+        *,
+        destination: str | None = "module1_analysis",
+        status: str = "completed",
+        symbol: str = "NVDA",
+        request_id: str = "req-1",
+    ) -> ConversationTurn:
+        """Drive one real turn through the API, so the row under test was written by the app."""
+        conversation_id = self.start()
+        result = a_result(
+            status=status, symbol=symbol, answer="a long stored answer"
+        ).model_copy(update={"destination": destination})
+        self.ask(conversation_id, ScriptedAnalysis([result]), request_id=request_id)
+
+        # Scoped to the conversation this call opened. Every conversation numbers its turns from
+        # one, so ordering by `sequence` alone would pick an arbitrary turn once a test has two.
+        return self.session.scalars(
+            select(ConversationTurn).where(
+                ConversationTurn.conversation_id == conversation_id
+            )
+        ).first()
+
+    def set_completed_at(self, turn: ConversationTurn, when: datetime) -> None:
+        """Pin a turn's completion time, so "latest" is decided by this test and not by timing."""
+        turn.completed_at = when
+        turn.created_at = when
+        self.session.flush()
+        self.session.expire_all()
+
+    def test_no_analysis_yet_is_an_explicit_null(self):
+        """A Dashboard loading itself asks "is there one?", and "no" is an answer."""
+        body = get_latest_analysis()
+
+        self.assertIsNone(body.analysis)
+
+    def test_the_most_recently_completed_analysis_is_the_one_reported(self):
+        earlier = self.a_completed_analysis(symbol="NVDA", request_id="req-1")
+        later = self.a_completed_analysis(symbol="MSFT", request_id="req-2")
+        self.set_completed_at(earlier, datetime(2026, 9, 1, tzinfo=timezone.utc))
+        self.set_completed_at(later, datetime(2026, 9, 2, tzinfo=timezone.utc))
+
+        body = get_latest_analysis()
+
+        self.assertIsNotNone(body.analysis)
+        self.assertEqual(body.analysis.turn_id, later.id)
+        self.assertEqual(body.analysis.symbol, "MSFT")
+
+    def test_a_run_that_did_not_complete_is_not_reported_as_the_latest_analysis(self):
+        """A clarification is a question, not an answer, and reporting it would present one as
+        the other."""
+        self.a_completed_analysis(status="clarification_needed")
+
+        self.assertIsNone(get_latest_analysis().analysis)
+
+    def test_a_turn_routed_elsewhere_is_not_reported_as_an_analysis(self):
+        self.a_completed_analysis(destination="company_not_stored")
+
+        self.assertIsNone(get_latest_analysis().analysis)
+
+    def test_a_turn_stored_before_destinations_were_recorded_is_passed_over(self):
+        """A turn with no destination cannot be claimed to be a Module 1 analysis."""
+        self.a_completed_analysis(destination=None)
+
+        self.assertIsNone(get_latest_analysis().analysis)
+
+    def test_the_summary_carries_the_instrument_the_window_and_the_completion_time(self):
+        turn = self.a_completed_analysis()
+        self.set_completed_at(turn, datetime(2026, 9, 19, 19, 8, 35, tzinfo=timezone.utc))
+
+        analysis = get_latest_analysis().analysis
+
+        self.assertEqual(analysis.status, "completed")
+        self.assertEqual(analysis.symbol, "NVDA")
+        self.assertEqual(analysis.destination, "module1_analysis")
+        self.assertEqual(analysis.start_date, "2026-08-06")
+        self.assertEqual(analysis.end_date, "2026-09-17")
+        self.assertEqual(analysis.as_of, "2026-09-17")
+        self.assertTrue(analysis.completed_at.startswith("2026-09-19T19:08:35"))
+
+    def test_the_summary_does_not_carry_the_stored_answer(self):
+        """The answer is the Analysis page's to render. Shipping it here would put a whole
+        markdown document on the wire to draw one line of a Dashboard."""
+        self.a_completed_analysis()
+
+        rendered = get_latest_analysis().model_dump_json()
+
+        self.assertNotIn("a long stored answer", rendered)
+
+    def test_reading_the_latest_analysis_writes_nothing(self):
+        """A read. No model is asked, nothing is ingested, and no row changes."""
+        self.a_completed_analysis()
+        before = self.counts()
+
+        get_latest_analysis()
+
+        self.assert_wrote_nothing(before)
 
 
 if __name__ == "__main__":

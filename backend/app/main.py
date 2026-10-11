@@ -3,8 +3,6 @@
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from decimal import Decimal
-
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
@@ -29,19 +27,11 @@ from app.schemas import (
     PortfolioOut,
     PortfolioSyncOut,
     PortfolioValuationOut,
-    ScenarioOut,
-    ScenarioRequest,
     ValuationHoldingOut,
 )
 from app.portfolio_identity import DEMO_PORTFOLIO_NAME, find
-from app.valuation import (
-    HoldingNotFoundError,
-    MissingPriceError,
-    calculate_scenario,
-    calculate_valuation,
-)
+from app.valuation import MissingPriceError, calculate_valuation
 
-_HUNDRED = Decimal("100")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -264,61 +254,3 @@ def _missing_price_detail(portfolio: Portfolio, exc: MissingPriceError) -> str:
         "(POST /portfolio/sync); no demo price is used as a substitute."
     )
 
-
-@app.post("/portfolio/scenario", response_model=ScenarioOut)
-def post_portfolio_scenario(
-    payload: ScenarioRequest,
-    session: Session = Depends(get_session),
-) -> ScenarioOut:
-    """Re-price one holding and report the hypothetical impact.
-
-    POST rather than GET because the question has a body, not a path: "what if *this*
-    symbol moved by *this* much". Nothing is stored — the same rows are read, arithmetic
-    is applied, and the answer is returned.
-
-    The percentage becomes a fraction here, not in the calculation: `calculate_scenario`
-    takes a fraction, so the parsing and the -100..+100 bound (enforced by
-    `ScenarioRequest`) stay on this side of the boundary.
-
-    The prices are the same ones `GET /portfolio/valuation` would use, through the same
-    `app.portfolio_prices` call -- so a scenario over a synchronised portfolio moves the
-    broker's prices, never a fictional one, and its "before" column is the valuation's.
-    """
-    portfolio = _load_portfolio(session)
-    basis = _price_basis(portfolio)
-
-    try:
-        scenario = calculate_scenario(
-            portfolio.holdings,
-            portfolio.cash_balance,
-            basis.prices,
-            payload.symbol,
-            payload.price_change_percent / _HUNDRED,
-            reported_total_value=basis.reported_total_value,
-        )
-    except HoldingNotFoundError as exc:
-        held = ", ".join(sorted(holding.symbol for holding in portfolio.holdings))
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"{exc.symbol} is not held by {portfolio.name!r}. "
-                f"Held: {held or 'nothing'}."
-            ),
-        ) from exc
-
-    return ScenarioOut(
-        portfolio_id=portfolio.id,
-        currency=portfolio.currency,
-        price_source=basis.source,
-        last_synced_at=basis.last_synced_at,
-        symbol=scenario.symbol,
-        price_change_percent=payload.price_change_percent,
-        price_before=scenario.price_before,
-        price_after=scenario.price_after,
-        holding_value_before=scenario.holding_value_before,
-        holding_value_after=scenario.holding_value_after,
-        total_value_before=scenario.total_value_before,
-        total_value_after=scenario.total_value_after,
-        change_value=scenario.change_value,
-        change_percent=scenario.change_percent,
-    )

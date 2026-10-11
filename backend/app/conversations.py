@@ -40,7 +40,8 @@ from app.agent.context import (
     PriorTurn,
     SettledContext,
 )
-from app.agent.run import STATUS_CLARIFICATION_NEEDED, RunResult
+from app.agent.run import STATUS_CLARIFICATION_NEEDED, STATUS_COMPLETED, RunResult
+from app.agent.supervisor import Destination
 from app.db import SessionLocal
 from app.models import Conversation, ConversationTurn
 
@@ -619,6 +620,70 @@ def _conversation_summary(conversation: Conversation) -> dict:
     }
 
 
+def latest_module1_analysis() -> dict | None:
+    """The most recently completed Module 1 analysis, or `None` if there has not been one.
+
+    **This is the one query in this module that is not scoped to a conversation**, and it exists
+    because the Dashboard has to answer "what did the last analysis say" without knowing which
+    conversation it happened in. A conversation id separates conversations from each other; it is
+    not an authorization boundary in this single-user build, so reading across them is a
+    reporting question rather than a permission one -- and the row it returns is the same shape
+    `_turn_summary` gives, so a turn read here and a turn read from history cannot disagree.
+
+    Two conditions decide what "latest Module 1 analysis" means, and both are facts on the row
+    rather than inferences:
+
+    * `status == completed`. A turn that was interrupted, or that ended in a clarification, is
+      not an analysis that reached a conclusion, and reporting one as the latest result would
+      present a question as an answer.
+    * `result -> destination == module1_analysis`, which is the router's own record of what the
+      request turned out to be. Turns stored before the destination was written carry no
+      destination, and are passed over rather than assumed to be Module 1.
+
+    **The answer itself is not returned.** A stored answer is a long markdown document, and a
+    dashboard that shipped one would be shipping the Analysis page's whole job to render a
+    sentence of it. What comes back is the handful of facts a summary is made of; the answer is
+    read from `GET /analysis/conversations/{id}` by the page that shows it.
+    """
+    with SessionLocal() as session:
+        row = session.scalars(
+            select(ConversationTurn)
+            .where(ConversationTurn.status == STATUS_COMPLETED)
+            .where(
+                ConversationTurn.result["destination"].astext == Destination.MODULE1_ANALYSIS
+            )
+            # Nulls last, because a DESC order puts them first by default and a completed turn
+            # with no completion time would then be reported as the most recent one.
+            .order_by(
+                ConversationTurn.completed_at.desc().nullslast(),
+                ConversationTurn.created_at.desc(),
+                ConversationTurn.id.desc(),
+            )
+            .limit(1)
+        ).first()
+        if row is None:
+            return None
+
+        stored = row.result or {}
+        return {
+            "turn_id": row.id,
+            "status": row.status,
+            "created_at": _iso(row.created_at),
+            "completed_at": _iso(row.completed_at),
+            "run_id": row.run_id,
+            # The promoted columns, which are what the run resolved the request to and what
+            # survive a result document that is absent or an older shape.
+            "symbol": row.resolved_symbol,
+            "start_date": _iso(row.resolved_start_date),
+            "end_date": _iso(row.resolved_end_date),
+            "as_of": _iso(row.resolved_as_of),
+            "destination": stored.get("destination"),
+            # The question the run recorded for itself; the typed message is the fallback for a
+            # turn stored before runs wrote one.
+            "question": stored.get("question") or row.user_message,
+        }
+
+
 def turn_summary(turn: ConversationTurn) -> dict:
     return _turn_summary(turn, include_result=True)
 
@@ -713,6 +778,7 @@ __all__ = [
     "finalize_turn",
     "get_conversation",
     "history",
+    "latest_module1_analysis",
     "new_id",
     "turn_summary",
 ]

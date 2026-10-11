@@ -1,10 +1,11 @@
-/** Moving between the two destinations, and the mobile drawer closing behind you. */
+/** Moving between destinations, and the mobile drawer closing behind you. */
 
 import { fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { App } from '../App'
 import type { Valuation } from '../api'
+import { aStrategy } from '../testing'
 
 /** The shape `GET /portfolio/valuation` returns for the demo portfolio. */
 const DEMO: Valuation = {
@@ -41,14 +42,24 @@ const DEMO: Valuation = {
   ],
 }
 
-/** Every request succeeds. Unlike the page tests, moving between two pages makes an
- *  unpredictable number of calls, so this one always resolves rather than counting. */
+/** Every request succeeds. Unlike the page tests, moving between destinations makes an
+ *  unpredictable number of calls, so this one always resolves rather than counting -- and it
+ *  answers by URL, because the Backtest page reads a strategy catalogue whose shape the
+ *  portfolio fixture is not. Anything it does not know about gets `value`. */
 function stubFetch(value: unknown = DEMO, status = 200) {
-  const mock = vi.fn().mockResolvedValue({
-    ok: status >= 200 && status < 300,
-    status,
-    json: async () => value,
-  } as Response)
+  const mock = vi.fn(async (input: RequestInfo | URL) => {
+    const url = typeof input === 'string' ? input : input.toString()
+    const body = url.includes('/backtest/strategies')
+      ? { strategies: [aStrategy()] }
+      : url.includes('/backtest/runs/latest')
+        ? { run: null }
+        : value
+    return {
+      ok: status >= 200 && status < 300,
+      status,
+      json: async () => body,
+    } as Response
+  })
   vi.stubGlobal('fetch', mock)
   return mock
 }
@@ -67,38 +78,38 @@ describe('App', () => {
     expect(await screen.findAllByText('$16,100.00')).not.toHaveLength(0)
   })
 
-  it('switches to What if? and moves the highlight with it', async () => {
+  it('switches to Backtest and moves the highlight with it', async () => {
     stubFetch()
 
     render(<App />)
     await screen.findAllByText('$16,100.00')
 
-    fireEvent.click(screen.getByRole('button', { name: 'What if?' }))
-    // Let the newly mounted page finish its own request, so its state update lands
+    fireEvent.click(screen.getByRole('button', { name: 'Backtest' }))
+    // Let the newly mounted page finish its own requests, so its state updates land
     // inside the test rather than after it.
-    await screen.findByLabelText('Stock')
+    await screen.findByRole('button', { name: /Moving Average Crossover/ })
 
-    expect(screen.getByRole('heading', { level: 1, name: 'What if?' })).toBeTruthy()
+    expect(screen.getByRole('heading', { level: 1, name: 'Backtest' })).toBeTruthy()
     expect(screen.queryByRole('heading', { level: 1, name: 'Portfolio' })).toBeNull()
-    expect(screen.getByRole('button', { name: 'What if?' }).getAttribute('aria-current')).toBe(
+    expect(screen.getByRole('button', { name: 'Backtest' }).getAttribute('aria-current')).toBe(
       'page',
     )
     expect(screen.getByRole('button', { name: 'Portfolio' }).getAttribute('aria-current')).toBeNull()
   })
 
-  it('leaves Portfolio independently reachable from What if?', async () => {
+  it('leaves Portfolio independently reachable from Backtest', async () => {
     stubFetch()
 
     render(<App />)
     await screen.findAllByText('$16,100.00')
 
-    fireEvent.click(screen.getByRole('button', { name: 'What if?' }))
-    expect(screen.getByRole('heading', { level: 1, name: 'What if?' })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Backtest' }))
+    expect(screen.getByRole('heading', { level: 1, name: 'Backtest' })).toBeTruthy()
 
     fireEvent.click(screen.getByRole('button', { name: 'Portfolio' }))
 
     expect(screen.getByRole('heading', { level: 1, name: 'Portfolio' })).toBeTruthy()
-    expect(screen.queryByRole('heading', { level: 1, name: 'What if?' })).toBeNull()
+    expect(screen.queryByRole('heading', { level: 1, name: 'Backtest' })).toBeNull()
     expect(await screen.findAllByText('$16,100.00')).not.toHaveLength(0)
   })
 
@@ -111,11 +122,11 @@ describe('App', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Open navigation menu' }))
     const drawer = screen.getByRole('dialog')
 
-    fireEvent.click(within(drawer).getByRole('button', { name: 'What if?' }))
-    await screen.findByLabelText('Stock')
+    fireEvent.click(within(drawer).getByRole('button', { name: 'Backtest' }))
+    await screen.findByRole('button', { name: /Moving Average Crossover/ })
 
     // Both at once: the destination changed and the drawer got out of the way.
     expect(screen.queryByRole('dialog')).toBeNull()
-    expect(screen.getByRole('heading', { level: 1, name: 'What if?' })).toBeTruthy()
+    expect(screen.getByRole('heading', { level: 1, name: 'Backtest' })).toBeTruthy()
   })
 })

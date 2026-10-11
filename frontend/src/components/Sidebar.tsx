@@ -1,9 +1,7 @@
 /** Application shell navigation.
  *
- * Seven destinations, six of which exist. Analysis, Portfolio, What if?, News & Trading, Backtest
- * and Orders are real pages; Dashboard is rendered as a genuinely disabled button with a
- * "Coming soon" description, because a link that navigates nowhere is worse than a link that
- * says it cannot.
+ * Six destinations, all of which exist: Dashboard, Analysis, Portfolio, News & Trading,
+ * Backtest and Orders.
  *
  * The list is what this application can reach, not what it might one day hold: Strategies,
  * Watchlist and Settings were removed rather than left disabled, because a row that can never be
@@ -21,12 +19,17 @@ import {
   DataNewsIcon,
   OrdersIcon,
   PortfolioIcon,
-  WhatIfIcon,
 } from './icons'
 
 /** The pages that exist. Declared here because this file owns the list of destinations;
  *  `App` holds whichever one is current. */
-export type PageId = 'analysis' | 'portfolio' | 'what-if' | 'news' | 'backtest' | 'orders'
+export type PageId =
+  | 'dashboard'
+  | 'analysis'
+  | 'portfolio'
+  | 'news'
+  | 'backtest'
+  | 'orders'
 
 type NavItem = {
   label: string
@@ -37,10 +40,9 @@ type NavItem = {
 }
 
 const NAV_ITEMS: NavItem[] = [
-  { label: 'Dashboard', Icon: DashboardIcon },
+  { id: 'dashboard', label: 'Dashboard', Icon: DashboardIcon },
   { id: 'analysis', label: 'Analysis', Icon: AnalysisIcon },
   { id: 'portfolio', label: 'Portfolio', Icon: PortfolioIcon },
-  { id: 'what-if', label: 'What if?', Icon: WhatIfIcon },
   { id: 'news', label: 'News & Trading', Icon: DataNewsIcon },
   { id: 'backtest', label: 'Backtest', Icon: BacktestIcon },
   { id: 'orders', label: 'Orders', Icon: OrdersIcon },

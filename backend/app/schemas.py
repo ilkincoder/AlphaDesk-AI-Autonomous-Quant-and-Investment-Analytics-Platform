@@ -82,45 +82,6 @@ class PortfolioValuationOut(BaseModel):
     holdings: list[ValuationHoldingOut]
 
 
-class ScenarioRequest(BaseModel):
-    """A hypothetical price move for one held symbol.
-
-    `price_change_percent` is a signed percentage, so `-10` means a ten percent fall.
-    It is declared as `Decimal` and accepts a JSON *string*, which is what the frontend
-    sends: parsing "-10" straight to `Decimal` never passes through a binary float.
-    """
-
-    symbol: str = Field(min_length=1)
-    price_change_percent: Decimal = Field(ge=Decimal("-100"), le=Decimal("100"))
-
-
-class ScenarioOut(BaseModel):
-    """One holding re-priced, and what it did to the portfolio.
-
-    Every `*_before` is the portfolio as it stands; every `*_after` is the same portfolio
-    with that single price changed. Cash, the other holdings, and all quantities are the
-    same on both sides, which is what makes the difference attributable to one move.
-
-    `change_percent` is null when `total_value_before` is zero — nothing to be a
-    percentage of.
-    """
-
-    portfolio_id: int
-    currency: str
-    price_source: str
-    # As on the valuation: when the broker snapshot behind the "before" column was read.
-    last_synced_at: datetime | None = None
-    symbol: str
-    price_change_percent: Decimal
-    price_before: Decimal
-    price_after: Decimal
-    holding_value_before: Decimal
-    holding_value_after: Decimal
-    total_value_before: Decimal
-    total_value_after: Decimal
-    change_value: Decimal
-    change_percent: Decimal | None
-
 class PortfolioSyncOut(BaseModel):
     """The result of one broker sync.
 
@@ -395,6 +356,47 @@ class ConversationHistoryOut(BaseModel):
     limit: int
     offset: int
     turns: list[dict]
+
+
+class LatestAnalysisSummaryOut(BaseModel):
+    """What a completed Module 1 analysis is summarised by.
+
+    Every field is a fact the stored turn holds, read from a column or from the run's own result
+    document. `symbol` and the three dates come from the promoted columns rather than from inside
+    the result, because those columns are what survive a result that is absent or of an older
+    shape.
+
+    `question` is the request the run recorded for itself. `destination` says what kind of
+    analysis this turned out to be, so a client can label it without inferring it from a ticker.
+
+    **There is deliberately no conclusion, verdict, score or confidence.** This system computes
+    none of those for an analysis -- `app.analysis` states that plainly -- so a summary schema
+    carrying one would be manufacturing it at the edge. What it does carry is whether the run
+    completed and when, which is what a reader can rely on.
+    """
+
+    turn_id: str
+    status: str
+    created_at: str | None = None
+    completed_at: str | None = None
+    run_id: str | None = None
+    symbol: str | None = None
+    start_date: str | None = None
+    end_date: str | None = None
+    as_of: str | None = None
+    destination: str | None = None
+    question: str | None = None
+
+
+class LatestAnalysisOut(BaseModel):
+    """The most recently completed Module 1 analysis, or an explicit null.
+
+    200 with a null body rather than a 404 when there has not been one: a Dashboard loading
+    itself is asking "is there one?", and "no" is an answer rather than an error. Same shape as
+    `RebalanceProposalView` and `BacktestRunView`, for the same reason.
+    """
+
+    analysis: LatestAnalysisSummaryOut | None = None
 
 
 # --- the rebalance proposal ------------------------------------------------------------------

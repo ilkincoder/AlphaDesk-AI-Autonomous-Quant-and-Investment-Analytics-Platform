@@ -186,8 +186,41 @@ export type ProgressEvent = {
  *  Duplicated here so the composer can stop a reader before the API has to reject them. */
 export const MAX_MESSAGE_LENGTH = 2000
 
-async function jsonRequest<T>(url: string, init?: RequestInit): Promise<T> {
-  let response: Response
+/** A completed analysis, as the Dashboard summarises it. Mirrors `LatestAnalysisSummaryOut`.
+ *
+ * **There is no conclusion, verdict or score here, and its absence is the point.** This system
+ * computes no confidence and no signal for an analysis, so a summary carrying one would be
+ * inventing it at the edge. What a stored run genuinely recorded is what was asked, the
+ * instrument and window it resolved to, whether it finished, and when.
+ */
+export type LatestAnalysis = {
+  turn_id: string
+  status: string
+  created_at: string | null
+  completed_at: string | null
+  run_id: string | null
+  symbol: string | null
+  start_date: string | null
+  end_date: string | null
+  as_of: string | null
+  /** The router's own record of what the request turned out to be, e.g. `module1_analysis`. */
+  destination: string | null
+  /** The question the run recorded for itself. */
+  question: string | null
+}
+
+/** The most recently completed Module 1 analysis, or `null` when there has not been one.
+ *
+ * A read, and only a read: nothing is ingested, no model is asked and no run is started. `null`
+ * is an answer -- "there is no saved analysis" -- rather than a 404 to be handled.
+ */
+export function fetchLatestAnalysis(
+  signal?: AbortSignal,
+): Promise<{ analysis: LatestAnalysis | null }> {
+  return jsonRequest<{ analysis: LatestAnalysis | null }>('/api/analysis/latest', { signal })
+}
+
+async function jsonRequest<T>(url: string, init?: RequestInit): Promise<T> {  let response: Response
   try {
     response = await fetch(url, init)
   } catch (cause) {

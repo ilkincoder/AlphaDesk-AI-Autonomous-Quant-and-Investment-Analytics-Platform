@@ -11,16 +11,17 @@ Three services:
 - **backend** — FastAPI on port 8000, hot-reloading.
 - **postgres** — PostgreSQL 18, with a named volume so data survives restarts.
 
-**Open the app at <http://localhost:5173>.** Two screens work:
+**Open the app at <http://localhost:5173>.** Every navigation item leads somewhere:
 
+- **Dashboard** — the three modules summarized: portfolio value and cash, the allocation,
+  the latest saved backtest and its explanation, the latest analysis, and recent paper orders.
+- **Analysis** — ask about one company's price movement against its reported insider activity.
 - **Portfolio** — the overview, with the valuation figures from `GET /portfolio/valuation`.
-- **What if?** — pick a holding, enter a percentage move between −100% and +100%, and see
-  the hypothetical before and after. The stock list and every figure come from the backend.
+- **News & Trading** — ingest and search news, and generate a rebalance proposal.
+- **Backtest** — test a predefined strategy against a stock's past prices. Nothing is traded.
+- **Orders** — the execution batches a proposed rebalance produced, and what each order did.
 
-The remaining eight navigation items and four of the five Portfolio tabs are visibly
-disabled — they lead nowhere yet, on purpose.
-
-Five API endpoints:
+Four API endpoints:
 
 | Endpoint | Purpose | Behaviour when the database is down |
 |---|---|---|
@@ -28,7 +29,6 @@ Five API endpoints:
 | `GET /health/db` | Readiness — can the API reach PostgreSQL? | `503` |
 | `GET /portfolio` | The seeded demo portfolio and its holdings | `503` |
 | `GET /portfolio/valuation` | The same portfolio valued at the demo prices | `503` |
-| `POST /portfolio/scenario` | One holding re-priced, and what it does to the total | `503` |
 
 Liveness and readiness are separate on purpose: a process that is running but cannot
 reach its database should not report itself as healthy.
@@ -583,42 +583,8 @@ Behaviour:
   `null`. With nothing to divide by, the share is undefined rather than zero.
 - **Read-only.** It runs a `SELECT` and multiplies. Nothing is written.
 
-### Scenario: what if one holding moves?
-
-```bash
-curl -s -X POST localhost:8000/portfolio/scenario \
-  -H 'Content-Type: application/json' \
-  -d '{"symbol":"NVDA","price_change_percent":"-10"}'
-# {"portfolio_id":1,"currency":"USD","price_source":"demo","symbol":"NVDA",
-#  "price_change_percent":"-10",
-#  "price_before":"150.00","price_after":"135.00",
-#  "holding_value_before":"1500.00","holding_value_after":"1350.00",
-#  "total_value_before":"16100.00","total_value_after":"15950.00",
-#  "change_value":"-150.00","change_percent":"-0.93"}
-```
-
-**One price moves; nothing else does.** Cash, the other holdings, and every quantity are
-identical on both sides, which is what makes the difference attributable to the single
-move the request named. `change_percent` is against the *before* total.
-
-`price_change_percent` is a signed percentage, and it is sent as a **string** — `Decimal`
-parses `"-10"` exactly, whereas a JSON number would have gone through a float first. The
-value is bounded to −100 (the whole price) and +100.
-
-`POST` rather than `GET` because the question has a body rather than a path: *what if this
-symbol moved by this much*. Nothing is written — the same rows are read, arithmetic is
-applied, and the answer is returned.
-
-| Situation | Response |
-|---|---|
-| Stock moves, everything fine | `200` |
-| Portfolio not seeded | `404` |
-| `symbol` is not held by the portfolio | `404`, listing what is held |
-| `price_change_percent` outside −100..100, or `symbol` empty | `422` |
-| A held symbol has no demo price | `503` |
-
-Interactive API docs: <http://localhost:8000/docs> — every endpoint, including the POST,
-can be run from there with the "Try it out" button.
+Interactive API docs: <http://localhost:8000/docs> — every endpoint can be run from there
+with the "Try it out" button.
 
 To confirm the two endpoints really are independent, stop the database and check both:
 
@@ -678,12 +644,11 @@ README recording where each came from and which is which. The real one is stored
 with its accession number and source URL.
 
 `test_valuation.py` and `test_scenario.py` are pure arithmetic and need no database or
-running service at all. The two endpoint files import `app.main` (so `DATABASE_URL` must
-be set, which is why they run in the container) but use a stub session, so they open no
-connection and cannot alter the demo portfolio. The `-100..+100` bound is validated by
-Pydantic before the handler runs, so it is checked against the live server with the `curl`
-commands above rather than from a handler test. The endpoint is also worth checking by hand with the
-`curl` commands above, since those read the real seeded rows.
+running service at all — including `calculate_scenario`, which is still what prices the
+rebalance proposal's disclosed demo shock. The endpoint file imports `app.main` (so
+`DATABASE_URL` must be set, which is why it runs in the container) but uses a stub session,
+so it opens no connection and cannot alter the demo portfolio. It is worth checking by hand
+with the `curl` commands above, since those read the real seeded rows.
 
 #### The schema tests, and their own database
 
@@ -2759,20 +2724,20 @@ while your Mac-side tools use `localhost:5433`. It is the same database either w
   step and a real web server, plus a decision about where the `/api` proxy lives.
 - **No router, and therefore no URLs.** Which page is showing is React state in `App.tsx`,
   not a route. Two destinations did not justify the dependency or the rework. The costs are
-  real though: a refresh always returns to Portfolio, the What if? page cannot be linked to
-  or bookmarked, and the browser's Back button does not move between them. Adding
+  real though: a refresh always returns to Portfolio, no page can be linked to or
+  bookmarked, and the browser's Back button does not move between them. Adding
   `react-router` later is a contained change — `PageId` in `components/Sidebar.tsx`
   already names the destinations, and the nav list is the single place they are declared.
 - **The scenario calculation only moves one price at a time.** Correlated moves, a shock
   applied to the whole portfolio, and a fall below −100% are all out of scope. A price
   cannot go negative, and `calculate_scenario` refuses a fraction below `-1` rather than
-  producing one.
+  producing one. It has no endpoint of its own any more: the one caller is the rebalance
+  proposal, which uses it to price the disclosed demo shock on the largest holding.
 - **`calculate_scenario` is pure, and stays that way.** Holdings, cash, prices, a symbol,
   and a *fraction* in; numbers out. It imports no database and no HTTP, and takes a
-  fraction rather than a percentage so that parsing "-10" stays the caller's business —
-  which is what lets an endpoint and, later, an AI tool call the same function with their
-  own phrasing. It is built by calling `calculate_valuation` twice, so the "before" column
-  can never drift from what `GET /portfolio/valuation` reports.
+  fraction rather than a percentage so that parsing "-10" stays the caller's business. It
+  is built by calling `calculate_valuation` twice, so the "before" column can never drift
+  from what `GET /portfolio/valuation` reports.
 - **The frontend is USD-only in practice.** It renders a `$` symbol and the sidebar shows
   "USD" as a static shell label, while the API's `currency` field is carried but only used
   for display. A non-USD portfolio would be mislabelled.
@@ -2856,8 +2821,8 @@ while your Mac-side tools use `localhost:5433`. It is the same database either w
   a bounded sample supports.
 - **Portfolio exposure is still not calculated.** NVDA and AAPL now have real prices and
   filings stored, but MSFT does not, and no endpoint reads the ingested bars — `GET
-  /portfolio`, `GET /portfolio/valuation` and `POST /portfolio/scenario` still return the
-  seeded demo prices, byte for byte as before. Checked after adding AAPL.
+  /portfolio` and `GET /portfolio/valuation` still return the seeded demo prices, byte for
+  byte as before. Checked after adding AAPL.
 - **Amendment blocking is broader than it needs to be.** One `4/A` before the cutoff withholds
   the whole divergence comparison, because working out which rows it corrects is a separate
   problem. Narrowing that is a deliberate future change, not an oversight. A `10-K/A` does
@@ -3321,3 +3286,84 @@ needed for the explanation, and everything else works without it.
    under them. Reload: they are still there, without another model call.
 6. If `DEEPSEEK_API_KEY` is unset, step 5 says the explanation could not be written and offers no
    retry, while every figure above it stays exactly where it was.
+
+## The Dashboard
+
+**Dashboard** is the first destination in the sidebar and the one the other three modules report
+into. It summarizes what is already stored -- it introduces no analytics of its own, calculates
+nothing, and **every request it makes is a GET**. Loading it and pressing **Refresh** cannot
+submit an order, generate a proposal, run a backtest, ingest news or call a model; the frontend
+tests assert that only GETs are ever sent.
+
+### Four sources, four sections, four failures
+
+| Source | What it feeds |
+|---|---|
+| `GET /portfolio/valuation` | Portfolio value, cash, and the allocation donut |
+| `GET /orders` | The active-batch count and the paper-orders panel |
+| `GET /backtest/runs/latest` | The return card, the equity chart, and the explanation excerpt |
+| `GET /analysis/latest` | The insider-analysis panel |
+
+They are fetched together and applied one at a time, so **a source that fails takes only its own
+sections with it**. Cards are mapped one-to-one from API fields: the portfolio value and cash
+come straight from the valuation, the batch count uses the application's own
+`ACTIVE_BATCH_STATUSES` (`pending`, `submitting`), and the return is the latest saved run's own
+`total_return_percent`.
+
+### Four data states, kept apart
+
+The distinction the page is built around, and the one a dashboard most easily gets wrong:
+
+- **Unavailable** -- the source failed. The figure shows `—`, says which read failed and offers a
+  retry. A refresh that fails *after* a good load keeps the values it had and reports the failure
+  once at the top, naming the source, rather than blanking figures that were still the last thing
+  known.
+- **Confirmed empty** -- the source answered and holds nothing. "No backtest has been saved yet"
+  with a button to go and run one; it is never dressed up as a figure.
+- **Confirmed zero** -- the source answered `0`. Active order batches shows `0`, not a dash.
+- **Present** -- the value itself.
+
+### What it deliberately does not do
+
+- **No historical portfolio equity chart.** Stored valuation history has not been established, so
+  there is nothing to draw one from.
+- **No signal score or confidence for an analysis**, in the UI or in the schema. `app.analysis`
+  states that this system computes neither, and the panel says so rather than leaving a reader to
+  assume one.
+- **No explanation written from here.** The panel shows an excerpt of the explanation the run
+  already carries, and points at the Backtest page to write one. It also never runs a backtest,
+  fetches prices or ingests anything to fill a card.
+- **No donut when a ring would mislead.** A negative cash balance or holding makes a share of the
+  total meaningless, so the amounts are listed as they are and the reason is stated, rather than
+  clamping a segment or inventing a percentage.
+- **Nothing is described as user-scoped that is not.** Backtest runs are global records with no
+  owner column, and the Dashboard says "the latest saved run" rather than implying one belongs to
+  the reader.
+
+Broker figures are labelled **paper trading** and backtest figures **Simulated**, and the
+portfolio card names its price source -- the fictional demo table is called fictional rather than
+presented as market data.
+
+### The one endpoint this added
+
+`GET /analysis/latest` returns the most recently completed Module 1 analysis as a small, typed
+summary: instrument, status, window and completion time, read from the turn's own columns, with
+the question and destination from its result document. It is the only cross-conversation read in
+the store, and it returns **no answer text** -- a stored answer is a long markdown document and
+the Analysis page is where it is rendered. A turn that did not complete, or that was routed
+somewhere other than `module1_analysis`, is passed over rather than reported as the latest
+analysis.
+
+### Checking it by hand
+
+1. Open <http://localhost:5173> and choose **Dashboard** in the sidebar.
+2. Every card should agree with the page it summarizes: Portfolio with **Portfolio**, the batch
+   count and paper-orders list with **Orders**, the chart and explanation with **Backtest**, the
+   analysis panel with **Analysis**.
+3. Press **Refresh**. Nothing is written; the four reads happen again and the values stay put.
+4. Stop the backend (`docker compose stop backend`) and press **Refresh**: every figure stays on
+   screen and a note at the top names what could not be refreshed. Reload with the backend down
+   and each affected section shows `—` with its own retry, while the sections that work still
+   render.
+5. Narrow the window below 760px: the cards stack, the nav becomes the drawer, and nothing
+   scrolls sideways.

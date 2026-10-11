@@ -1,5 +1,9 @@
 /** One allocation, as a ring with a numeric legend.
  *
+ * A legend row carries the money a segment is, when the caller supplies it, beside its share --
+ * `AllocationAsset.value`. Callers that draw a *proposed* allocation have percentages and no
+ * money to show, and those legends are unchanged: the share keeps the right-hand slot.
+ *
  * Hand-drawn SVG rather than a charting library. A donut is a circle with a `stroke-dasharray`
  * per segment, and the alternative is a dependency that ships a layout engine to draw one ring
  * — the existing `AllocationBar` already established that this application draws its own
@@ -18,7 +22,7 @@
 
 import { nothingToAllocate } from '../allocation'
 import type { AllocationAsset } from '../allocation'
-import { formatPercent } from '../format'
+import { formatCurrency, formatPercent } from '../format'
 
 /** The radius that makes the circumference exactly 100, so a percentage is a dash length. */
 const RADIUS = 15.9155
@@ -87,14 +91,37 @@ export function AllocationDonut({
 
       <ul className="mt-3 space-y-1.5">
         {assets.map((asset) => (
-          <li key={asset.key} className="flex items-center gap-2 text-label">
+          <li
+            key={asset.key}
+            className="flex items-center gap-2 text-label"
+            // A native tooltip on the row, so the money and the share are readable without
+            // hovering the thin ring segment -- which is not a hit target worth relying on.
+            title={
+              asset.value === undefined || asset.value === null
+                ? undefined
+                : `${asset.label}: ${formatCurrency(asset.value)} (${formatPercent(asset.percent)})`
+            }
+          >
             <span
               className="size-2 shrink-0 rounded-full"
               style={{ backgroundColor: asset.colour }}
               aria-hidden="true"
             />
             <span className="text-dim">{asset.label}</span>
-            <span className="ml-auto tabular-nums text-ink">
+            {asset.value !== undefined && asset.value !== null && (
+              <span className="ml-auto tabular-nums text-ink">
+                {formatCurrency(asset.value)}
+              </span>
+            )}
+            {/* The money takes the right-hand slot when there is money to show, and the share
+                keeps it when there is not -- so a legend of shares alone is unchanged. */}
+            <span
+              className={`${
+                asset.value === undefined || asset.value === null ? 'ml-auto ' : ''
+              }tabular-nums ${
+                asset.value === undefined || asset.value === null ? 'text-ink' : 'text-faint'
+              }`}
+            >
               {formatPercent(asset.percent)}
             </span>
           </li>

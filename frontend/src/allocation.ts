@@ -31,25 +31,43 @@ export type AllocationAsset = {
   /** The API's own string, or null when the total is zero and a share is undefined. */
   percent: string | null
   colour: string
+  /** The money this segment is, as the API's own string, when the caller has it to give.
+   *
+   * Optional because the two callers that draw a *proposed* allocation have percentages and no
+   * money -- a target weight is not a value. A legend that has both shows both; one that has
+   * only a share shows only that, which is why this is not a required field with a placeholder.
+   */
+  value?: string | null
 }
 
-/** One allocation as its segments, cash last. */
+/** One allocation as its segments, cash last.
+ *
+ * `cashValue` is the opt-in for money: pass the cash balance -- or `null`, when the balance is
+ * unknown -- and every segment also carries the value it represents. **Omit the argument and the
+ * segments carry shares alone, exactly as before**, which is what the projected allocations need:
+ * a target weight produced by a proposal is a share of a portfolio, not an amount of money, and
+ * a legend that showed a figure there would be labelling an estimate as a balance.
+ */
 export function allocationAssets(
   holdings: ValuationHolding[],
   cashAllocationPercent: string | null,
+  cashValue?: string | null,
 ): AllocationAsset[] {
+  const withValues = cashValue !== undefined
   return [
     ...holdings.map((holding, index) => ({
       key: holding.symbol,
       label: holding.symbol,
       percent: holding.allocation_percent,
       colour: HOLDING_SHADES[index % HOLDING_SHADES.length],
+      value: withValues ? holding.holding_value : undefined,
     })),
     {
       key: 'CASH',
       label: 'Cash',
       percent: cashAllocationPercent,
       colour: CASH_SHADE,
+      value: cashValue,
     },
   ]
 }

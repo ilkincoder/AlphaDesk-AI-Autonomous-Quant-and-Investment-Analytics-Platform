@@ -21,31 +21,38 @@ function navLabels() {
 }
 
 describe('Sidebar', () => {
-  it('lists every destination, with News & Trading directly below What if?', () => {
+  it('lists every destination in order, and nothing that is not one', () => {
     renderSidebar()
 
     expect(navLabels()).toEqual([
       'Dashboard',
       'Analysis',
       'Portfolio',
-      'What if?',
       'News & Trading',
       'Backtest',
       'Orders',
     ])
   })
 
-  it('marks the current page and disables the one that has no page', () => {
+  it('marks the current page and leaves every destination enabled', () => {
     renderSidebar()
 
     const portfolio = screen.getByRole('button', { name: 'Portfolio' })
     expect(portfolio.getAttribute('aria-current')).toBe('page')
     expect(portfolio.hasAttribute('disabled')).toBe(false)
 
-    // Seven destinations, six built. The one without a page behind it is genuinely disabled
-    // rather than a link that navigates nowhere.
-    expect(screen.getAllByTitle('Coming soon')).toHaveLength(1)
-    expect(screen.getByRole('button', { name: 'Dashboard' }).hasAttribute('disabled')).toBe(true)
+    // Six destinations, all built: nothing is left as a row that cannot be clicked.
+    expect(screen.queryAllByTitle('Coming soon')).toHaveLength(0)
+    for (const label of [
+      'Dashboard',
+      'Analysis',
+      'Portfolio',
+      'News & Trading',
+      'Backtest',
+      'Orders',
+    ]) {
+      expect(screen.getByRole('button', { name: label }).hasAttribute('disabled')).toBe(false)
+    }
   })
 
   it('enables Backtest, and reports it as the chosen destination', () => {
@@ -89,9 +96,9 @@ describe('Sidebar', () => {
   })
 
   it('highlights the current page, not merely an enabled one', () => {
-    renderSidebar('what-if')
+    renderSidebar('news')
 
-    expect(screen.getByRole('button', { name: 'What if?' }).getAttribute('aria-current')).toBe(
+    expect(screen.getByRole('button', { name: 'News & Trading' }).getAttribute('aria-current')).toBe(
       'page',
     )
     // Every built destination is enabled; only one is current.
@@ -101,17 +108,17 @@ describe('Sidebar', () => {
   it('reports the destination that was chosen', () => {
     const onNavigate = renderSidebar()
 
-    fireEvent.click(screen.getByRole('button', { name: 'What if?' }))
+    fireEvent.click(screen.getByRole('button', { name: 'News & Trading' }))
 
-    expect(onNavigate).toHaveBeenCalledWith('what-if')
+    expect(onNavigate).toHaveBeenCalledWith('news')
   })
 
-  it('does not navigate from a disabled destination', () => {
+  it('navigates to the Dashboard, which is the first destination and a real page', () => {
     const onNavigate = renderSidebar()
 
     fireEvent.click(screen.getByRole('button', { name: 'Dashboard' }))
 
-    expect(onNavigate).not.toHaveBeenCalled()
+    expect(onNavigate).toHaveBeenCalledWith('dashboard')
   })
 
   it('names the demo portfolio and its currency, and invents no user', () => {
@@ -149,9 +156,9 @@ describe('Sidebar', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Open navigation menu' }))
     const drawer = screen.getByRole('dialog')
-    fireEvent.click(within(drawer).getByRole('button', { name: 'What if?' }))
+    fireEvent.click(within(drawer).getByRole('button', { name: 'News & Trading' }))
 
-    expect(onNavigate).toHaveBeenCalledWith('what-if')
+    expect(onNavigate).toHaveBeenCalledWith('news')
     expect(screen.queryByRole('dialog')).toBeNull()
   })
 

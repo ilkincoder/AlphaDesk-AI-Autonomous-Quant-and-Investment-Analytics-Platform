@@ -2,12 +2,12 @@ import { useCallback, useState } from 'react'
 
 import { AnalysisPage } from './components/AnalysisPage'
 import { BacktestPage } from './components/BacktestPage'
+import { DashboardPage } from './components/DashboardPage'
 import { NewsPage } from './components/NewsPage'
 import { OrdersPage } from './components/OrdersPage'
 import { PortfolioPage } from './components/PortfolioPage'
 import { Sidebar } from './components/Sidebar'
 import type { PageId } from './components/Sidebar'
-import { WhatIfPage } from './components/WhatIfPage'
 
 /** The shell: a full-height sidebar beside the current page.
  *
@@ -57,14 +57,18 @@ export function App() {
       {/* min-h-0 so the content column can be narrower and shorter than its contents, which
           is what lets a table or a transcript scroll inside its own container. */}
       <main className="flex min-h-0 min-w-0 flex-1 flex-col">
+        <div className="min-h-0 flex-1 flex-col p-6" style={{ display: showing('dashboard') }}>
+          {/* No `active` prop: the page reads four sources once on mount and refreshes when
+              asked. Nothing here happens on its own, and nothing it calls writes anything. */}
+          {visited.has('dashboard') && (
+            <DashboardPage onNavigate={navigate} onOpenOrders={openOrders} />
+          )}
+        </div>
+
         <div className="min-h-0 flex-1 flex-col p-6" style={{ display: showing('portfolio') }}>
           {/* `active` is what the page polls on. It stays mounted while hidden, so
               mounting is not the same event as arriving here. */}
           {visited.has('portfolio') && <PortfolioPage active={page === 'portfolio'} />}
-        </div>
-
-        <div className="min-h-0 flex-1 flex-col p-6" style={{ display: showing('what-if') }}>
-          {visited.has('what-if') && <WhatIfPage />}
         </div>
 
         <div className="min-h-0 flex-1 flex-col p-6" style={{ display: showing('news') }}>

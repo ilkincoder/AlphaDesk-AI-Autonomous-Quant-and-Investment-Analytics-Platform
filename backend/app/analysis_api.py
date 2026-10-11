@@ -60,7 +60,13 @@ from app.conversations import (
     Replay,
     TURN_PROCESSING,
 )
-from app.schemas import ChatRequest, ChatTurnOut, ConversationCreatedOut, ConversationHistoryOut
+from app.schemas import (
+    ChatRequest,
+    ChatTurnOut,
+    ConversationCreatedOut,
+    ConversationHistoryOut,
+    LatestAnalysisOut,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -144,8 +150,27 @@ def get_conversation(
     return ConversationHistoryOut(**page)
 
 
-# --- asking --------------------------------------------------------------------------------
+@router.get(
+    "/latest",
+    response_model=LatestAnalysisOut,
+    summary="Read the most recently completed Module 1 analysis",
+)
+def get_latest_analysis() -> LatestAnalysisOut:
+    """The last analysis that finished, or an explicit null.
 
+    **A read, and only a read.** Nothing is ingested, no model is asked anything and no run is
+    started: this exists so a Dashboard can show what the last analysis found without the page
+    having to know which conversation it was in.
+
+    The one thing it deliberately does not do is summarise the analysis into a verdict. There is
+    no confidence score and no conclusion in this system -- see `app.analysis` -- so this returns
+    the facts a stored turn actually holds: what was asked, the instrument and window it resolved
+    to, whether it completed, and when.
+    """
+    return LatestAnalysisOut(analysis=conversations.latest_module1_analysis())
+
+
+# --- asking --------------------------------------------------------------------------------
 
 @router.post(
     "/chat",
