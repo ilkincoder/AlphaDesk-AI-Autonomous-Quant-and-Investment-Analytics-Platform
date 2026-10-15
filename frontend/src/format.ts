@@ -57,8 +57,11 @@ export function formatSignedPercent(value: string): string {
  *
  * Read off the digits rather than parsed: a minus sign in front of nothing is not a
  * change, and `Number("-0.00")` is not the only thing that would have to be trusted.
+ *
+ * Private, because a signed percentage is the only thing that asks. A second caller reaching
+ * for it would be a second place deciding what "no change" means.
  */
-export function isZeroAmount(value: string): boolean {
+function isZeroAmount(value: string): boolean {
   return !/[1-9]/.test(value)
 }
 
@@ -96,15 +99,4 @@ export function formatDateTime(value: string | null): string | null {
     hour: '2-digit',
     minute: '2-digit',
   })
-}
-
-/** Which way a change went, as a word.
- *
- * Returned separately from any colour so that the direction survives without it. Red and
- * green are the least reliable way to say "down" and "up" — to a colour-blind reader
- * they are the same shade, and to a screen reader they are nothing at all.
- */
-export function directionOf(value: string): 'increase' | 'decrease' | 'no change' {
-  if (isZeroAmount(value)) return 'no change'
-  return value.startsWith('-') ? 'decrease' : 'increase'
 }

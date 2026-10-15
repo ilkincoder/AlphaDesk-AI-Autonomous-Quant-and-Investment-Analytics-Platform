@@ -22,7 +22,7 @@ never conflated and the financial-facts tool's period filters are never constrai
 window.
 """
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import TYPE_CHECKING
@@ -639,10 +639,6 @@ def known_symbols(session) -> KnownSymbols:
     return KnownSymbols(companies=companies, holdings=holdings)
 
 
-def describe_symbols(symbols: Sequence[str]) -> str:
-    return ", ".join(symbols) if symbols else "none"
-
-
 __all__ = [
     "ExplicitArguments",
     "ResolutionOutcome",
@@ -665,7 +661,6 @@ __all__ = [
     "PendingClarification",
     "PriorTurn",
     "SettledContext",
-    "describe_symbols",
     "known_symbols",
     "resolve_period",
     "resolve_request",

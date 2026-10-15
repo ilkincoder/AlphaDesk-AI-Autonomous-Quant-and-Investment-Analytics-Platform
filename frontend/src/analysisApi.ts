@@ -166,7 +166,14 @@ export type ConversationHistory = ConversationSummary & {
 /** One thing the run reported while it worked. Every field is something the finished result
  *  already exposes; nothing here is a stage the backend does not actually have. */
 export type ProgressEvent = {
-  event: 'routing' | 'tool' | 'findings' | 'composing' | 'done' | 'error'
+  event:
+    | 'routing'
+    | 'tool'
+    | 'findings'
+    | 'composing'
+    | 'answer_draft'
+    | 'done'
+    | 'error'
   destination?: string
   symbol?: string | null
   resolved?: Resolved | null
@@ -178,6 +185,9 @@ export type ProgressEvent = {
   evidence_refs?: string[]
   findings?: number
   limitations?: number
+  /** `answer_draft` only: everything the model has written so far, not the newest piece of
+   *  it. Each draft replaces the last, so a draft that never arrives leaves no mark. */
+  text?: string
   turn?: Turn
   detail?: string
 }
@@ -272,15 +282,6 @@ export function fetchConversation(
     `/api/analysis/conversations/${encodeURIComponent(conversationId)}${suffix}`,
     { signal },
   )
-}
-
-export function sendMessage(body: ChatRequest, signal?: AbortSignal): Promise<Turn> {
-  return jsonRequest<Turn>('/api/analysis/chat', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-    signal,
-  })
 }
 
 /** Send a turn and report what the run is doing as it does it.

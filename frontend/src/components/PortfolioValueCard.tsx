@@ -1,6 +1,7 @@
+import { allocationAssets } from '../allocation'
 import type { Valuation } from '../api'
 import { formatCurrency, formatSyncTime } from '../format'
-import { AllocationBar } from './AllocationBar'
+import { AllocationDonut } from './AllocationDonut'
 import { Card } from './Card'
 
 function Amount({ label, value }: { label: string; value: string }) {
@@ -43,9 +44,13 @@ export function PortfolioValueCard({ valuation }: { valuation: Valuation }) {
       <div className="mt-6 border-t border-line pt-5">
         <h3 className="text-heading font-medium text-ink">Allocation</h3>
         <div className="mt-3">
-          <AllocationBar
-            holdings={valuation.holdings}
-            cashAllocationPercent={valuation.cash_allocation_percent}
+          {/* The same ring, under the same label, as the Dashboard draws: one portfolio's
+              allocation should not change shape between two pages that both show it. The
+              shares are the API's own and the legend carries them as text, so no money is
+              added here that this card does not already state above. */}
+          <AllocationDonut
+            label="Share of portfolio value"
+            assets={allocationAssets(valuation.holdings, valuation.cash_allocation_percent)}
           />
         </div>
       </div>

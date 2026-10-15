@@ -51,7 +51,6 @@ from app.tools.results import (
     ToolStatus,
     database_unavailable,
     merged_warnings,
-    unavailable,
 )
 
 logger = logging.getLogger(__name__)

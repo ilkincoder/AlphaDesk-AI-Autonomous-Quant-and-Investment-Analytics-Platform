@@ -20,9 +20,10 @@ year-to-date figure that share an end date are not the same number. A missing fi
 zero. A similarity score is not a probability. The demo portfolio is not the user's brokerage
 account.
 
-**They are also duplicated in the application.** The prompts say "do not cite a reference you
-were not given"; `app.agent.supervisor` checks the citations and refuses the answer if they are
-invented. Prompts are a request; the code around them is what makes it a rule.
+**They are also duplicated in the application.** The prompt says the company, the market window
+and the information cutoff are fixed and enforced in code; `app.agent.module1` refuses a tool
+call whose arguments disagree with them. Prompts are a request; the code around them is what
+makes it a rule.
 """
 
 # The evidence rules, shared by both roles. Written as imperatives because they are, and
@@ -72,6 +73,49 @@ change your reading. If the evidence is thin, recommend what to investigate or m
 than inventing a conclusion. A generic disclaimer in place of an answer is not acceptable
 either -- say what the data does show, and say what it does not."""
 
+# How the answer is written. Separate from `EVIDENCE_RULES`, because the two are different
+# kinds of instruction: those are rules about what is true, and these are about who is reading.
+#
+# **Written after reading a live answer, which is what these fix.** It was accurate, fully
+# caveated, and unusable for its reader: four headed sections, every limitation restated in
+# prose, an internal status name and a coverage code quoted verbatim, and `[E1]` at the end of
+# almost every sentence. Nothing in the prompt had said who the answer was for, how long it
+# should be, or that the application already prints the limitations and the resolved dates
+# underneath it.
+#
+# **Nothing here relaxes a rule about truth.** Every caveat that changes how the answer should
+# be read still has to be in the prose; what changes is that the reader is told the ones that
+# bear on it rather than handed the whole list twice.
+WRITING_STYLE = """\
+Write for someone who follows markets but is not an analyst. They know what a share is. They do
+not know this system's vocabulary, and they did not ask for a report.
+
+- **Answer first.** The opening sentence says what the data shows, in the plainest words that
+  are still accurate. No preamble, no restatement of the question, no summary of what you are
+  about to say. Name the company in passing as you go, not as a label above the text.
+- **Short.** A few paragraphs, around 200-300 words, and only longer when the data genuinely
+  needs it. Length is not thoroughness: the evidence, the resolved dates and the portfolio's
+  figures are on the page beside your answer, and repeating them makes the answer look more
+  substantial without adding anything.
+- **Prose, not sections.** Headings and bullet lists only when the answer is genuinely a list.
+  Keep your reading in its own sentence -- "in my reading", "that suggests" -- so a reader can
+  always tell what the data says from what you make of it.
+- **No internal vocabulary.** Never write a status, a reason code or a field name:
+  not `insufficient_coverage`, not `price_up_net_selling`, not `partial`, not `ok`. Say what it
+  means: "the sample is too thin to conclude anything", "insiders reported sales and no
+  purchases". The same goes for filer jargon and for statistics that need a definition.
+- **Explain a term of art once, in passing,** the first time it carries weight -- insider, Form
+  4, split-adjusted, net selling. A few words, not a glossary, and not every term.
+- **Do not write reference markers.** No `[E1]`, no bracketed reference of any kind. The
+  application prints every source under your answer, with the filing it came from, and it does
+  not print a marker you leave in the prose either -- it removes it. A sentence that ends in one
+  therefore reads to the user as a sentence with a gap in it.
+- **Do not restate the limitation list.** The application prints every limitation under your
+  answer, in full. In the prose, say the one or two that change how *this* answer should be
+  read -- a thin sample, a window the stored prices do not cover -- and let the list be the list.
+- **A number earns its place** by being the point of its sentence. Do not decorate with figures
+  a reader will not use, and do not repeat one you have already given."""
+
 # The Supervisor's job. It routes, and it writes the final answer.
 SUPERVISOR_PROMPT = f"""\
 You are the Supervisor of a financial analysis application. You do not call tools yourself.
@@ -111,10 +155,11 @@ question.
 
 {EVIDENCE_RULES}
 
-When you are given findings and evidence, write the user's answer. Cite the evidence you rely
-on with its bracketed reference, like [E2], and cite nothing you were not given. State the
-resolved company and dates. Carry forward every limitation you were given -- a limitation that
-disappears between the evidence and the answer is a wrong answer."""
+{WRITING_STYLE}
+
+When you are given findings and evidence, write the user's answer: the opening sentence says
+what the data shows, and the prose is in the voice above. Say only what the findings you were
+given support."""
 
 # The Module 1 agent's job. It picks tools and reports what came back.
 MODULE1_PROMPT = f"""\
@@ -186,17 +231,22 @@ Report only what the tool results below contain. Every finding must be traceable
 them, and every limitation shown to you must appear in "limitations" -- a limitation you leave
 out is one the reader will never see."""
 
-# Asked of the Supervisor when its answer cited a reference that does not exist.
+# Asked of the Supervisor when its answer carried a reference marker anyway.
+#
+# The prompt asks for none at all, so reaching this means it wrote some. They are not corrected
+# into better ones -- the application shows no marker to anyone, so the correction is to write
+# the same answer without them, and an answer it will not do that to is withheld as before.
 CORRECTION_INSTRUCTION = """\
-Your previous answer cited {invalid}, which {verb} not in this run's evidence. Every reference
-must be one of: {available}.
+Your previous answer carried the reference markers {invalid}, and this application does not use
+them: it removes any it finds, so each one reached the user as a gap in a sentence.
 
-Rewrite the answer using only references from that list. If a claim cannot be supported by one
-of them, remove the claim or mark it as your own interpretation rather than as evidence.
+Rewrite the answer with no bracketed references at all. Keep every claim the evidence supports
+-- it is: {available} -- and drop any claim that needs a marker to stand up.
 Return the corrected answer only, with no preamble and no explanation of what changed."""
 
 NO_EVIDENCE_NOTE = (
-    "No evidence was gathered for this run, so the answer cannot cite anything."
+    "No evidence was gathered for this run, so there is nothing here to support a claim about "
+    "the company. Say that, and say what would have answered it."
 )
 
 # The rules the Portfolio Agent works under.
@@ -346,4 +396,5 @@ __all__ = [
     "MODULE2_RULES",
     "NO_EVIDENCE_NOTE",
     "SUPERVISOR_PROMPT",
+    "WRITING_STYLE",
 ]

@@ -72,3 +72,472 @@
     cursor: not-allowed;
   }
 }
+
+/* The startup screen's two animations.
+ *
+ * Plain classes rather than `@theme` animation tokens: nothing else in the application
+ * animates, these carry a shared 3s clock that two elements have to agree on, and a token
+ * would put that clock somewhere a component could pick up and change on its own.
+ *
+ * **The line and the dot are the same animation.** Both are parameterised by distance
+ * along the path -- `stroke-dashoffset` on the stroke, `offset-distance` on the dot -- so
+ * given one linear clock the dot sits exactly on the revealed end at every instant. Easing
+ * either one, or giving them different durations, is what would let them drift apart.
+ *
+ * The last fifth of the cycle holds the finished line, fades it, and only then returns to
+ * the start -- so the loop restarts with nothing on screen rather than a dot running
+ * backwards.
+ */
+@keyframes market-pulse-line {
+  0% {
+    stroke-dashoffset: 1;
+    opacity: 1;
+  }
+  80%,
+  88% {
+    stroke-dashoffset: 0;
+    opacity: 1;
+  }
+  100% {
+    stroke-dashoffset: 0;
+    opacity: 0;
+  }
+}
+
+@keyframes market-pulse-dot {
+  0% {
+    offset-distance: 0%;
+    opacity: 1;
+  }
+  80%,
+  88% {
+    offset-distance: 100%;
+    opacity: 1;
+  }
+  100% {
+    offset-distance: 100%;
+    opacity: 0;
+  }
+}
+
+@keyframes market-pulse-accent {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(270px);
+  }
+}
+
+.market-pulse-line {
+  /* `pathLength="1"` on the path makes a dash of 1 the whole of it, so the offset is the
+     revealed fraction and no length has to be measured in the browser. */
+  stroke-dasharray: 1 1;
+  animation: market-pulse-line 3s linear infinite;
+}
+
+.market-pulse-dot {
+  /* The dot is placed by the same geometry as the dash, so the two cannot disagree about
+     where the end of the line is. */
+  offset-path: path(
+    'M 0 145 C 12 140 18 129 28 132 S 43 110 54 118 S 70 128 82 111 S 97 107 109 89 S 123 80 136 98 S 149 93 161 111 S 177 106 190 119 S 205 125 217 132 S 231 120 244 112 S 257 116 270 96 S 284 87 296 100 S 310 80 322 86 S 335 58 347 72 S 361 50 374 51 S 387 69 399 82 S 411 64 424 88 S 438 109 452 97 S 467 85 481 80 S 500 61 520 60'
+  );
+  animation: market-pulse-dot 3s linear infinite;
+}
+
+.market-pulse-accent {
+  animation: market-pulse-accent 1.6s linear infinite;
+}
+
+/* The "just approved" ring and label on the Orders page, both fading out.
+ *
+ * A moment, not a state: they answer "which batch did the approval I just made open?", and
+ * they are wrong the moment that question stops being the one a reader is asking. The
+ * duration is not set here -- `OrdersPage.tsx` hands it over inline from
+ * `APPROVAL_HIGHLIGHT_MS`, because the same number decides when the component takes the
+ * element out of the DOM, and one of the two holding a private copy is how a ring ends up
+ * still fading after the thing it was drawn around has gone.
+ *
+ * The ring is a box-shadow rather than Tailwind's `ring-*` utilities, which compose their
+ * shadow from custom properties: a keyframe cannot animate a value assembled that way.
+ * `color-mix` keeps the accent at the 60% the utility used. */
+@keyframes approval-ring-out {
+  from {
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--color-accent) 60%, transparent);
+  }
+  to {
+    box-shadow: 0 0 0 1px transparent;
+  }
+}
+
+@keyframes approval-label-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+.approval-ring {
+  animation-name: approval-ring-out;
+  animation-timing-function: ease-out;
+  animation-fill-mode: forwards;
+}
+
+.approval-label {
+  animation-name: approval-label-out;
+  animation-timing-function: ease-out;
+  animation-fill-mode: forwards;
+}
+
+/* Reduced motion: the finished trace, at rest, and an accent that does not travel. The
+   screen still says it is loading -- through its text -- without anything moving. */
+@media (prefers-reduced-motion: reduce) {
+  .market-pulse-line {
+    animation: none;
+    stroke-dashoffset: 0;
+    opacity: 1;
+  }
+
+  .market-pulse-dot {
+    animation: none;
+    offset-distance: 100%;
+    opacity: 1;
+  }
+
+  .market-pulse-accent {
+    animation: none;
+    transform: translateX(88px);
+  }
+
+  /* The highlight still goes, at the same moment the component takes it away -- it simply
+     arrives and leaves without fading. With the ring's animation off there is no shadow at
+     all, which is the honest version of "no movement": the label says which batch it is,
+     does its three seconds, and goes. */
+  .approval-ring,
+  .approval-label {
+    animation: none;
+  }
+}
+
+/* =======================================================================================
+   The Aurora startup screen.
+   =======================================================================================
+
+   Everything here is scoped to `.aurora-splash*`. No rule below selects anything outside
+   that subtree, and nothing outside it selects these names, so the rest of the application
+   animates exactly as it did before this screen existed.
+
+   The palette lives here as custom properties rather than in `@theme`, because these are
+   this screen's colours and not the application's: a `--color-*` in `@theme` becomes a
+   utility that any component can reach for, and the aurora's near-black indigos are not
+   surfaces anything else should be able to pick up by accident.
+
+   Layout, type sizes and spacing are Tailwind's, on the element, as everywhere else in this
+   application. What is here is what Tailwind cannot say: gradients, blurs, and the
+   animations. Nothing here sets a property Tailwind also sets on the same element, so the
+   two never have to be resolved against each other by stylesheet order. */
+.aurora-splash {
+  --aurora-base: #060913;
+  --aurora-navy: #0b1024;
+  --aurora-indigo: #151238;
+  --aurora-violet: #8b45ff;
+  --aurora-violet-bright: #a65bff;
+  --aurora-violet-muted: #49319a;
+  --aurora-text: #f4f4f8;
+  --aurora-text-dim: #a8b1c9;
+  --aurora-label: #78849f;
+
+  color: var(--aurora-text);
+  /* Layered rather than one flat fill: a single colour at this darkness reads as a hole in
+     the screen, and what the composition needs is a room with the lights low. The middle
+     layer is the violet wash behind the logo, the lower one is the light reaching the floor,
+     and the top one keeps the corners at almost nothing. */
+  background-color: var(--aurora-base);
+  background-image:
+    radial-gradient(
+      58% 42% at 50% 47%,
+      color-mix(in srgb, var(--aurora-violet) 15%, transparent) 0%,
+      transparent 72%
+    ),
+    radial-gradient(
+      90% 55% at 50% 112%,
+      color-mix(in srgb, var(--aurora-indigo) 85%, transparent) 0%,
+      transparent 70%
+    ),
+    linear-gradient(180deg, var(--aurora-navy) 0%, var(--aurora-base) 58%, #04060d 100%);
+}
+
+/* --- The aurora itself ---------------------------------------------------------------- */
+
+.aurora-splash__ribbon {
+  position: absolute;
+  left: 50%;
+  top: 44%;
+  width: 150%;
+  margin-left: -75%;
+  border-radius: 50%;
+  /* Blurred to the point where the band has no edge left, which is what separates light from
+     a shape. Values this large are cheap here: there are three of these and they never move
+     in response to anything. */
+  filter: blur(72px);
+  will-change: transform, opacity;
+}
+
+.aurora-splash__ribbon--one {
+  height: 190px;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--aurora-violet-muted) 32%,
+    var(--aurora-violet) 62%,
+    transparent 100%
+  );
+  animation: aurora-splash-drift 14s ease-in-out infinite;
+}
+
+.aurora-splash__ribbon--two {
+  top: 50%;
+  height: 260px;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--aurora-violet) 28%,
+    var(--aurora-violet-bright) 58%,
+    var(--aurora-indigo) 82%,
+    transparent 100%
+  );
+  animation: aurora-splash-drift 17s ease-in-out -5s infinite;
+}
+
+.aurora-splash__ribbon--three {
+  top: 38%;
+  height: 150px;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--aurora-indigo) 30%,
+    var(--aurora-violet-bright) 70%,
+    transparent 100%
+  );
+  animation: aurora-splash-drift 20s ease-in-out -11s infinite;
+}
+
+/* Slow, wide, and never fully extinguished: the band crosses the screen and comes back, and
+   the eye is not meant to catch it arriving. `translate3d` and `opacity` only, so the work
+   stays on the compositor rather than repainting a blurred layer sixty times a second. */
+@keyframes aurora-splash-drift {
+  0%,
+  100% {
+    transform: translate3d(-5%, -3%, 0) scaleY(1);
+    opacity: 0.3;
+  }
+  50% {
+    transform: translate3d(5%, 2%, 0) scaleY(1.22);
+    opacity: 0.52;
+  }
+}
+
+/* --- The chart ------------------------------------------------------------------------ */
+
+.aurora-splash__chart-ink {
+  /* The reveal is a fade, not a stroke drawn along the path. `stroke-dasharray` reveals a
+     path by fraction of its length, and this path is stretched to the viewport and stroked
+     with `vector-effect`, so the dash and the drawn line would be measured in two different
+     spaces. The group fading in says the same thing without that question. */
+  opacity: 0;
+  animation: aurora-splash-chart-in 1.9s ease-out forwards;
+}
+
+@keyframes aurora-splash-chart-in {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.aurora-splash__chart-line {
+  /* Enough glow to read the line as lit rather than as drawn, and no more. `drop-shadow`
+     rather than an SVG filter because it follows the stretched stroke instead of the grid. */
+  filter: drop-shadow(0 0 6px color-mix(in srgb, var(--aurora-violet) 45%, transparent));
+}
+
+.aurora-splash__chart-candles {
+  opacity: 0;
+  animation: aurora-splash-candles-in 2.4s ease-out 0.2s forwards;
+}
+
+@keyframes aurora-splash-candles-in {
+  to {
+    opacity: 1;
+  }
+}
+
+.aurora-splash__chart-candle {
+  /* Behind the line, not competing with it: the bars are there to say "a market was here" at
+     a glance, and anything that can be read bar by bar is too loud for a background. */
+  fill: var(--aurora-violet-muted);
+  opacity: 0.3;
+}
+
+.aurora-splash__node {
+  position: absolute;
+  width: 7px;
+  height: 7px;
+  /* Centred on its own coordinate by margin rather than by a translate, so that `transform`
+     is left free for the pulse below. */
+  margin: -3.5px 0 0 -3.5px;
+  border-radius: 50%;
+  background: var(--aurora-violet-bright);
+  box-shadow: 0 0 10px 2px color-mix(in srgb, var(--aurora-violet-bright) 55%, transparent);
+  animation: aurora-splash-node 5.5s ease-in-out infinite;
+}
+
+.aurora-splash__node--2 {
+  animation-delay: -1.4s;
+}
+
+.aurora-splash__node--3 {
+  animation-delay: -2.8s;
+}
+
+.aurora-splash__node--4 {
+  animation-delay: -4.2s;
+}
+
+/* Never off, never bright: at no point in this cycle is a node invisible or a highlight, so
+   the four of them read as points on a line rather than as four blinking lights. */
+@keyframes aurora-splash-node {
+  0%,
+  100% {
+    opacity: 0.3;
+    transform: scale(0.8);
+  }
+  50% {
+    opacity: 0.85;
+    transform: scale(1.12);
+  }
+}
+
+/* --- The glow under everything -------------------------------------------------------- */
+
+.aurora-splash__glow {
+  position: absolute;
+  left: 50%;
+  bottom: -20%;
+  width: min(1150px, 135%);
+  height: 400px;
+  margin-left: calc(min(1150px, 135%) / -2);
+  border-radius: 50%;
+  background: radial-gradient(
+    closest-side,
+    color-mix(in srgb, var(--aurora-violet) 30%, transparent) 0%,
+    transparent 100%
+  );
+  filter: blur(80px);
+  opacity: 0.45;
+}
+
+/* --- The logo ------------------------------------------------------------------------- */
+
+.aurora-splash__ring {
+  /* A whole turn every three seconds, on the element: the arc and its head are inside it and
+     travel with it, and the track they sit on is a circle, so turning it is invisible apart
+     from what it is meant to move. `linear` because a loading indicator that eases is a
+     loading indicator that looks like it is stalling. */
+  animation: aurora-splash-spin 3s linear infinite;
+  transform-origin: 50% 50%;
+}
+
+@keyframes aurora-splash-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* The track the arc runs on: dark and translucent, so the ring is a circle the light travels
+   round rather than a second lit arc competing with the first. */
+.aurora-splash__ring-track {
+  stroke: color-mix(in srgb, var(--aurora-violet-muted) 42%, transparent);
+}
+
+.aurora-splash__ring-head {
+  fill: #d9b8ff;
+  filter: drop-shadow(0 0 5px var(--aurora-violet-bright));
+}
+
+.aurora-splash__mark {
+  filter: drop-shadow(0 0 14px color-mix(in srgb, var(--aurora-violet-bright) 60%, transparent));
+}
+
+/* --- Type, dots and the corner label -------------------------------------------------- */
+
+.aurora-splash__title {
+  color: var(--aurora-text);
+}
+
+.aurora-splash__title-ai {
+  color: var(--aurora-violet-bright);
+}
+
+.aurora-splash__subtitle {
+  color: var(--aurora-text-dim);
+}
+
+.aurora-splash__label {
+  color: var(--aurora-label);
+}
+
+.aurora-splash__dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--aurora-violet-muted);
+  animation: aurora-splash-dot 1.7s ease-in-out infinite;
+}
+
+.aurora-splash__dot--two {
+  background: var(--aurora-violet-bright);
+  box-shadow: 0 0 12px color-mix(in srgb, var(--aurora-violet-bright) 65%, transparent);
+  animation-delay: 0.18s;
+}
+
+.aurora-splash__dot--three {
+  animation-delay: 0.36s;
+}
+
+/* A brightness pulse rather than a movement, and shallow: three dots trading places in a
+   sweeping wave is a progress bar, and this screen has no progress to report. */
+@keyframes aurora-splash-dot {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+/* Reduced motion: the screen arrives already composed instead of assembling itself. The
+   chart is the one thing that would otherwise be missing rather than merely still -- its
+   group starts at `opacity: 0` and is brought in by the animation, so with the animation off
+   that starting value has to be undone here or the line never appears at all. */
+@media (prefers-reduced-motion: reduce) {
+  .aurora-splash__ribbon,
+  .aurora-splash__ring,
+  .aurora-splash__node,
+  .aurora-splash__dot {
+    animation: none;
+  }
+
+  .aurora-splash__chart-ink,
+  .aurora-splash__chart-candles {
+    animation: none;
+    opacity: 1;
+  }
+}

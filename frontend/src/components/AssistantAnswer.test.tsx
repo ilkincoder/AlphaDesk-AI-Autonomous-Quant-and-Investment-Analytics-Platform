@@ -5,11 +5,11 @@
  * evidence -- and whether a `javascript:` link in a filing passage can become a click.
  */
 
-import { fireEvent, render, screen, within } from '@testing-library/react'
+import { render, screen, within } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
 
 import { aTurn } from '../testing'
-import { AssistantAnswer } from './AssistantAnswer'
+import { AnswerDraft, AssistantAnswer } from './AssistantAnswer'
 
 function withPassage() {
   return aTurn({
@@ -77,6 +77,51 @@ function withPassage() {
   })
 }
 
+/** A tool result carrying what a real insider analysis carries: one row per transaction, each
+ *  naming the Form 4 it was read from. The URLs are the SEC archive ones, not invented ones. */
+function insiderResult(rows = 2) {
+  return {
+    transactions: {
+      included: Array.from({ length: rows }, (_, index) => ({
+        accession_number: `0001045810-26-00003${index + 1}`,
+        source_document_url: `https://www.sec.gov/Archives/edgar/data/1045810/00010458102600003${index + 1}/form4.xml`,
+      })),
+    },
+  }
+}
+
+/** A financial-facts result, whose source documents are 10-Ks -- `.htm`, so already readable. */
+function financialFactsResult() {
+  return {
+    observations: [
+      {
+        accession_number: '0001045810-26-000021',
+        concept: 'Revenues',
+        source_reference:
+          'https://www.sec.gov/Archives/edgar/data/1045810/000104581026000021/nvda-20260125.htm',
+      },
+    ],
+  }
+}
+
+function withToolResult(summary: Record<string, unknown>) {
+  return aTurn({
+    evidence: [
+      {
+        reference: 'E1',
+        kind: 'tool_result',
+        tool: 'market_insider_analysis',
+        symbol: 'NVDA',
+        label: 'market_insider_analysis result for NVDA',
+        status: 'ok',
+        summary,
+        citation: null,
+        trimmed: false,
+      },
+    ],
+  })
+}
+
 describe('AssistantAnswer', () => {
   it('renders the answer’s Markdown, not its source', () => {
     render(
@@ -105,54 +150,22 @@ describe('AssistantAnswer', () => {
     expect(table.parentElement?.className).toContain('overflow-x-auto')
   })
 
-  it('makes a citation a control when that reference is evidence for this answer', () => {
+  it('strips the reference markers out of the answer, space and all', () => {
     render(<AssistantAnswer turn={withPassage()} />)
 
-    expect(screen.getByRole('button', { name: 'Show evidence E1' })).toBeDefined()
+    // The sources are listed under the answer. A marker in the prose is not a second copy of
+    // them, it is something in the middle of a sentence -- and the space in front of it goes
+    // too, or the full stop would be left with a gap before it.
+    expect(screen.queryByText(/\[E\d+\]/)).toBeNull()
+    expect(screen.getByText('Export controls matter. A second point.')).toBeDefined()
   })
 
-  it('leaves an unresolved citation as plain text, not a dead control', () => {
+  it('strips a marker even when it names nothing this turn has', () => {
     render(<AssistantAnswer turn={aTurn({ answer: 'Something [E9].', evidence: [] })} />)
 
-    expect(screen.queryByRole('button', { name: 'Show evidence E9' })).toBeNull()
-    expect(screen.getByText(/\[E9\]/)).toBeDefined()
-  })
-
-  it('scopes evidence ids by turn, so E1 in two answers is two targets', () => {
-    const first = withPassage()
-    const second = withPassage()
-    second.turn_id = 'turn-2'
-    second.answer = 'A different answer [E1].'
-
-    render(
-      <>
-        <AssistantAnswer turn={first} />
-        <AssistantAnswer turn={second} />
-      </>,
-    )
-
-    // Two controls, two distinct targets: clicking the second answer's E1 must not open the
-    // first answer's evidence.
-    const controls = screen.getAllByRole('button', { name: 'Show evidence E1' })
-    expect(controls).toHaveLength(2)
-
-    fireEvent.click(controls[1])
-    const target = document.getElementById('evidence-turn-2-E1')
-    expect(target).not.toBeNull()
-    expect(document.getElementById('evidence-turn-1-E1')).not.toBeNull()
-    // And they really are different elements.
-    expect(target).not.toBe(document.getElementById('evidence-turn-1-E1'))
-  })
-
-  it('opens the sources when a citation is pressed', () => {
-    render(<AssistantAnswer turn={withPassage()} />)
-
-    const sources = screen.getByText(/Sources and evidence/).closest('details')
-    expect(sources?.open).toBe(false)
-
-    fireEvent.click(screen.getByRole('button', { name: 'Show evidence E1' }))
-
-    expect(screen.getByText(/Sources and evidence/).closest('details')?.open).toBe(true)
+    // Stripping is by shape, not by whether the reference resolves: what the reader must not
+    // see is the marker itself, and a stray one is exactly the case where it would show.
+    expect(screen.getByText('Something.')).toBeDefined()
   })
 
   it('shows what the evidence actually holds, including the filing it came from', () => {
@@ -176,6 +189,73 @@ describe('AssistantAnswer', () => {
     expect(link.getAttribute('href')).toBe(
       'https://www.sec.gov/Archives/edgar/data/1045810/000104581026000021/nvda-20260125.htm',
     )
+  })
+
+  it('links to the filings a structured result came from', () => {
+    render(<AssistantAnswer turn={withToolResult(insiderResult())} />)
+
+    const link = screen.getByRole('link', { name: /0001045810-26-000031/ })
+    // The readable page for the filing, not the Form 4's XML: a browser renders that as a raw
+    // tree, which is not something a reader can use.
+    expect(link.getAttribute('href')).toBe(
+      'https://www.sec.gov/Archives/edgar/data/1045810/000104581026000031/0001045810-26-000031-index.htm',
+    )
+  })
+
+  it('links a document that already opens as a page unchanged', () => {
+    render(<AssistantAnswer turn={withToolResult(financialFactsResult())} />)
+
+    expect(
+      screen.getByRole('link', { name: /0001045810-26-000021/ }).getAttribute('href'),
+    ).toBe(
+      'https://www.sec.gov/Archives/edgar/data/1045810/000104581026000021/nvda-20260125.htm',
+    )
+  })
+
+  it('lists one link per filing, however many rows cite it', () => {
+    const summary = insiderResult()
+    const transactions = (summary.transactions as { included: unknown[] }).included
+    // Two rows on the same form, which is the ordinary case: one Form 4 can report
+    // several transactions.
+    transactions.push(transactions[0])
+
+    render(<AssistantAnswer turn={withToolResult(summary)} />)
+
+    expect(screen.getAllByRole('link', { name: /0001045810-26-000031/ })).toHaveLength(1)
+  })
+
+  it('counts the filings it does not list, so a short list is not read as the whole one', () => {
+    render(<AssistantAnswer turn={withToolResult(insiderResult(7))} />)
+
+    expect(screen.getAllByRole('link', { name: /Open filing/ })).toHaveLength(5)
+    expect(screen.getByText('and 2 more')).toBeDefined()
+  })
+
+  it('does not turn a source URL that is not https into a click', () => {
+    const summary = insiderResult()
+    const transactions = summary.transactions as {
+      included: { source_document_url: string }[]
+    }
+    transactions.included[0].source_document_url = 'javascript:alert(1)'
+
+    render(<AssistantAnswer turn={withToolResult(summary)} />)
+
+    expect(screen.queryByRole('link', { name: /0001045810-26-000031/ })).toBeNull()
+  })
+
+  it('rewrites only documents that are really SEC archive documents', () => {
+    const summary = insiderResult()
+    const transactions = summary.transactions as {
+      included: { source_document_url: string }[]
+    }
+    // An XML document somewhere else is not assumed to have an EDGAR filing page beside it.
+    transactions.included[0].source_document_url = 'https://example.test/data/form4.xml'
+
+    render(<AssistantAnswer turn={withToolResult(summary)} />)
+
+    expect(
+      screen.getByRole('link', { name: /0001045810-26-000031/ }).getAttribute('href'),
+    ).toBe('https://example.test/data/form4.xml')
   })
 
   it('does not render raw HTML from the answer', () => {
@@ -265,5 +345,31 @@ describe('AssistantAnswer', () => {
     expect(details?.open).toBe(false)
     expect(within(details as HTMLElement).getByText(/market_insider_analysis/)).toBeDefined()
     expect(within(details as HTMLElement).getByText(/5 model requests/)).toBeDefined()
+  })
+})
+
+describe('AnswerDraft', () => {
+  it('shows the prose and says plainly that nothing has checked it', () => {
+    render(<AnswerDraft text="NVDA rose slightly over the window." />)
+
+    expect(screen.getByText('Answer being written')).toBeDefined()
+    expect(screen.getByText('Not checked yet')).toBeDefined()
+    expect(screen.getByText(/sources have not been checked yet/)).toBeDefined()
+    expect(screen.getByText('NVDA rose slightly over the window.')).toBeDefined()
+  })
+
+  it('strips a reference from the draft as well as from the answer', () => {
+    render(<AnswerDraft text="Insiders were sellers [E1]." />)
+
+    // The draft and the answer are the same kind of text, and a marker must not survive in
+    // either -- including here, where the run that wrote it can still withdraw the sentence.
+    expect(screen.getByText('Insiders were sellers.')).toBeDefined()
+  })
+
+  it('does not make a link clickable in text that is still being written', () => {
+    render(<AnswerDraft text="See [the filing](https://www.sec.gov/Archives/x.htm)." />)
+
+    expect(screen.queryByRole('link')).toBeNull()
+    expect(screen.getByText('the filing')).toBeDefined()
   })
 })

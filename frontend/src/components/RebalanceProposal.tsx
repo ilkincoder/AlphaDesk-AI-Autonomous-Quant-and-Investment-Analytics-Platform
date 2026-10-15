@@ -112,7 +112,7 @@ function DecisionFooter({
           </p>
           <p className="mt-0.5 text-label text-faint">
             {decision.decision === 'approved'
-              ? 'These exact orders were approved. Their progress is on the Orders page.'
+              ? 'These exact orders were approved. Their progress is reported on the news page, and in full on the Orders page.'
               : 'No orders were created, and a rejected proposal cannot afterwards be approved.'}
           </p>
         </div>

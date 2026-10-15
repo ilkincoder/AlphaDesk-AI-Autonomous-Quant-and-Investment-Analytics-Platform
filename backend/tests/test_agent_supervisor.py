@@ -24,6 +24,7 @@ from app.agent.evidence import EvidenceMap
 from app.agent.module1 import Module1Outcome
 from app.agent.module2 import ProposalOutcome
 from app.agent.supervisor import (
+    DRAFT_CHUNK_CHARS,
     MAX_EVIDENCE_IN_PROMPT,
     Destination,
     SupervisorOutcome,
@@ -34,6 +35,7 @@ from app.agent.supervisor import (
     parse_route,
     run_supervisor,
 )
+from app.agent.progress import KIND_ANSWER_DRAFT, NULL_PROGRESS, ProgressEvent
 from tests.agent_doubles import (
     AUTH_ERROR,
     RESPONSE_ERROR,
@@ -85,7 +87,7 @@ def with_evidence(*entries):
     return evidence
 
 
-def run(script, *, evidence=None, agent=None, budget=None, request=None):
+def run(script, *, evidence=None, agent=None, budget=None, request=None, progress=None):
     model = ScriptedModel(script)
     outcome = run_supervisor(
         client=model,
@@ -93,8 +95,26 @@ def run(script, *, evidence=None, agent=None, budget=None, request=None):
         budget=budget or RunBudget(),
         evidence=evidence if evidence is not None else with_evidence({}),
         run_module1_call=lambda context: agent or an_agent(),
+        progress=progress if progress is not None else NULL_PROGRESS,
     )
     return outcome, model
+
+
+def a_composition_prompt() -> str:
+    """The per-run instruction the Supervisor composes the answer from."""
+    return compose_request(
+        context=type(
+            "C",
+            (),
+            {
+                "question": "q",
+                "describe_for_prompt": lambda self: "Company: NVDA",
+            },
+        )(),
+        route=SupervisorRoute(destination=Destination.MODULE1_ANALYSIS),
+        module1=an_agent(limitations=["insufficient_coverage: the sample is thin"]),
+        evidence=with_evidence({}),
+    )
 
 
 class RoutingTests(unittest.TestCase):
@@ -410,6 +430,66 @@ class CitationTests(unittest.TestCase):
         self.assertEqual(len(model.requests), 3)
 
 
+class AnswerDraftTests(unittest.TestCase):
+    """The answer, as it is handed to a client while it is still being written.
+
+    What matters here is that the draft is a *draft*: everything the run went on to accept, sent
+    early, and replaced rather than appended to when a correction rewrites it.
+    """
+
+    def drafts(self, script):
+        events: list[ProgressEvent] = []
+        run(script, progress=events.append)
+        return [event for event in events if event.kind == KIND_ANSWER_DRAFT]
+
+    def test_a_short_answer_is_still_sent_as_a_draft(self):
+        drafts = self.drafts([route(), say("The price rose [E1].")])
+
+        self.assertEqual(len(drafts), 1)
+        self.assertEqual(drafts[-1].data["text"], "The price rose [E1].")
+
+    def test_the_draft_grows_and_always_contains_what_came_before(self):
+        answer = "The price rose over the window. " * 20 + "[E1]"
+
+        drafts = self.drafts([route(), say(answer)])
+
+        self.assertGreater(len(drafts), 1)
+        for earlier, later in zip(drafts, drafts[1:]):
+            self.assertTrue(later.data["text"].startswith(earlier.data["text"]))
+        self.assertEqual(drafts[-1].data["text"], answer)
+
+    def test_a_draft_is_not_sent_for_every_delta(self):
+        """The provider writes a few characters at a time; the client is not sent each one.
+
+        The queue behind the stream holds a few dozen events and drops the oldest, so a stream
+        that sent every delta would spend the whole channel on one answer's text.
+        """
+        answer = "x" * (DRAFT_CHUNK_CHARS * 4)
+
+        drafts = self.drafts([route(), say(answer)])
+
+        # The scripted model hands out seven characters at a time: 69 deltas, four drafts.
+        self.assertEqual(len(drafts), 4)
+        for draft in drafts[:-1]:
+            self.assertGreaterEqual(len(draft.data["text"]), DRAFT_CHUNK_CHARS)
+
+    def test_a_corrected_answer_replaces_the_draft_rather_than_appending_to_it(self):
+        drafts = self.drafts(
+            [route(), say("The price rose [E7]."), say("The price rose [E1].")]
+        )
+
+        self.assertEqual(drafts[-1].data["text"], "The price rose [E1].")
+        self.assertNotIn("[E7]", drafts[-1].data["text"])
+
+    def test_a_withheld_answer_still_sent_a_draft_that_the_reader_must_be_told_about(self):
+        """The case the label exists for: the text went out, and then it did not stand."""
+        drafts = self.drafts([route(), say("[E7]"), say("[E8]"), say("[E9]"), say("[E10]")])
+
+        self.assertEqual(drafts[-1].data["text"], "[E8]")
+        outcome, _ = run([route(), say("[E7]"), say("[E8]"), say("[E9]"), say("[E10]")])
+        self.assertIsNone(outcome.answer)
+
+
 class CompositionTests(unittest.TestCase):
     def test_the_answer_is_written_from_the_findings_and_the_evidence(self):
         evidence = with_evidence({"summary": {"change_percent": "0.1598"}})
@@ -597,23 +677,62 @@ class PromptContentTests(unittest.TestCase):
         self.assertIn("You do not call tools yourself", SUPERVISOR_PROMPT)
         self.assertIn("You have four read-only tools", MODULE1_PROMPT)
 
-    def test_the_composition_prompt_forbids_citing_what_was_not_given(self):
-        route_decision = SupervisorRoute(destination=Destination.MODULE1_ANALYSIS)
-        prompt = compose_request(
-            context=type(
-                "C",
-                (),
-                {
-                    "question": "q",
-                    "describe_for_prompt": lambda self: "Company: NVDA",
-                },
-            )(),
-            route=route_decision,
-            module1=an_agent(),
-            evidence=with_evidence({}),
-        )
+    def test_the_composition_prompt_forbids_reference_markers(self):
+        """It used to ask for one reference per claim. It now asks for none at all.
 
-        self.assertIn("using only references from the list above", prompt)
+        The ban has to be here as well as in `WRITING_STYLE`, because this is the text that is
+        sent together with the evidence list -- and a list of references is exactly what invites
+        the model to point at it.
+        """
+        prompt = a_composition_prompt()
+
+        self.assertIn("Write no reference markers at all", prompt)
+        self.assertIn("The list above is what you may say", prompt)
+
+    def test_the_supervisor_prompt_says_who_the_answer_is_for(self):
+        """The rules were all about truth and none about the reader, and the answers showed it."""
+        from app.agent.prompts import SUPERVISOR_PROMPT
+
+        self.assertIn("not an analyst", SUPERVISOR_PROMPT)
+        # A concrete length, because "be brief" is not one.
+        self.assertIn("around 200-300 words", SUPERVISOR_PROMPT)
+        # The opening sentence has to be the answer, not a preamble.
+        self.assertIn("Answer first", SUPERVISOR_PROMPT)
+        # Internal status names are for this application, not for a reader.
+        self.assertIn("Never write a status, a reason code or a field name", SUPERVISOR_PROMPT)
+        self.assertIn("`insufficient_coverage`", SUPERVISOR_PROMPT)
+
+    def test_the_supervisor_prompt_forbids_reference_markers(self):
+        """The rule used to be that a reference belonged to a claim rather than a sentence.
+
+        It is now that there are no references in the prose at all: the sources are printed
+        under the answer, and the application strips any marker it finds, so one left in would
+        reach the reader as a gap in a sentence.
+        """
+        from app.agent.prompts import SUPERVISOR_PROMPT
+
+        self.assertIn("Do not write reference markers", SUPERVISOR_PROMPT)
+        self.assertIn("it removes it", SUPERVISOR_PROMPT)
+
+    def test_the_composition_prompt_no_longer_asks_for_the_limitation_list_back(self):
+        """Every limitation still reaches the model; the answer is not asked to repeat them.
+
+        They are printed under the answer by the application, so restating them made the answer
+        twice as long and no more informative.
+        """
+        prompt = a_composition_prompt()
+
+        self.assertIn("They are printed under your answer in full", prompt)
+        self.assertNotIn("Carry every limitation forward", prompt)
+        self.assertNotIn("must be carried into the answer", prompt)
+        # And the list itself is still handed over, in full.
+        self.assertIn("insufficient_coverage", prompt)
+
+    def test_the_composition_prompt_asks_for_prose_rather_than_a_report(self):
+        prompt = a_composition_prompt()
+
+        self.assertIn("Do not restate the resolved company and dates as a header", prompt)
+        self.assertIn("One short answer, not a report.", prompt)
 
 
 if __name__ == "__main__":

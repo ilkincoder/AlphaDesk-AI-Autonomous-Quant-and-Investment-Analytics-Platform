@@ -26,7 +26,6 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import Any
 from urllib.parse import urlparse
 from xml.etree import ElementTree
 
@@ -414,11 +413,6 @@ def _get(url: str, transport: httpx.BaseTransport | None) -> str:
             f"Could not reach {url}. Check network connectivity from the backend "
             "container. Nothing was retried."
         ) from None
-
-
-def feed_document(feed: Feed) -> dict[str, Any]:
-    """One feed as plain values, for a command or a test to print."""
-    return {"key": feed.key, "title": feed.title, "source": feed.source, "url": feed.url}
 
 
 __all__ = [

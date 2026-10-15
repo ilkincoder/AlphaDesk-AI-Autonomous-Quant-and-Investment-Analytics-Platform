@@ -79,6 +79,59 @@ def a_completion(*, content="hello", tool_calls=None, prompt=10, completion=5):
     )
 
 
+def a_stream(*pieces, usage=True):
+    """A streamed completion, in the shape the SDK yields.
+
+    One chunk per delta, then a final chunk with **no choices at all** carrying the usage --
+    which is what the provider actually sends, and the reason usage cannot be read from
+    `choices[0]`.
+    """
+
+    def chunks():
+        for piece in pieces:
+            yield SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content=piece), finish_reason=None
+                    )
+                ],
+                usage=None,
+            )
+        yield SimpleNamespace(
+            choices=[],
+            usage=(
+                SimpleNamespace(prompt_tokens=30, completion_tokens=12, total_tokens=42)
+                if usage
+                else None
+            ),
+        )
+
+    return chunks()
+
+
+def a_stream_that_breaks(error: Exception, *, after: int = 0):
+    """A stream that fails part way, as a dropped connection does.
+
+    `after=0` fails before a single character is written, which is the retryable case;
+    anything higher fails with text already handed to the caller.
+    """
+
+    def chunks():
+        for index in range(after):
+            yield SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content=f"partial {index}"),
+                        finish_reason=None,
+                    )
+                ],
+                usage=None,
+            )
+        raise error
+
+    return chunks()
+
+
 class FakeOpenAI:
     """The SDK's client, reduced to the one call this code makes."""
 
@@ -331,6 +384,111 @@ class ErrorClassificationTests(unittest.TestCase):
             client.complete(messages=[], max_tokens=10)
 
         self.assertEqual(caught.exception.limit, "deadline_seconds")
+
+
+class StreamingTests(unittest.TestCase):
+    """The one call whose prose is handed out as it is written.
+
+    The shape asserted here is the provider's: one chunk per delta, and the token usage in a
+    final chunk that carries no choices at all. Verified against the live endpoint before this
+    was written -- a short answer arrived as eight chunks for eighteen characters, which is why
+    the caller batches deltas before sending them anywhere.
+    """
+
+    def test_the_text_is_handed_out_in_the_order_it_arrives(self):
+        client = a_client([a_stream("The ", "price ", "rose.")])
+        seen: list[str] = []
+
+        response = client.complete_streaming(
+            messages=[], max_tokens=10, on_delta=seen.append
+        )
+
+        self.assertEqual(seen, ["The ", "price ", "rose."])
+        self.assertEqual(response.content, "The price rose.")
+
+    def test_the_finished_response_is_the_same_shape_as_an_unstreamed_one(self):
+        client = a_client([a_stream("hello")])
+
+        response = client.complete_streaming(
+            messages=[], max_tokens=10, on_delta=lambda _: None
+        )
+
+        # No tools were asked for, so the appended turn carries no `tool_calls` key at all --
+        # the provider rejects an empty list where it expects the key to be absent.
+        self.assertEqual(response.tool_calls, ())
+        self.assertEqual(response.message, {"role": "assistant", "content": "hello"})
+
+    def test_usage_is_read_from_the_chunk_that_has_no_choices(self):
+        client = a_client([a_stream("hello")])
+
+        response = client.complete_streaming(
+            messages=[], max_tokens=10, on_delta=lambda _: None
+        )
+
+        self.assertEqual(response.prompt_tokens, 30)
+        self.assertEqual(response.completion_tokens, 12)
+
+    def test_the_request_streams_and_asks_for_usage(self):
+        fake = FakeOpenAI([a_stream("hello")])
+        client = DeepSeekClient(api_key="k", sleep=lambda _: None, _client=fake)
+
+        client.complete_streaming(messages=[], max_tokens=25, on_delta=lambda _: None)
+
+        payload = fake.payloads[0]
+        self.assertIs(payload["stream"], True)
+        # Without this the provider sends no usage block on a streamed response, and the run
+        # would report zero tokens for the call that wrote the answer.
+        self.assertEqual(payload["stream_options"], {"include_usage": True})
+        self.assertEqual(payload["max_tokens"], 25)
+        # Thinking mode is disabled here exactly as it is on the other call.
+        self.assertEqual(payload["extra_body"], {"thinking": {"type": "disabled"}})
+        self.assertNotIn("tools", payload)
+
+    def test_a_stream_that_reports_no_usage_says_so_rather_than_claiming_zero(self):
+        client = a_client([a_stream("hello", usage=False)])
+
+        with self.assertLogs("app.agent.llm", level="WARNING"):
+            response = client.complete_streaming(
+                messages=[], max_tokens=10, on_delta=lambda _: None
+            )
+
+        self.assertEqual(response.total_tokens, 0)
+
+    def test_a_failure_before_any_text_is_retried(self):
+        budget = RunBudget(max_transient_retries=1)
+        client = a_client(
+            [a_stream_that_breaks(an_error("connection", 500)), a_stream("recovered")],
+            budget=budget,
+        )
+        seen: list[str] = []
+
+        response = client.complete_streaming(
+            messages=[], max_tokens=10, on_delta=seen.append
+        )
+
+        self.assertEqual(response.content, "recovered")
+        self.assertEqual(seen, ["recovered"])
+        self.assertEqual(budget.transient_retries, 1)
+
+    def test_a_failure_after_text_has_been_written_is_not_retried(self):
+        """A second attempt would start a new answer under the half-written one, and nothing
+        in the text would say which was which. The failure is reported instead."""
+        budget = RunBudget(max_transient_retries=3)
+        fake = FakeOpenAI(
+            [a_stream_that_breaks(an_error("connection", 500), after=1), a_stream("second try")]
+        )
+        client = DeepSeekClient(
+            api_key="k", sleep=lambda _: None, budget=budget, _client=fake
+        )
+        seen: list[str] = []
+
+        with self.assertRaises(ProviderUnavailableError):
+            client.complete_streaming(messages=[], max_tokens=10, on_delta=seen.append)
+
+        self.assertEqual(seen, ["partial 0"])
+        # One attempt, and the retry that was available went unused.
+        self.assertEqual(len(fake.payloads), 1)
+        self.assertEqual(budget.transient_retries, 0)
 
 
 class ClientConstructionTests(unittest.TestCase):

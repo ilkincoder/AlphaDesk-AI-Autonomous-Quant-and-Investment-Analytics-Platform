@@ -25,7 +25,6 @@ this system holds no data for.
 
 import logging
 import uuid
-from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
 
@@ -85,17 +84,6 @@ STATUS_SERVICE_FAILED = "service_failed"
 STATUS_CONFIGURATION_ERROR = "configuration_error"
 STATUS_INVALID_CITATIONS = "invalid_citations"
 
-# The statuses that mean the run did not produce a usable answer.
-FAILED_STATUSES = frozenset(
-    {
-        STATUS_BUDGET_EXHAUSTED,
-        STATUS_PROVIDER_FAILED,
-        STATUS_SERVICE_FAILED,
-        STATUS_CONFIGURATION_ERROR,
-    }
-)
-
-
 class RunResult(BaseModel):
     """Everything one run produced, in a shape a caller can act on.
 
@@ -142,19 +130,6 @@ class RunResult(BaseModel):
 
     def as_json(self) -> dict[str, Any]:
         return self.model_dump(mode="json")
-
-
-@dataclass
-class RunDependencies:
-    """What a run needs from the outside, injectable so tests can supply doubles.
-
-    `client` is required. Defaulting it to a real client would mean a test that forgot to
-    pass one quietly made a network call and spent money.
-    """
-
-    client: ModelClient
-    budget: RunBudget
-    known_symbols: KnownSymbols | None = None
 
 
 def run_analysis(
@@ -510,8 +485,6 @@ def _known_symbols() -> KnownSymbols:
 
 
 __all__ = [
-    "FAILED_STATUSES",
-    "RunDependencies",
     "RunResult",
     "STATUS_BUDGET_EXHAUSTED",
     "STATUS_CLARIFICATION_NEEDED",

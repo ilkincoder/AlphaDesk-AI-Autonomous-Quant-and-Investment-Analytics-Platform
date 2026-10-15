@@ -21,7 +21,7 @@ const LIST_KEY = 'alphadesk.analysis.conversations'
 
 /** How many conversations are remembered. Enough to be useful, bounded so a long-lived
  *  browser cannot grow this without limit. */
-export const MAX_STORED_CONVERSATIONS = 20
+const MAX_STORED_CONVERSATIONS = 20
 
 function read(key: string): string | null {
   try {

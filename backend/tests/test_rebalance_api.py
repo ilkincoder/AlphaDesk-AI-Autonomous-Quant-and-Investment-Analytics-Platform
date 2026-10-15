@@ -27,10 +27,9 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from app import proposals
 from app.models import Holding, Portfolio, RebalanceProposal
 from app.portfolio_identity import DEMO_PORTFOLIO_NAME
-from app.agent.progress import KIND_DONE, KIND_STAGE, ProgressEvent
+from app.agent.progress import KIND_DONE, KIND_STAGE, ProgressEvent, drain_events
 from app.rebalance_api import (
     RETRY_AFTER_SECONDS,
-    _drain,
     get_proposal,
     post_proposal,
     post_proposal_stream,
@@ -723,7 +722,7 @@ class StreamTest(ProposalApiTestCase):
 
         threading.Thread(target=feed, daemon=True).start()
 
-        frames = "".join(_drain(events))
+        frames = "".join(drain_events(events))
 
         self.assertEqual(
             frames,

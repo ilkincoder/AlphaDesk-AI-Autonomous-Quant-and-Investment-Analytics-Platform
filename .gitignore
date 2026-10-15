@@ -14,5 +14,7 @@ dist/
 .idea/
 .DS_Store
 
-# Generated tool state (code-analysis working directory), not source
-.ua/
+# Claude Code. The shared settings are worth committing; the .local file is this machine's,
+# and it is ignored here rather than left to be committed by accident.
+.claude/settings.local.json
+

@@ -16,15 +16,25 @@ no budget internals. Everything an event carries is something the finished resul
 exposes: the destination, the resolved dates, which tool ran and how it went. A progress
 channel that leaks more than the result would be a new disclosure surface, not a convenience.
 
+**One event carries prose, and it is provisional.** `answer_draft` is the answer as the model
+writes it, which is the one thing a reader is waiting for and the one thing a finished result
+cannot convey any other way. It is emitted *before* the answer is final -- the run can still send
+the text back for a correction, or stop before it has one -- so what it shows can still change.
+The terminal event always carries the version that stands, and a reader must be told the draft is
+not final. It is a snapshot of
+everything written so far rather than a delta, so an event lost to a full queue is repaired by
+the next one instead of leaving a hole in the middle of a sentence.
+
 **Progress is a courtesy, never a dependency.** Every emission is wrapped, so an emitter that
 raises logs and the run continues. A client watching a run must not be able to break it, and a
 client that stops watching must not stop it either -- `app.analysis_api` runs the analysis on
 its own thread for exactly that reason.
 """
 
+import json
 import logging
 import queue
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -36,6 +46,10 @@ KIND_ROUTING = "routing"
 KIND_TOOL = "tool"
 KIND_FINDINGS = "findings"
 KIND_COMPOSING = "composing"
+# The answer, as it is being written. A snapshot of the prose so far, not a delta -- see the
+# module docstring. The only event that carries model output, and the only one whose content is
+# provisional.
+KIND_ANSWER_DRAFT = "answer_draft"
 # A named stage of a workflow that has no tools and no routing -- the Module 2 proposal run,
 # which synchronises, retrieves, proposes and calculates. It is the same rule as the kinds
 # above: emitted by the code that did the work, for a step the run actually has, never a timer
@@ -138,7 +152,36 @@ class QueueProgress:
             self.dropped += 1
 
 
+def sse_frame(event: ProgressEvent) -> str:
+    """One server-sent event, over the wire.
+
+    The kind is on the `event:` line and repeated inside the data. The repetition is
+    deliberate: a client that reads only `data` -- which is most of them, and how the frontend
+    here is written -- gets a self-describing payload rather than having to parse two lines in
+    step.
+
+    Here rather than in either of the two routes that write it, because it is the other end of
+    `QueueProgress` above: what one puts on a queue, this turns into bytes, and the two streams
+    in this application must not be able to frame an event differently from each other.
+    """
+    return f"event: {event.kind}\ndata: {json.dumps(event.as_dict())}\n\n"
+
+
+def drain_events(events: "queue.Queue[ProgressEvent]") -> Iterator[str]:
+    """Yield queued events as frames until a terminal one.
+
+    Returns as soon as an outcome arrives, so a handler thread is never left waiting on a
+    queue nothing will write to again.
+    """
+    while True:
+        event = events.get()
+        yield sse_frame(event)
+        if event.terminal:
+            return
+
+
 __all__ = [
+    "KIND_ANSWER_DRAFT",
     "KIND_COMPOSING",
     "KIND_DONE",
     "KIND_ERROR",
@@ -152,5 +195,7 @@ __all__ = [
     "ProgressEvent",
     "QueueProgress",
     "TERMINAL_KINDS",
+    "drain_events",
     "safe",
+    "sse_frame",
 ]

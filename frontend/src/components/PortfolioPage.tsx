@@ -63,7 +63,20 @@ function RefreshIcon() {
  * on its own, and it has to: a hidden page that kept syncing every thirty seconds would
  * spend the reader's broker quota on a screen nobody is looking at.
  */
-export function PortfolioPage({ active = true }: { active?: boolean }) {
+export function PortfolioPage({
+  active = true,
+  onLoaded,
+}: {
+  active?: boolean
+  /** Called once every read has settled, whichever way it went.
+   *
+   * This page is the one the application opens on, so its first read is what "the workspace
+   * is ready" means -- there is no separate startup call, and inventing one would be a
+   * second thing to wait for that tells the reader nothing the first does not. Fired after
+   * every read rather than only the first: which of them is the startup one is the shell's
+   * question, and it already knows. */
+  onLoaded?: () => void
+}) {
   const [state, setState] = useState<State>({ phase: 'loading' })
   const [refreshing, setRefreshing] = useState(false)
   // A ref, not state: this is a guard against a second call, and setting state would not
@@ -104,8 +117,11 @@ export function PortfolioPage({ active = true }: { active?: boolean }) {
     } finally {
       inFlight.current = false
       setRefreshing(false)
+      // After the state is set, so whatever the shell does about it happens once this page
+      // already has something to show.
+      onLoaded?.()
     }
-  }, [])
+  }, [onLoaded])
 
   useEffect(() => {
     if (!active) return

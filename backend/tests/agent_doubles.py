@@ -33,11 +33,6 @@ def call(call_id: str, name: str, **arguments: Any) -> dict[str, Any]:
     return {"id": call_id, "name": name, "arguments": json.dumps(arguments)}
 
 
-def raw_call(call_id: str, name: str, arguments: str) -> dict[str, Any]:
-    """A tool call whose argument string is not valid JSON, for the failure paths."""
-    return {"id": call_id, "name": name, "arguments": arguments}
-
-
 def say(content: str) -> tuple[str, list]:
     """A turn with prose and no tool calls."""
     return (content, [])
@@ -128,6 +123,42 @@ class ScriptedModel:
         response_format: Mapping[str, Any] | None = None,
         max_tokens: int,
     ) -> ModelResponse:
+        return self._next_turn(
+            messages=messages,
+            tools=tools,
+            response_format=response_format,
+            max_tokens=max_tokens,
+        )
+
+    def complete_streaming(
+        self,
+        *,
+        messages: Sequence[Mapping[str, Any]],
+        max_tokens: int,
+        on_delta: Any,
+    ) -> ModelResponse:
+        """The same scripted turn, handed out a piece at a time.
+
+        The pieces are deliberately smaller than the caller's own chunk size and there are
+        deliberately more than one of them: a caller that batches deltas before sending them
+        on is only tested by a stream that would have to be batched.
+        """
+        response = self._next_turn(
+            messages=messages, tools=None, response_format=None, max_tokens=max_tokens
+        )
+        content = response.content or ""
+        for start in range(0, len(content), 7):
+            on_delta(content[start : start + 7])
+        return response
+
+    def _next_turn(
+        self,
+        *,
+        messages: Sequence[Mapping[str, Any]],
+        tools: Sequence[Mapping[str, Any]] | None,
+        response_format: Mapping[str, Any] | None,
+        max_tokens: int,
+    ) -> ModelResponse:
         self.requests.append(
             {
                 "messages": [dict(message) for message in messages],
@@ -179,6 +210,10 @@ class FailingModel:
         self.calls += 1
         raise self.error
 
+    def complete_streaming(self, **_: Any) -> ModelResponse:
+        self.calls += 1
+        raise self.error
+
 
 class FailOnceModel(ScriptedModel):
     """Fails the first N requests with a chosen error, then follows the script."""
@@ -202,6 +237,18 @@ class FailOnceModel(ScriptedModel):
                                   "max_tokens": 0})
             raise self.error
         return super().complete(**kwargs)
+
+    def complete_streaming(self, **kwargs: Any) -> ModelResponse:
+        # A failure here is a failure *before any text was written*, which is the case the
+        # client is allowed to retry. The mid-stream case is not reachable through this
+        # double on purpose: it belongs to the client's own tests, where a stream can be made
+        # to break half way.
+        if self.failed < self.failures:
+            self.failed += 1
+            self.requests.append({"messages": [], "tools": None, "response_format": None,
+                                  "max_tokens": 0})
+            raise self.error
+        return super().complete_streaming(**kwargs)
 
 
 class SessionProxy:
@@ -253,7 +300,6 @@ __all__ = [
     "call",
     "calls",
     "findings",
-    "raw_call",
     "route",
     "say",
     "tool_sessions",

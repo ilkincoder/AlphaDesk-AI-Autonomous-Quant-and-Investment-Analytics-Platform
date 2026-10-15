@@ -578,6 +578,18 @@ export function fetchOrders(signal?: AbortSignal): Promise<OrdersView> {
   return request<OrdersView>('/api/orders', { signal })
 }
 
+/** One execution batch, followed while the server's own loop works on it.
+ *
+ * The single-batch route rather than the whole list: a page waiting on the batch an approval
+ * just opened is waiting on that one, and reading fifty others with all their orders would be
+ * paying for an answer nobody asked for. 404s for a batch that is not this portfolio's, which
+ * the server reports as "not found" rather than "forbidden" -- it cannot confirm the existence
+ * of an id that is not its own.
+ */
+export function fetchBatch(batchId: string, signal?: AbortSignal): Promise<ExecutionBatch> {
+  return request<ExecutionBatch>(`/api/orders/${encodeURIComponent(batchId)}`, { signal })
+}
+
 /** The latest proposal, as the page reads it on load. */
 export function fetchProposal(signal?: AbortSignal): Promise<ProposalView> {
   return request<ProposalView>('/api/rebalance/proposal', { signal })

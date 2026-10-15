@@ -14,6 +14,7 @@ import { act, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { SyncResult, Valuation } from '../api'
+import { jsonResponse } from '../testing'
 import { PortfolioPage } from './PortfolioPage'
 
 /** Byte-for-byte the shape `GET /portfolio/valuation` returns before the first sync. */
@@ -96,16 +97,6 @@ const SYNC_OK: SyncResult = {
   cash_balance: '2500.25',
   equity: '9374.50',
   position_count: 3,
-}
-
-/** Only the parts of Response the api module reads. Cheaper and more obvious than
- *  building a real Response, which jsdom does not provide. */
-function jsonResponse(body: unknown, status = 200): Response {
-  return {
-    ok: status >= 200 && status < 300,
-    status,
-    json: async () => body,
-  } as Response
 }
 
 /** One load: a successful sync followed by the valuation it produced. */
@@ -322,7 +313,26 @@ describe('PortfolioPage', () => {
     expect(screen.getAllByText('100.00%').length).toBeGreaterThan(0)
   })
 
-  it('explains a zero-value portfolio instead of drawing an empty bar', async () => {
+  it('draws the allocation as a ring, with the shares readable beside it', async () => {
+    stubLoads(jsonResponse(DEMO))
+
+    const { container } = render(<PortfolioPage />)
+
+    const heading = await screen.findByRole('heading', { name: 'Allocation' })
+    // The ring is decorative -- `AllocationDonut` marks it `aria-hidden` because the legend
+    // carries the same shares as text -- so it is found by shape, not by role.
+    const rings = container.querySelectorAll('#portfolio-overview svg circle')
+    expect(rings.length).toBeGreaterThan(0)
+    // Each holding and cash, as the API's own percentage strings. Scoped to this card: the
+    // holdings table states the same shares, and a legend missing one would still pass there.
+    const allocation = within(heading.parentElement as HTMLElement)
+    expect(allocation.getByText('Share of portfolio value')).toBeTruthy()
+    for (const share of ['6.21%', '22.36%', '9.32%', '62.11%']) {
+      expect(allocation.getByText(share)).toBeTruthy()
+    }
+  })
+
+  it('explains a zero-value portfolio instead of drawing an empty ring', async () => {
     stubLoads(
       jsonResponse({
         ...DEMO,

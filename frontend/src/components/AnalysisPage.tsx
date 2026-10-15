@@ -95,6 +95,10 @@ function describeEvent(event: ProgressEvent): string | null {
       return 'Summarising what the tools returned…'
     case 'composing':
       return 'Writing the answer…'
+    case 'answer_draft':
+      // No line: the draft itself is what there is to see, and it is rendered as prose rather
+      // than as another step in the list.
+      return null
     default:
       return null
   }
@@ -131,7 +135,14 @@ export function AnalysisPage() {
   const [historyOpen, setHistoryOpen] = useState(false)
   const [conversations, setConversations] = useState<StoredConversation[]>([])
   const [draft, setDraft] = useState('')
-  const [pending, setPending] = useState<{ requestId: string; message: string } | null>(null)
+  // `answer` is the answer as it is being written, which is not a turn and does not outlive
+  // the question: it lives inside `pending` so that it cannot be left behind by any of the
+  // paths that clear a pending question.
+  const [pending, setPending] = useState<{
+    requestId: string
+    message: string
+    answer?: string
+  } | null>(null)
   const [progress, setProgress] = useState<string[]>([])
   const [statusNote, setStatusNote] = useState<string | null>(null)
   const [showCheckStatus, setShowCheckStatus] = useState(false)
@@ -323,6 +334,14 @@ export function AnalysisPage() {
           { conversation_id: id, request_id: requestId, message },
           (event) => {
             if (id !== activeIdRef.current) return
+            if (event.event === 'answer_draft') {
+              // Each draft is everything written so far, so it replaces the last one rather
+              // than being appended to it: a correction that rewrites the answer, or a draft
+              // lost on the way here, both come out right.
+              const text = event.text ?? ''
+              setPending((current) => (current ? { ...current, answer: text } : current))
+              return
+            }
             const line = describeEvent(event)
             if (line) setProgress((current) => [...current, line])
           },
@@ -566,6 +585,7 @@ export function AnalysisPage() {
               <ChatTranscript
                 turns={turns}
                 pendingQuestion={pending?.message ?? null}
+                pendingAnswer={pending?.answer ?? null}
                 busy={busy}
                 progress={progress}
                 statusNote={statusNote}

@@ -11,12 +11,13 @@
 
 import { StrictMode } from 'react'
 
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { NewsIngest, NewsList, NewsSearch } from '../api'
-import { aDecision, aProposal, sseResponse } from '../testing'
-import { NewsPage } from './NewsPage'
+import { aBatch, aDecision, anOrder, aProposal, sseResponse } from '../testing'
+import { POLL_INTERVAL_MS } from '../orders'
+import { NewsPage, WAIT_CEILING_MS, WORK_SCREEN_DELAY_MS } from './NewsPage'
 
 const PUBLISHED = '2026-09-22T14:00:00+00:00'
 const INGESTED = '2026-09-22T15:30:00+00:00'
@@ -180,6 +181,9 @@ const proposalReads = (urls: string[]) =>
   urls.filter((url) => url === '/api/rebalance/proposal')
 const proposalRuns = (urls: string[]) =>
   urls.filter((url) => url.startsWith('/api/rebalance/proposal/stream'))
+/** Reads of the batch an approval opened. Note the trailing slash: the whole list is not this
+ *  page's, and a read of it would mean the page is following batches nobody asked about. */
+const batchReads = (urls: string[]) => urls.filter((url) => url.startsWith('/api/orders/'))
 
 
 type Route = () => Response | Promise<Response>
@@ -199,6 +203,7 @@ function stubApi(
     proposal?: Route
     generate?: Route
     decision?: Route
+    batch?: Route
   } = {},
 ) {
   const calls: string[] = []
@@ -221,6 +226,12 @@ function stubApi(
     }
     // Before the proposal route, which this URL also starts with: `/rebalance/proposal/{id}/
     // decision` is a different endpoint that happens to share a prefix.
+    // Ahead of the proposal family: a batch is read by id, and `/api/orders/{id}` shares no
+    // prefix with it. Without this route the fallthrough below would answer a batch read with a
+    // news listing, which is the kind of stub that makes a broken page look tested.
+    if (url.startsWith('/api/orders/')) {
+      return Promise.resolve((routes.batch ?? (() => jsonResponse(aBatch())))())
+    }
     if (url.endsWith('/decision')) {
       return Promise.resolve((routes.decision ?? (() => jsonResponse(anApproval())))())
     }
@@ -269,6 +280,20 @@ function aRenewal() {
 function decisionBody(requests: Array<{ url: string; init?: RequestInit }>) {
   const sent = requests.filter((item) => item.url.endsWith('/decision')).at(-1)
   return sent?.init?.body ? JSON.parse(String(sent.init.body)) : null
+}
+
+/** The full-screen work screen, found by its footer -- the one string on it that nothing else
+ *  in the application has. */
+async function workScreen(): Promise<HTMLElement> {
+  const footer = await screen.findByText('Investment Analytics')
+  return footer.closest('div') as HTMLElement
+}
+
+/** Open the proposal the page is offering. This is how the flow is entered: a restored proposal
+ *  is a notice, and taking the page for it is something the reader asks for. */
+async function review() {
+  fireEvent.click(await screen.findByRole('button', { name: 'Review' }))
+  await screen.findByRole('heading', { name: 'Rebalance proposal' })
 }
 
 async function renderLoaded(routes = {}) {
@@ -607,16 +632,32 @@ describe('NewsPage', () => {
     expect(screen.queryByText(/No orders have been sent/)).toBeNull()
   })
 
-  it('restores the latest proposal on load, without generating anything', async () => {
+  it('offers a restored proposal without taking the page for it', async () => {
     const { calls } = stubApi({ proposal: () => jsonResponse({ proposal: aProposal() }) })
 
     render(<NewsPage />)
 
-    expect(await screen.findByRole('heading', { name: 'Rebalance proposal' })).toBeTruthy()
-    // Twice: the panel's status line and the summary card's recorded status.
-    expect(screen.getAllByText('Proposed · Estimates only')).toHaveLength(2)
+    // The page is still the news. A proposal restored from the store is offered rather than
+    // imposed: taking the page for one on every visit would answer a question nobody asked.
+    expect(await screen.findByText(/A rebalance proposal is ready to review/)).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Review' })).toBeTruthy()
+    expect(screen.getByText('Analyst Sees More Upside for Microsoft')).toBeTruthy()
     // Restoring is a read. Nothing was generated and nothing was spent.
     expect(proposalRuns(calls)).toHaveLength(0)
+  })
+
+  it('opens the restored proposal when it is asked for', async () => {
+    stubApi({ proposal: () => jsonResponse({ proposal: aProposal() }) })
+
+    render(<NewsPage />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Review' }))
+
+    expect(await screen.findByRole('heading', { name: 'Rebalance proposal' })).toBeTruthy()
+    // The news steps aside while the proposal has the page. Asserted on the search field rather
+    // than on an article: the proposal cites the same fixture article as evidence, so a headline
+    // is on screen either way and would prove nothing.
+    expect(screen.queryByLabelText('Search the stored news')).toBeNull()
   })
 
   it('restores the proposal once under StrictMode, and does not generate one', async () => {
@@ -628,7 +669,7 @@ describe('NewsPage', () => {
       </StrictMode>,
     )
 
-    expect(await screen.findByRole('heading', { name: 'Rebalance proposal' })).toBeTruthy()
+    expect(await screen.findByText(/A rebalance proposal is ready to review/)).toBeTruthy()
     expect(proposalRuns(calls)).toHaveLength(0)
   })
 
@@ -649,10 +690,13 @@ describe('NewsPage', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Rebalance proposal' }))
 
-    const button = await screen.findByRole('button', { name: 'Generating…' })
-    expect((button as HTMLButtonElement).disabled).toBe(true)
-    // The news stays available: the run is not the page.
-    expect(screen.getByText('Analyst Sees More Upside for Microsoft')).toBeTruthy()
+    // The proposal has the page from the press: the run is what the reader asked for, and a
+    // loading line above a couple of hundred article cards is what they could not find.
+    expect(await screen.findByRole('heading', { name: 'Rebalance proposal' })).toBeTruthy()
+    expect(screen.getByText(/Starting…/)).toBeTruthy()
+    expect(screen.queryByLabelText('Search the stored news')).toBeNull()
+    // And the header offers the way back rather than a second run.
+    expect(screen.getByRole('button', { name: 'Back to news' })).toBeTruthy()
 
     await act(async () => {
       release?.()
@@ -662,7 +706,7 @@ describe('NewsPage', () => {
     expect(proposalRuns(calls)).toHaveLength(1)
   })
 
-  it('never starts a second run for a second click', async () => {
+  it('never starts a second run while one is in flight', async () => {
     const { calls } = await renderLoaded({
       generate: () =>
         new Promise(() => {
@@ -670,10 +714,15 @@ describe('NewsPage', () => {
         }) as unknown as Response,
     })
 
-    const button = screen.getByRole('button', { name: 'Rebalance proposal' })
-    fireEvent.click(button)
-    await screen.findByRole('button', { name: 'Generating…' })
-    fireEvent.click(screen.getByRole('button', { name: 'Generating…' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Rebalance proposal' }))
+    await screen.findByRole('heading', { name: 'Rebalance proposal' })
+
+    // The only way on from here is back, and asking again while the first run is still going is
+    // refused by the button rather than answered with a race the reader did not need to see.
+    fireEvent.click(screen.getByRole('button', { name: 'Back to news' }))
+    const again = await screen.findByRole('button', { name: 'Generating…' })
+    expect((again as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(again)
 
     expect(proposalRuns(calls)).toHaveLength(1)
   })
@@ -724,7 +773,8 @@ describe('NewsPage', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Rebalance proposal' }))
 
     expect(await screen.findByText('Could not generate a proposal.')).toBeTruthy()
-    expect(screen.getByRole('button', { name: 'Rebalance proposal' })).toBeTruthy()
+    // The news is still there to go back to, and the run is not repeated on the way.
+    fireEvent.click(screen.getByRole('button', { name: 'Back to news' }))
     expect(screen.getByText('Analyst Sees More Upside for Microsoft')).toBeTruthy()
     // A failure is a recorded outcome, not a retry: the page does not ask again on its own.
     expect(proposalRuns(calls)).toHaveLength(1)
@@ -781,26 +831,38 @@ describe('NewsPage', () => {
     expect(mock).not.toHaveBeenCalled()
   })
 
-  it('approves through the decision endpoint, and opens the Orders page on the batch', async () => {
+  it('approves through the decision endpoint, and follows the batch here', async () => {
     const onOpenOrders = vi.fn()
-    const { requests } = stubApi({ proposal: () => jsonResponse({ proposal: aProposal() }) })
+    const { requests, calls } = stubApi({
+      proposal: () => jsonResponse({ proposal: aProposal() }),
+      // Still working, so the placing screen stays up for the assertions below.
+      batch: () => jsonResponse(aBatch()),
+    })
 
     render(<NewsPage onOpenOrders={onOpenOrders} />)
-    await screen.findByRole('heading', { name: 'Rebalance proposal' })
+    await review()
 
     fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
 
-    await waitFor(() => expect(onOpenOrders).toHaveBeenCalledWith('b'.repeat(32)))
+    // The wait is reported here, and the reader is not sent to another page for it.
+    expect(await screen.findByRole('heading', { name: 'Placing orders' })).toBeTruthy()
+    expect(onOpenOrders).not.toHaveBeenCalled()
+
     const body = decisionBody(requests)
     expect(body.decision).toBe('approve')
     // No quantity, no symbol, no side: what is executed is resolved from the stored proposal.
     expect(Object.keys(body).sort()).toEqual(['confirm', 'decision', 'idempotency_key'])
     expect(body.confirm).toBe(false)
+
+    // The batch is read by id, not by pulling every batch the portfolio has ever run.
+    await waitFor(() =>
+      expect(batchReads(calls)).toEqual([`/api/orders/${'b'.repeat(32)}`]),
+    )
   })
 
   it('records a rejection and opens nothing', async () => {
     const onOpenOrders = vi.fn()
-    const { requests } = stubApi({
+    const { requests, calls } = stubApi({
       proposal: () => jsonResponse({ proposal: aProposal() }),
       decision: () =>
         jsonResponse(
@@ -815,7 +877,7 @@ describe('NewsPage', () => {
     })
 
     render(<NewsPage onOpenOrders={onOpenOrders} />)
-    await screen.findByRole('heading', { name: 'Rebalance proposal' })
+    await review()
 
     fireEvent.click(screen.getByRole('button', { name: 'Reject' }))
 
@@ -824,6 +886,8 @@ describe('NewsPage', () => {
     expect((await screen.findAllByText(/This proposal was rejected/)).length).toBeGreaterThan(0)
     expect(decisionBody(requests).decision).toBe('reject')
     expect(onOpenOrders).not.toHaveBeenCalled()
+    // A rejection opens no batch, so there is nothing to follow and nothing is read.
+    expect(batchReads(calls)).toHaveLength(0)
   })
 
   it('keeps dismissing and rejecting apart', async () => {
@@ -832,17 +896,19 @@ describe('NewsPage', () => {
     const { requests } = stubApi({ proposal: () => jsonResponse({ proposal: aProposal() }) })
 
     render(<NewsPage />)
-    await screen.findByRole('heading', { name: 'Rebalance proposal' })
+    await review()
 
     fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
 
+    // Out of the flow, and back on the news it was covering.
     expect(screen.queryByRole('heading', { name: 'Rebalance proposal' })).toBeNull()
+    expect(screen.getByText('Analyst Sees More Upside for Microsoft')).toBeTruthy()
     expect(decisionBody(requests)).toBeNull()
   })
 
   it("shows a refusal in the server's own words and sends nothing further", async () => {
     const onOpenOrders = vi.fn()
-    stubApi({
+    const { calls } = stubApi({
       proposal: () => jsonResponse({ proposal: aProposal() }),
       decision: () =>
         jsonResponse(
@@ -861,18 +927,20 @@ describe('NewsPage', () => {
     })
 
     render(<NewsPage onOpenOrders={onOpenOrders} />)
-    await screen.findByRole('heading', { name: 'Rebalance proposal' })
+    await review()
 
     fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
 
     expect(await screen.findByText(/US market is closed/)).toBeTruthy()
     expect(onOpenOrders).not.toHaveBeenCalled()
+    // A refusal carries no batch: there is nothing to wait for and nothing was opened.
+    expect(batchReads(calls)).toHaveLength(0)
   })
 
   it("asks again, and confirms, when the plan's prices have moved", async () => {
     const onOpenOrders = vi.fn()
     let answered = false
-    const { requests } = stubApi({
+    const { requests, calls } = stubApi({
       proposal: () => jsonResponse({ proposal: aProposal() }),
       decision: () => {
         if (!answered) {
@@ -884,20 +952,186 @@ describe('NewsPage', () => {
     })
 
     render(<NewsPage onOpenOrders={onOpenOrders} />)
-    await screen.findByRole('heading', { name: 'Rebalance proposal' })
+    await review()
 
     fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
 
     // The refreshed estimates come back, and nothing was approved by the first press.
     expect(await screen.findByText(/largest move is 25%/)).toBeTruthy()
     expect(onOpenOrders).not.toHaveBeenCalled()
+    // A renewal opens no batch either: the first press is a question, not an approval.
+    expect(batchReads(calls)).toHaveLength(0)
 
     fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
 
-    await waitFor(() => expect(onOpenOrders).toHaveBeenCalledWith('b'.repeat(32)))
+    expect(await screen.findByRole('heading', { name: 'Placing orders' })).toBeTruthy()
     // The second press is the confirmation, and the only thing it says is "yes, at these
     // prices" -- the orders are the ones already validated, not a fresh resolution.
     expect(decisionBody(requests).confirm).toBe(true)
+  })
+
+  it('follows the batch to a stop, then gives the news back with the outcome on it', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    try {
+      let settled = false
+      const { calls } = stubApi({
+        proposal: () => jsonResponse({ proposal: aProposal() }),
+        batch: () =>
+          jsonResponse(
+            settled
+              ? aBatch({
+                  status: 'completed',
+                  orders: [
+                    anOrder(),
+                    anOrder({ intent_id: 'f'.repeat(32), sequence: 2, symbol: 'MSFT', side: 'buy' }),
+                  ],
+                })
+              : aBatch({ status: 'submitting' }),
+          ),
+      })
+
+      render(<NewsPage />)
+      await review()
+      fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
+      await screen.findByRole('heading', { name: 'Placing orders' })
+
+      // The batch is followed on the executor's own tick, so the next read is one interval away.
+      settled = true
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(POLL_INTERVAL_MS + 100)
+      })
+
+      // The news is back, and the outcome is on it rather than on a page the reader was sent to.
+      expect(screen.getByLabelText('Search the stored news')).toBeTruthy()
+      expect(screen.getByText(/Completed — 2 orders: 2 filled\./)).toBeTruthy()
+      // And the wait is over: no further reads once the batch has stopped.
+      const reads = batchReads(calls).length
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(POLL_INTERVAL_MS * 3)
+      })
+      expect(batchReads(calls)).toHaveLength(reads)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('reports a batch that was still working rather than claiming it finished', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    try {
+      const onOpenOrders = vi.fn()
+      stubApi({
+        proposal: () => jsonResponse({ proposal: aProposal() }),
+        // Never settles: an order the broker accepted and has not filled, which is what a market
+        // that closes mid-batch leaves behind.
+        batch: () => jsonResponse(aBatch({ status: 'submitting' })),
+      })
+
+      render(<NewsPage onOpenOrders={onOpenOrders} />)
+      await review()
+      fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
+      await screen.findByRole('heading', { name: 'Placing orders' })
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(WAIT_CEILING_MS + POLL_INTERVAL_MS)
+      })
+
+      // The wait ends, the news comes back, and the report says what is actually true of it.
+      expect(screen.getByLabelText('Search the stored news')).toBeTruthy()
+      expect(screen.getByText(/still being worked on/)).toBeTruthy()
+
+      // The one case that needs the Orders page: the batch is moving and this page stopped
+      // watching, so the reader is given the way there rather than a dead sentence.
+      fireEvent.click(screen.getByRole('button', { name: 'View orders' }))
+      expect(onOpenOrders).toHaveBeenCalledWith('b'.repeat(32))
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not call a batch that could not be read a failure', async () => {
+    stubApi({
+      proposal: () => jsonResponse({ proposal: aProposal() }),
+      batch: () => jsonResponse({ detail: 'Orders are unavailable.' }, 503),
+    })
+
+    render(<NewsPage />)
+    await review()
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
+
+    await waitFor(() => expect(screen.getByLabelText('Search the stored news')).toBeTruthy())
+    // An unreadable batch says nothing about the orders in it, so no status is invented for it.
+    expect(screen.getByText(/could not be read here/)).toBeTruthy()
+    expect(screen.queryByText('Rejected by the broker')).toBeNull()
+    expect(screen.queryByText('Filled')).toBeNull()
+  })
+
+  it('covers the page while a run is going, and uncovers it when the run ends', async () => {
+    let release: (() => void) | null = null
+    await renderLoaded({
+      generate: () =>
+        new Promise((resolve) => {
+          release = () => resolve(sseResponse([{ event: 'done', proposal: aProposal() }]))
+        }) as unknown as Response,
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Rebalance proposal' }))
+
+    // The inline panel answers the press immediately; the full screen follows once the wait
+    // has gone on long enough to be worth covering the whole application for.
+    expect(within(await workScreen()).getByText('Starting the proposal')).toBeTruthy()
+
+    await act(async () => {
+      release?.()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+
+    // The wait is over, so it goes -- and what it was waiting for is on the page behind it.
+    await waitFor(() => expect(screen.queryByText('Investment Analytics')).toBeNull())
+    expect(await screen.findAllByText('Proposed · Estimates only')).not.toHaveLength(0)
+  })
+
+  it('does not cover the page for a decision that comes back at once', async () => {
+    stubApi({
+      proposal: () => jsonResponse({ proposal: aProposal() }),
+      // No broker call and no batch: a rejection is one write and is answered in milliseconds.
+      decision: () =>
+        jsonResponse(
+          anApproval({
+            outcome: 'rejected',
+            detail: 'This proposal was rejected. No orders were created.',
+            decision: aDecision({ decision: 'rejected' }),
+            batch_id: null,
+            plan: [],
+          }),
+        ),
+    })
+
+    render(<NewsPage />)
+    await review()
+    fireEvent.click(screen.getByRole('button', { name: 'Reject' }))
+    expect(await screen.findAllByText(/This proposal was rejected/)).not.toHaveLength(0)
+
+    // Long enough that a screen which was going to appear would have. A full-screen flash for
+    // an 80ms write reads as a fault rather than as progress, so there is none.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, WORK_SCREEN_DELAY_MS + 150))
+    })
+    expect(screen.queryByText('Investment Analytics')).toBeNull()
+  })
+
+  it('names the batch the work screen is waiting on rather than the run behind it', async () => {
+    stubApi({
+      proposal: () => jsonResponse({ proposal: aProposal() }),
+      // Still working, so the screen stays up long enough to be read.
+      batch: () => jsonResponse(aBatch()),
+    })
+
+    render(<NewsPage />)
+    await review()
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
+
+    // The batch's own status and its own orders, rather than one word for the whole wait.
+    expect(within(await workScreen()).getByText('Working · 1 of 1 order sent')).toBeTruthy()
   })
 
   it('does not offer an approval for a proposal that has no trades', async () => {
@@ -910,7 +1144,7 @@ describe('NewsPage', () => {
 
     render(<NewsPage />)
 
-    await screen.findByRole('heading', { name: 'Rebalance proposal' })
+    await review()
     expect(screen.queryByRole('button', { name: 'Approve' })).toBeNull()
     expect(screen.queryByRole('button', { name: 'Reject' })).toBeNull()
   })

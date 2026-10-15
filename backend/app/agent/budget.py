@@ -92,10 +92,6 @@ class RunBudget:
         return self.clock() - self.started_at
 
     @property
-    def remaining_seconds(self) -> float:
-        return max(0.0, self.deadline_seconds - self.elapsed_seconds)
-
-    @property
     def expired(self) -> bool:
         return self.elapsed_seconds >= self.deadline_seconds
 
@@ -194,25 +190,10 @@ class RunBudget:
         }
 
 
-def truncate_for_context(text: str, limit: int) -> tuple[str, bool]:
-    """Cut `text` to `limit` characters, saying whether it was cut.
-
-    Half of a JSON document is not valid JSON, which matters because these strings are fed
-    back to a model that will try to read them. Callers therefore truncate the *values* they
-    put into a result rather than the serialised result -- see
-    `app.agent.module1._bounded_result`. This helper is the last line of defence for a string
-    that is still too long after that, and it never silently returns something shorter.
-    """
-    if len(text) <= limit:
-        return text, False
-    return text[:limit], True
-
-
 __all__ = [
     "BudgetExhausted",
     "LIMIT_DEADLINE",
     "LIMIT_MODEL_REQUESTS",
     "LIMIT_TOOL_CALLS",
     "RunBudget",
-    "truncate_for_context",
 ]

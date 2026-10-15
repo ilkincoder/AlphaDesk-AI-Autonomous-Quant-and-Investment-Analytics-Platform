@@ -1,8 +1,11 @@
 /** Navigation icons.
  *
- * Nine of them, all drawn on the same 16x16 grid with a 1.5px stroke, so they read as
- * one set rather than nine borrowed drawings. Each inherits `currentColor`, so a row's
- * icon colours itself from the row's text colour and no icon needs a variant.
+ * One per destination, all drawn on the same 16x16 grid with a 1.5px stroke, so they read as
+ * one set rather than as six borrowed drawings. Each inherits `currentColor`, so a row's icon
+ * colours itself from the row's text colour and no icon needs a variant.
+ *
+ * There is no icon here without a row: the destinations that were cut took theirs with them,
+ * rather than leaving drawings behind for a menu entry that does not exist.
  */
 
 import type { ReactNode } from 'react'
@@ -59,26 +62,6 @@ export function PortfolioIcon() {
   )
 }
 
-export function WhatIfIcon() {
-  return (
-    <Icon>
-      <circle cx="8" cy="8" r="5.5" />
-      {/* A question mark: the arc, the stem, then the dot. */}
-      <path d="M6.4 6.3a1.6 1.6 0 0 1 3.2 0v.2c0 1-.9 1.5-1.6 2.1v1" />
-      <path d="M8 11.3h.01" />
-    </Icon>
-  )
-}
-
-export function StrategiesIcon() {
-  return (
-    <Icon>
-      <circle cx="8" cy="8" r="5.5" />
-      <circle cx="8" cy="8" r="1.75" />
-    </Icon>
-  )
-}
-
 export function BacktestIcon() {
   return (
     <Icon>
@@ -98,15 +81,6 @@ export function OrdersIcon() {
   )
 }
 
-export function WatchlistIcon() {
-  return (
-    <Icon>
-      <path d="M1.5 8S3.9 4 8 4s6.5 4 6.5 4-2.4 4-6.5 4S1.5 8 1.5 8Z" />
-      <circle cx="8" cy="8" r="1.75" />
-    </Icon>
-  )
-}
-
 export function DataNewsIcon() {
   return (
     <Icon>
@@ -117,13 +91,3 @@ export function DataNewsIcon() {
   )
 }
 
-export function SettingsIcon() {
-  return (
-    <Icon>
-      <path d="M2.5 5.5h11" />
-      <path d="M2.5 10.5h11" />
-      <circle cx="6" cy="5.5" r="1.6" />
-      <circle cx="10" cy="10.5" r="1.6" />
-    </Icon>
-  )
-}

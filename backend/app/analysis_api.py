@@ -25,11 +25,10 @@ from one another; it is **not** an authorization boundary, and nothing here shou
 to more than one user without authentication and ownership checks first. See the README.
 """
 
-import json
 import logging
 import queue
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Annotated, Any
 
@@ -43,6 +42,7 @@ from app.agent.progress import (
     KIND_ERROR,
     ProgressEvent,
     QueueProgress,
+    drain_events,
 )
 from app.agent.run import (
     STATUS_PROVIDER_FAILED,
@@ -409,8 +409,11 @@ def _replay_response(payload: ChatRequest, turn: dict) -> Response:
     responses={
         200: {
             "description": (
-                "text/event-stream. Events: routing, tool, findings, composing, then done or "
-                "error. Every event names something that actually happened."
+                "text/event-stream. Events: routing, tool, findings, composing, then any "
+                "number of answer_draft events carrying the answer as it is written, then "
+                "done or error. Every event names something that actually happened, and the "
+                "draft is the one whose content is provisional -- the terminal event carries "
+                "the version that stands."
             ),
             "content": {"text/event-stream": {}},
         },
@@ -526,7 +529,7 @@ def _stream_turn(
     ).start()
 
     return StreamingResponse(
-        _drain(events),
+        drain_events(events),
         media_type="text/event-stream",
         headers={
             # Nothing between here and the browser may cache or buffer this: a buffered
@@ -536,30 +539,6 @@ def _stream_turn(
             "X-Accel-Buffering": "no",
         },
     )
-
-
-def _drain(events: "queue.Queue[ProgressEvent]") -> Iterator[str]:
-    """Yield the queued events as SSE frames until a terminal one.
-
-    Returns as soon as an outcome arrives, so a handler thread is never left waiting on a queue
-    nothing will write to again.
-    """
-    while True:
-        event = events.get()
-        yield _sse(event)
-        if event.terminal:
-            return
-
-
-def _sse(event: ProgressEvent) -> str:
-    """One server-sent event.
-
-    The kind is on the `event:` line and repeated inside the data. The repetition is
-    deliberate: a client that reads only `data` -- which is most of them, and how the frontend
-    here is written -- gets a self-describing payload rather than having to parse two lines in
-    step.
-    """
-    return f"event: {event.kind}\ndata: {json.dumps(event.as_dict())}\n\n"
 
 
 # --- status mapping -------------------------------------------------------------------------

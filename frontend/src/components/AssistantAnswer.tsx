@@ -6,14 +6,21 @@
  * document anybody vetted. Links are restricted to `https:` and in-page anchors, so a
  * `javascript:` URL in a passage cannot become a click.
  *
- * Citations are the part worth reading closely. `[E1]` in the prose becomes a control only
- * when `E1` is in *this turn's* evidence, and its target id carries the turn: `E1` in two
- * different answers is two different pieces of evidence, and a bare `#E1` would have the second
- * answer's link open the first answer's source.
+ * **Reference markers are stripped, not rendered.** The Supervisor used to be asked to write
+ * `[E1]` after the claims it rested on, and this component turned each one into a control that
+ * jumped to the source it named. They are gone from the answer now: the sources are printed in
+ * full underneath it, and a second copy of that list, spread one marker at a time through the
+ * prose, was noise in the middle of the answer. What is left is removed here rather than shown,
+ * because a prompt is a request -- the reader should not be the one who finds out it was
+ * ignored.
+ *
+ * Every source link is read out of the evidence record, never out of the answer's prose. A
+ * passage names its filing in `citation`; a structured result names them inside its own payload,
+ * which `sourceLinks` reads by key.
  */
 
-import { useCallback, useRef, useState } from 'react'
-import Markdown from 'react-markdown'
+import type { ReactNode } from 'react'
+import Markdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 
 import type { Evidence, FilingCitation, Turn } from '../analysisApi'
@@ -21,47 +28,118 @@ import { Card } from './Card'
 
 /** Links the answer may contain. Anything else renders as plain text.
  *
- * `#` is allowed because citations are in-page anchors this component owns. `https:` is
- * allowed because SEC source links are https. `http:`, `javascript:`, `data:` and the rest are
- * not: a filing passage is untrusted text, and one of them turning into a live link is exactly
- * the thing this prevents.
+ * `https:` is allowed because SEC source links are https. `http:`, `javascript:`, `data:` and
+ * the rest are not: a filing passage is untrusted text, and one of them turning into a live
+ * link is exactly the thing this prevents. In-page anchors are not allowed either: nothing
+ * rendered here is a link to another part of itself any more.
  */
 function safeHref(url: string | undefined): string | undefined {
   if (!url) return undefined
-  if (url.startsWith('#evidence-')) return url
   if (url.startsWith('https://')) return url
   return undefined
 }
 
-function evidenceId(turnId: string, reference: string): string {
-  // Prefixed with the turn so two answers citing `E1` cannot collide, and with `evidence-`
-  // so a citation link and its target are recognisable as a pair.
-  return `evidence-${turnId}-${reference}`
-}
-
-/** Turn `[E1]` into a link, but only where `E1` is evidence this turn actually has.
+/** The Supervisor's reference markers -- `[E1]`, `[E2]` -- and the space in front of them.
  *
- * An unresolved reference stays exactly as written -- plain text, not a control -- because the
- * backend deliberately withholds an answer whose citations do not resolve, and the one thing
- * worse than a dead link is a live one that opens something unrelated.
+ * The space goes with the marker, because the marker sits where a claim ends: removing only the
+ * brackets would turn "insiders were sellers [E1]." into "insiders were sellers ." -- a gap
+ * before the full stop, and a visible trace of the thing that was taken out.
  */
-function withCitationLinks(markdown: string, available: Set<string>, turnId: string): string {
-  return markdown.replace(/\[(E\d+)\]/g, (whole, reference: string) =>
-    available.has(reference) ? `[${reference}](#${evidenceId(turnId, reference)})` : whole,
-  )
+const REFERENCE_MARKER = / *\[E\d+\]/g
+
+/** Where a tool payload records the filing a row came from.
+ *
+ * Matched by key rather than by looking for anything that resembles a link: these are the names
+ * the tools give their provenance, and a string that merely *looks* like a URL is not a source.
+ * `source_reference` is `company_financial_facts`'s name for what the other two call a URL.
+ */
+const SOURCE_URL_KEYS = new Set(['source_url', 'source_reference', 'source_document_url'])
+
+/** How many filings one tool result links to before the rest are counted rather than listed.
+ *  An insider analysis can cover fifty transactions, and fifty links is a wall, not a source
+ *  list. The remainder is still counted on screen: a short list must not read as the whole one.
+ */
+const MAX_SOURCE_LINKS = 5
+
+/** One document inside an SEC filing's archive directory. */
+const SEC_ARCHIVE_DOCUMENT = /^https:\/\/www\.sec\.gov\/Archives\/edgar\/data\/[^/]+\/[^/]+\/[^/]+$/i
+
+/** The page to send a reader to for one source document.
+ *
+ * A filing's primary document is whatever SEC stores, and for a Form 4 that is XML -- a browser
+ * shows it as a raw tree, so the link works and is useless. SEC publishes a readable page for
+ * the filing in the same directory, listing the form type and a rendered version of it, and that
+ * is what a reader wants. An `.htm` document is left alone: it already opens as the filing.
+ */
+function readerUrl(url: string, accession: unknown): string {
+  if (!/\.xml$/i.test(url) || typeof accession !== 'string') return url
+  if (!SEC_ARCHIVE_DOCUMENT.test(url)) return url
+  return `${url.slice(0, url.lastIndexOf('/'))}/${accession}-index.htm`
 }
 
-function Citation({ reference, onOpen }: { reference: string; onOpen: (ref: string) => void }) {
+/** The filings one tool result rests on: every source URL its payload carries.
+ *
+ * A passage is one filing, but a structured result is usually several -- a Form 4 per
+ * transaction, a 10-K or 10-Q per observation -- so these are collected per URL rather than per
+ * entry, and deduplicated, because many rows cite the same document. Each is labelled with the
+ * accession recorded beside it, which is what identifies a filing to a reader. A URL that is not
+ * `https:` is dropped, not rendered: nothing here is more trusted than a passage's prose.
+ */
+function sourceLinks(summary: Record<string, unknown> | null): { url: string; label: string }[] {
+  const found: { url: string; label: string }[] = []
+  const seen = new Set<string>()
+
+  const visit = (value: unknown) => {
+    if (Array.isArray(value)) {
+      value.forEach(visit)
+      return
+    }
+    if (!value || typeof value !== 'object') return
+    const record = value as Record<string, unknown>
+    for (const [key, child] of Object.entries(record)) {
+      if (SOURCE_URL_KEYS.has(key) && typeof child === 'string') {
+        const accession = record.accession_number
+        const url = safeHref(readerUrl(child, accession))
+        if (url && !seen.has(url)) {
+          seen.add(url)
+          found.push({
+            url,
+            label: typeof accession === 'string' ? accession : 'Open the filing on sec.gov',
+          })
+        }
+      } else {
+        visit(child)
+      }
+    }
+  }
+
+  visit(summary)
+  return found
+}
+
+function SourceLinks({ links }: { links: { url: string; label: string }[] }) {
+  const shown = links.slice(0, MAX_SOURCE_LINKS)
+  const hidden = links.length - shown.length
+
   return (
-    <button
-      type="button"
-      onClick={() => onOpen(reference)}
-      // The accessible name says what pressing it does; "E1" alone does not.
-      aria-label={`Show evidence ${reference}`}
-      className="mx-0.5 rounded border border-accent/40 bg-selected px-1 text-label text-accent-ink transition-colors hover:border-accent"
-    >
-      {reference}
-    </button>
+    <p className="mt-1.5 flex flex-wrap items-baseline gap-x-2 gap-y-1 text-label">
+      <span className="text-faint">Filings behind this result:</span>
+      {shown.map((link) => (
+        <a
+          key={link.url}
+          href={link.url}
+          target="_blank"
+          rel="noreferrer noopener"
+          // The visible label is an accession number, which is not a description of what
+          // pressing it does. The accessible name says so and still contains the label.
+          aria-label={`Open filing ${link.label} on sec.gov`}
+          className="text-accent-ink underline underline-offset-2"
+        >
+          {link.label}
+        </a>
+      ))}
+      {hidden > 0 && <span className="text-faint">and {hidden} more</span>}
+    </p>
   )
 }
 
@@ -69,6 +147,92 @@ const DATE_LABELS = {
   start_date: 'Market comparison period',
   information_date: 'Overall information date',
 } as const
+
+/** The prose style, in one place: the answer and the draft of it are the same kind of text and
+ *  must not drift apart, or the answer would appear to change shape as it is finished. */
+const PROSE_STYLES =
+  'max-w-[72ch] space-y-3 text-body text-dim [&_a]:text-accent-ink [&_a]:underline [&_code]:rounded [&_code]:bg-page [&_code]:px-1 [&_h1]:text-heading [&_h1]:font-semibold [&_h1]:text-ink [&_h2]:mt-4 [&_h2]:text-heading [&_h2]:font-semibold [&_h2]:text-ink [&_h3]:mt-3 [&_h3]:font-semibold [&_h3]:text-ink [&_li]:ml-4 [&_li]:list-disc [&_ol>li]:list-decimal [&_strong]:text-ink'
+
+/** Markdown as this application renders it, whoever is asking.
+ *
+ * Raw HTML is off everywhere: this text is model output, and anything that reached it through
+ * a filing passage is text, not markup. `urlTransform` restricts links to `https:` and in-page
+ * anchors, so a `javascript:` URL in a passage cannot become a click -- and `link` decides
+ * what an allowed link becomes, which is the one thing the answer and the draft differ on.
+ */
+function Prose({
+  children,
+  link,
+}: {
+  children: string
+  /** What an `a` renders as. Without one, a link is shown as its text: the draft has no
+   *  checked evidence behind it, so there is nothing it is entitled to link to. */
+  link?: Components['a']
+}) {
+  return (
+    <div className={PROSE_STYLES}>
+      <Markdown
+        remarkPlugins={[remarkGfm]}
+        skipHtml
+        urlTransform={(url) => safeHref(url) ?? ''}
+        components={{
+          a: link ?? (({ children: text }) => <span>{text}</span>),
+          // Tables scroll inside their own box rather than widening the page.
+          table({ children: rows }) {
+            return (
+              <div className="overflow-x-auto">
+                <table className="w-full border-collapse text-note">{rows}</table>
+              </div>
+            )
+          },
+          th({ children: heading }) {
+            return (
+              <th className="border-b border-line px-2 py-1 text-left text-label text-faint">
+                {heading}
+              </th>
+            )
+          },
+          td({ children: cell }) {
+            return <td className="border-b border-line/60 px-2 py-1">{cell}</td>
+          },
+        }}
+      >
+        {/* Stripped here rather than at the call sites, because it is a rule about this
+            application's prose and not about one reader of it: the answer and the draft of it
+            are the same kind of text, and a marker must not survive in either. */}
+        {children.replace(REFERENCE_MARKER, '')}
+      </Markdown>
+    </div>
+  )
+}
+
+/** The answer as it is being written, before anything has checked it.
+ *
+ * Deliberately not an `AssistantAnswer`: there is no turn here and no evidence, and the text
+ * can still be corrected or withdrawn by the run that is writing it. It therefore carries no
+ * citation controls -- a control pointing at sources nobody has checked would be a claim the
+ * draft cannot support -- and it says what it is. It is replaced by the answer itself, or by
+ * the reason there is none, as soon as the run finishes.
+ */
+export function AnswerDraft({ text }: { text: string }) {
+  return (
+    <Card>
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+        <h2 className="text-label font-medium text-dim">Answer being written</h2>
+        <span className="rounded-full bg-selected px-2.5 py-1 text-label text-accent-ink">
+          Not checked yet
+        </span>
+      </div>
+      <p className="mt-1 max-w-[70ch] text-label text-faint">
+        This is the answer as the model writes it. Its sources have not been checked yet, so it
+        can still change, or be withdrawn, before the run finishes.
+      </p>
+      <div className="mt-3">
+        <Prose>{text}</Prose>
+      </div>
+    </Card>
+  )
+}
 
 /** Company, the period compared, and the run's own information date.
  *
@@ -162,14 +326,17 @@ function FilingDetails({ filing }: { filing: FilingCitation }) {
   )
 }
 
-function EvidenceEntry({ id, item }: { id: string; item: Evidence }) {
+function EvidenceEntry({ item }: { item: Evidence }) {
   const quoted =
     item.kind === 'filing_passage' && typeof item.summary?.quoted_text === 'string'
       ? (item.summary.quoted_text as string)
       : null
+  // A passage carries its filing in `citation`, which `FilingDetails` already links. A tool
+  // result carries none, and names its filings inside its own payload instead.
+  const links = item.kind === 'tool_result' ? sourceLinks(item.summary) : []
 
   return (
-    <li id={id} className="scroll-mt-4 rounded-md border border-line bg-page/40 p-3">
+    <li className="rounded-md border border-line bg-page/40 p-3">
       <p className="text-label font-medium text-accent-ink">
         {item.reference} · {item.label}
       </p>
@@ -197,6 +364,8 @@ function EvidenceEntry({ id, item }: { id: string; item: Evidence }) {
           limitations and tool details above.
         </p>
       )}
+
+      {links.length > 0 && <SourceLinks links={links} />}
     </li>
   )
 }
@@ -235,72 +404,21 @@ function ToolDetails({ turn }: { turn: Turn }) {
 }
 
 export function AssistantAnswer({ turn }: { turn: Turn }) {
-  const [sourcesOpen, setSourcesOpen] = useState(false)
-  const asideRef = useRef<HTMLElement>(null)
-
-  const openEvidence = useCallback(
-    (reference: string) => {
-      setSourcesOpen(true)
-      // After the details has opened, so the element exists to scroll to.
-      window.requestAnimationFrame(() => {
-        document.getElementById(evidenceId(turn.turn_id, reference))?.scrollIntoView({
-          block: 'nearest',
-        })
-      })
-    },
-    [turn.turn_id],
-  )
-
-  const available = new Set(turn.evidence.map((item) => item.reference))
-  const markdown = turn.answer ? withCitationLinks(turn.answer, available, turn.turn_id) : ''
+  /** A link the answer is allowed to carry stays a link; anything else is shown as its text. */
+  function AnswerLink({ href, children }: { href?: string; children?: ReactNode }) {
+    const safe = safeHref(href)
+    if (!safe) return <span>{children}</span>
+    return (
+      <a href={safe} target="_blank" rel="noreferrer noopener">
+        {children}
+      </a>
+    )
+  }
 
   return (
     <Card>
       {turn.answer ? (
-        <div className="max-w-[72ch] space-y-3 text-body text-dim [&_a]:text-accent-ink [&_a]:underline [&_code]:rounded [&_code]:bg-page [&_code]:px-1 [&_h1]:text-heading [&_h1]:font-semibold [&_h1]:text-ink [&_h2]:mt-4 [&_h2]:text-heading [&_h2]:font-semibold [&_h2]:text-ink [&_h3]:mt-3 [&_h3]:font-semibold [&_h3]:text-ink [&_li]:ml-4 [&_li]:list-disc [&_ol>li]:list-decimal [&_strong]:text-ink">
-          <Markdown
-            remarkPlugins={[remarkGfm]}
-            // Raw HTML is not rendered at all: the answer is model output, and anything that
-            // reached it through a filing passage is text, not markup.
-            skipHtml
-            urlTransform={(url) => safeHref(url) ?? ''}
-            components={{
-              a({ href, children }) {
-                const safe = safeHref(href)
-                if (safe?.startsWith('#evidence-')) {
-                  const reference = children?.toString() ?? ''
-                  return <Citation reference={reference} onOpen={openEvidence} />
-                }
-                if (!safe) return <span>{children}</span>
-                return (
-                  <a href={safe} target="_blank" rel="noreferrer noopener">
-                    {children}
-                  </a>
-                )
-              },
-              // Tables scroll inside their own box rather than widening the page.
-              table({ children }) {
-                return (
-                  <div className="overflow-x-auto">
-                    <table className="w-full border-collapse text-note">{children}</table>
-                  </div>
-                )
-              },
-              th({ children }) {
-                return (
-                  <th className="border-b border-line px-2 py-1 text-left text-label text-faint">
-                    {children}
-                  </th>
-                )
-              },
-              td({ children }) {
-                return <td className="border-b border-line/60 px-2 py-1">{children}</td>
-              },
-            }}
-          >
-            {markdown}
-          </Markdown>
-        </div>
+        <Prose link={AnswerLink}>{turn.answer}</Prose>
       ) : (
         <p className="text-body text-dim">
           {turn.failure ?? 'This turn produced no answer text.'}
@@ -335,22 +453,14 @@ export function AssistantAnswer({ turn }: { turn: Turn }) {
       <ToolDetails turn={turn} />
 
       {turn.evidence.length > 0 && (
-        <details
-          className="mt-3"
-          open={sourcesOpen}
-          onToggle={(event) => setSourcesOpen(event.currentTarget.open)}
-        >
+        <details className="mt-3">
           <summary className="cursor-pointer text-label text-faint hover:text-dim">
             Sources and evidence ({turn.evidence.length})
           </summary>
-          <aside ref={asideRef} className="mt-2">
+          <aside className="mt-2">
             <ul className="space-y-2">
               {turn.evidence.map((item) => (
-                <EvidenceEntry
-                  key={item.reference}
-                  id={evidenceId(turn.turn_id, item.reference)}
-                  item={item}
-                />
+                <EvidenceEntry key={item.reference} item={item} />
               ))}
             </ul>
           </aside>

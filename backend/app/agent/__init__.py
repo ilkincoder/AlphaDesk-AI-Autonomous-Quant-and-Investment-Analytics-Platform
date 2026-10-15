@@ -15,7 +15,7 @@ question ──→ Supervisor ──┬─→ Module 1 agent ──→ four read
 | `budget` | The counters and the deadline that bound one run |
 | `llm` | The DeepSeek client, and the only place that knows the provider's details |
 | `context` | What the run is about, and the date conventions that settle it |
-| `evidence` | What the tools returned, and the identifiers citations are checked against |
+| `evidence` | What the tools returned, and the identifiers the sources are listed under |
 | `prompts` | The two system prompts, kept apart because the roles are different jobs |
 | `module1` | Choosing tools, and the trust boundary that executes them |
 | `supervisor` | Routing, and writing the final answer |
@@ -33,17 +33,13 @@ therefore cannot stop the API from starting.
 
 from app.agent.budget import BudgetExhausted, RunBudget
 from app.agent.run import (
-    FAILED_STATUSES,
-    RunDependencies,
     RunResult,
     run_analysis,
 )
 
 __all__ = [
-    "FAILED_STATUSES",
     "BudgetExhausted",
     "RunBudget",
-    "RunDependencies",
     "RunResult",
     "run_analysis",
 ]

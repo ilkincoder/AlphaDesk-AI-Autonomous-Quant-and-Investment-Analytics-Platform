@@ -23,11 +23,10 @@ by a partial unique index, so a second request while one is running is refused r
 queued, and a retry of the *same* request is answered from the row it already has.
 """
 
-import json
 import logging
 import queue
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from fastapi import APIRouter, Depends, HTTPException, Response
@@ -39,9 +38,9 @@ from app.agent.progress import (
     KIND_DONE,
     KIND_ERROR,
     NULL_PROGRESS,
-    Progress,
     ProgressEvent,
     QueueProgress,
+    drain_events,
 )
 from app.agent.recovery import recover_expired
 from app.db import SessionLocal
@@ -274,7 +273,7 @@ def _stream_run(admission: Admission, runner: ProposalRunner) -> StreamingRespon
     threading.Thread(target=work, name=f"proposal-{proposal_id}", daemon=True).start()
 
     return StreamingResponse(
-        _drain(events),
+        drain_events(events),
         media_type="text/event-stream",
         headers={
             # Nothing between here and the browser may buffer this.
@@ -282,20 +281,6 @@ def _stream_run(admission: Admission, runner: ProposalRunner) -> StreamingRespon
             "X-Accel-Buffering": "no",
         },
     )
-
-
-def _drain(events: "queue.Queue[ProgressEvent]") -> Iterator[str]:
-    """Yield queued events as SSE frames until a terminal one."""
-    while True:
-        event = events.get()
-        yield _sse(event)
-        if event.terminal:
-            return
-
-
-def _sse(event: ProgressEvent) -> str:
-    """One server-sent event, in the same shape the analysis stream writes."""
-    return f"event: {event.kind}\ndata: {json.dumps(event.as_dict())}\n\n"
 
 
 @router.get(

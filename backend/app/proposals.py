@@ -27,10 +27,8 @@ before the caller uses it, and an instance outliving its session raises the mome
 is touched. Everything crossing this module's boundary is a plain dict.
 """
 
-import contextlib
 import logging
-import uuid
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -38,7 +36,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.conversations import PROCESSING_GRACE_SECONDS
-from app.db import SessionLocal
+from app.db import SessionLocal, new_id, transaction, utc_now
 from app.models import RebalanceProposal
 
 logger = logging.getLogger(__name__)
@@ -47,27 +45,7 @@ logger = logging.getLogger(__name__)
 STATUS_GENERATING = "generating"
 STATUS_INTERRUPTED = "interrupted"
 
-# The statuses that mean the run is over, whichever way it went.
-TERMINAL_STATUSES = frozenset({"proposed", "no_change", "unavailable", "interrupted"})
 
-
-def new_id() -> str:
-    """A server-generated identifier, not a sequence -- see `app.conversations.new_id`."""
-    return uuid.uuid4().hex
-
-
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-@contextlib.contextmanager
-def _transaction(session: Session) -> Iterator[None]:
-    """One atomic unit of work, inside a caller's transaction if there is one."""
-    if session.in_transaction():
-        yield
-    else:
-        with session.begin():
-            yield
 
 
 # --- outcomes of trying to claim the slot ------------------------------------------------
@@ -116,7 +94,7 @@ def claim(*, request_id: str, budget_seconds: float) -> ClaimOutcome:
     in-flight requests would work perfectly until the second worker process existed.
     """
     with SessionLocal() as session:
-        with _transaction(session):
+        with transaction(session):
             _recover_expired(session)
 
             existing = session.scalar(
@@ -140,7 +118,7 @@ def claim(*, request_id: str, budget_seconds: float) -> ClaimOutcome:
                     proposal_id=active.id, deadline=active.processing_deadline
                 )
 
-            now = _now()
+            now = utc_now()
             identifier = new_id()
             proposal = RebalanceProposal(
                 id=identifier,
@@ -183,9 +161,9 @@ def renew(proposal_id: str, *, seconds: float) -> bool:
     Returns False for a row that is missing, already finished, or still leased by somebody else
     -- all three of which mean "not yours to resume", and none of which is an error.
     """
-    now = _now()
+    now = utc_now()
     with SessionLocal() as session:
-        with _transaction(session):
+        with transaction(session):
             proposal = session.get(RebalanceProposal, proposal_id, with_for_update=True)
             if proposal is None or proposal.status != STATUS_GENERATING:
                 return False
@@ -234,14 +212,14 @@ def finalize(
     says *why* there is no proposal is more useful than one that was never written.
     """
     with SessionLocal() as session:
-        with _transaction(session):
+        with transaction(session):
             proposal = session.get(RebalanceProposal, proposal_id)
             if proposal is None:  # pragma: no cover - inserted by `claim`
                 logger.warning("finalizing a proposal that does not exist: %s", proposal_id)
                 return STATUS_INTERRUPTED
 
             proposal.status = status
-            proposal.completed_at = _now()
+            proposal.completed_at = utc_now()
             proposal.processing_deadline = None
             proposal.failure = failure
             proposal.failure_reason = failure_reason
@@ -283,7 +261,7 @@ def latest() -> dict | None:
     proposal as though it were current.
     """
     with SessionLocal() as session:
-        with _transaction(session):
+        with transaction(session):
             _recover_expired(session)
 
         proposal = session.scalars(
@@ -345,7 +323,7 @@ def _recover_expired(session: Session) -> str | None:
             # offset. Treated as UTC rather than guessed at, because the alternative is
             # comparing it against an aware value and raising here.
             deadline = deadline.replace(tzinfo=timezone.utc)
-        if deadline > _now():
+        if deadline > utc_now():
             continue
 
         logger.warning(
@@ -353,7 +331,7 @@ def _recover_expired(session: Session) -> str | None:
             proposal.id,
         )
         proposal.status = STATUS_INTERRUPTED
-        proposal.completed_at = _now()
+        proposal.completed_at = utc_now()
         proposal.processing_deadline = None
         proposal.failure = (
             "This proposal did not finish within its processing deadline. It was interrupted, "
@@ -405,7 +383,6 @@ __all__ = [
     "Replay",
     "STATUS_GENERATING",
     "STATUS_INTERRUPTED",
-    "TERMINAL_STATUSES",
     "claim",
     "finalize",
     "get",

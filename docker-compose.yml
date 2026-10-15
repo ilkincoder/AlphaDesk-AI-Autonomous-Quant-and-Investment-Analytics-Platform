@@ -8,7 +8,13 @@ services:
     ports:
       # Host port 5433, not 5432: a native PostgreSQL already listens on 5432 on
       # this Mac, so binding 5432 here would fail.
-      - "5433:5432"
+      #
+      # Bound to 127.0.0.1 like every other published port below. This database is
+      # reached by the backend over the Compose network, so the host port exists only
+      # for a tool on this machine (DataGrip, psql) -- and the development password in
+      # .env.example is public, so an unbounded port would hand the database to anyone
+      # on the same network.
+      - "127.0.0.1:5433:5432"
     volumes:
       # Postgres 18 stores its data in /var/lib/postgresql/18/docker and the image
       # declares VOLUME /var/lib/postgresql, so that parent path is what must be
@@ -72,7 +78,13 @@ services:
       # With it pointing at the mounted volume below, the weights survive rebuilds.
       FASTEMBED_CACHE_PATH: /models/fastembed
     ports:
-      - "8000:8000"
+      # Bound to 127.0.0.1, and this is the port that most needs it. The API has no
+      # authentication at all -- it is a local, single-user application -- so an open
+      # 8000 on a shared network would let anyone read the portfolio, spend this
+      # machine's DeepSeek credits, and approve a rebalance. The frontend reaches the
+      # API by service name, and uvicorn still listens on 0.0.0.0 *inside* the
+      # container; only the host side is narrowed.
+      - "127.0.0.1:8000:8000"
     volumes:
       # Live source mount: edits on the Mac appear in the container immediately,
       # so changing code needs no rebuild at all (paired with --reload below).
@@ -112,7 +124,10 @@ services:
     # proxy, which runs inside this container and uses the Compose service name, so
     # no database credential is ever passed here or shipped to the browser.
     ports:
-      - "5173:5173"
+      # Bound to 127.0.0.1 for the same reason as the backend: the Vite dev server has
+      # no authentication either, and it proxies every /api call straight through to an
+      # API that has none.
+      - "127.0.0.1:5173:5173"
     volumes:
       # Live source mount, same as the backend: edits on the Mac reload the page.
       - ./frontend:/app

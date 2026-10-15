@@ -243,10 +243,6 @@ class TargetAllocation:
     reason: str
     evidence_refs: tuple[str, ...]
 
-    @property
-    def is_cash(self) -> bool:
-        return self.symbol == CASH
-
     def as_dict(self) -> dict:
         return {
             "symbol": self.symbol,

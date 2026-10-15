@@ -52,8 +52,7 @@ from tests.testdb import test_engine
 
 TICKER = "NVDA"
 CIK = "0001045810"
-OTHER_TICKER = "AAPL"
-OTHER_CIK = "0000320193"
+
 
 ACCEPTED = datetime(2026, 9, 5, 21, 0, tzinfo=timezone.utc)
 

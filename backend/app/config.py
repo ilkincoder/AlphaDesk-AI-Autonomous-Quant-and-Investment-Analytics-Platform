@@ -14,10 +14,10 @@ class Settings(BaseSettings):
     # postgresql+psycopg2://user:password@postgres:5432/dbname
     database_url: str
 
-    # Market-data provider key (Twelve Data). Optional on purpose: no provider client
-    # exists yet, and a missing key must never stop /health, /portfolio or
-    # /portfolio/valuation from starting. Code that actually calls the provider is
-    # responsible for reporting a missing key as its own error.
+    # Market-data provider key (Twelve Data). Optional on purpose: a missing key must never
+    # stop /health, /portfolio or /portfolio/valuation from starting, and the pages that need
+    # no market data must keep working without one. The code that does call the provider --
+    # `app/twelvedata.py` -- is responsible for reporting a missing key as its own error.
     #
     # Read from the TWELVE_DATA_API_KEY environment variable. Never log it, and never
     # send it to the frontend.
@@ -71,7 +71,12 @@ class Settings(BaseSettings):
     # The paper trading host, and the ONLY host this integration will talk to. The client
     # refused anything else -- see `app/alpaca.py` -- so pointing this at the live account
     # is a startup-visible error rather than a set of real orders.
-    alpaca_base_url: str = "https://paper-api.alpaca.markets"
+    #
+    # Read from ALPACA_API_BASE_URL, which is the name the field takes from its environment.
+    # The `api_` is not decoration: it is what makes this name match the two credentials
+    # above, and it is the name `.env.example`, `docker-compose.yml` and the client's own
+    # error message all use.
+    alpaca_api_base_url: str = "https://paper-api.alpaca.markets"
 
     # --- Module 1 agent -----------------------------------------------------------------
     #

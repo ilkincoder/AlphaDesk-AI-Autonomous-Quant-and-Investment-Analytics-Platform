@@ -12,7 +12,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import type { Turn } from '../analysisApi'
-import { AssistantAnswer } from './AssistantAnswer'
+import { AnswerDraft, AssistantAnswer } from './AssistantAnswer'
 import { Card } from './Card'
 
 /** How close to the bottom counts as "at the bottom", in pixels. */
@@ -52,6 +52,7 @@ function EmptyState() {
 export function ChatTranscript({
   turns,
   pendingQuestion,
+  pendingAnswer,
   busy,
   progress,
   statusNote,
@@ -61,6 +62,8 @@ export function ChatTranscript({
   turns: Turn[]
   /** The message being sent, shown before the server has answered. */
   pendingQuestion: string | null
+  /** The answer to it as it is being written, if the run has started writing one. */
+  pendingAnswer: string | null
   busy: boolean
   /** What the run has reported so far, in order. Each is something that happened. */
   progress: string[]
@@ -79,7 +82,7 @@ export function ChatTranscript({
   // Keep the reader in place unless they were already following along.
   useEffect(() => {
     if (atBottom) scrollToBottom()
-  }, [turns.length, pendingQuestion, progress.length, atBottom, scrollToBottom])
+  }, [turns.length, pendingQuestion, pendingAnswer, progress.length, atBottom, scrollToBottom])
 
   return (
     <div className="relative min-h-0 flex-1">
@@ -129,6 +132,11 @@ export function ChatTranscript({
                 </button>
               )}
             </Card>
+
+            {/* The answer arriving, rather than a step on the way to it. It is replaced by the
+                finished answer below the moment the run ends -- including when the run decides
+                the answer does not stand, in which case the reader is told why instead. */}
+            {pendingAnswer && <AnswerDraft text={pendingAnswer} />}
           </>
         )}
       </div>

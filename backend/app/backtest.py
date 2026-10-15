@@ -41,7 +41,7 @@ anyone expects a currency to follow. Execution prices carry four decimal places,
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date
 from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal
 
 from app.twelvedata import DailyBar
@@ -405,11 +405,6 @@ RSI_REVERSION = Strategy(
 STRATEGIES: tuple[Strategy, ...] = (MOVING_AVERAGE_CROSSOVER, RSI_REVERSION)
 
 STRATEGIES_BY_ID: dict[str, Strategy] = {item.id: item for item in STRATEGIES}
-
-
-def default_parameters(strategy: Strategy) -> dict[str, int]:
-    """The configuration a strategy runs with when nothing has been chosen."""
-    return {param.name: param.default for param in strategy.parameters}
 
 
 def warmup_lookback_days(sessions: int) -> int:
@@ -1123,7 +1118,6 @@ __all__ = [
     "Strategy",
     "Trade",
     "UnusableDataError",
-    "default_parameters",
     "run_backtest",
     "validate_configuration",
     "warmup_lookback_days",

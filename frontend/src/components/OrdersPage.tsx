@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 
 import {
   ApiError,
@@ -7,83 +7,34 @@ import {
   type OrderIntent,
   type OrdersView,
 } from '../api'
+import { batchColour, batchLabel, intentColour, intentLabel, POLL_INTERVAL_MS } from '../orders'
 import { Button } from './Button'
 import { Card } from './Card'
 import { ErrorNotice, LoadingCards } from './States'
 
-/** How often the page re-reads while a batch is still working.
+/** How long the "just approved" ring and label stay, before both leave.
  *
- * The execution itself does not depend on this: the server follows the batch on its own thread
- * whether or not this page is open. This only decides how quickly the screen catches up.
- */
-const POLL_INTERVAL_MS = 4000
-
-/** What a batch's status says to a reader.
+ * The highlight answers one question -- "which batch did the approval I just made open?" --
+ * and a batch approved ten minutes ago is not the answer to anything. So it is a moment, not
+ * a state: the stylesheet fades it over this same clock (`approval-ring-out` and
+ * `approval-label-out` in index.css) and this timer takes it out of the DOM at the end of it.
+ * Removing it matters as much as fading it: a label at `opacity: 0` is still a label a screen
+ * reader reads out.
  *
- * Plain language rather than the wire value, and never only a colour. `partial` and `halted` are
- * not failures of the application: they mean the batch stopped, and the reason is in the notes.
+ * The two halves are handed the same number rather than each carrying its own copy, because
+ * a ring that finishes fading after the element has gone -- or an element that vanishes
+ * mid-fade -- is the bug that pairing invites.
  */
-function batchLabel(batch: ExecutionBatch): string {
-  switch (batch.status) {
-    case 'completed':
-      return 'Completed'
-    case 'partial':
-      return 'Partly completed'
-    case 'halted':
-      return 'Stopped'
-    case 'submitting':
-      return 'Working'
-    default:
-      return 'Waiting'
-  }
-}
+export const APPROVAL_HIGHLIGHT_MS = 3000
 
-function batchColour(batch: ExecutionBatch): string {
-  if (batch.status === 'completed') return 'text-positive'
-  if (batch.status === 'halted' || batch.status === 'partial') return 'text-danger'
-  return 'text-accent-ink'
-}
+/** The order table's columns, counted once: the ten the order carries plus the one the
+ *  chevron sits in. The detail row spans all of them, and a `colSpan` that disagrees with
+ *  the header is a table that renders as a ragged grid rather than as an error. */
+const ORDER_COLUMNS = 11
 
-/** What one order's status says, including the two that mean "not known".
- *
- * `unknown` is an unanswered submission and `not_found` is one the broker has no record of.
- * Both are shown as what they are rather than as a failure, because an order that may exist
- * must not be reported as one that did not happen.
- */
-function intentLabel(intent: OrderIntent): string {
-  switch (intent.status) {
-    case 'filled':
-      return 'Filled'
-    case 'partially_filled':
-      return 'Partly filled'
-    case 'accepted':
-      return 'Accepted, not yet filled'
-    case 'submitting':
-      return 'Being submitted'
-    case 'planned':
-      return 'Not sent yet'
-    case 'rejected':
-      return 'Rejected by the broker'
-    case 'canceled':
-      return 'Canceled'
-    case 'expired':
-      return 'Expired unfilled'
-    case 'halted':
-      return 'Stopped, never sent'
-    case 'unknown':
-      return 'Unanswered — outcome not known'
-    case 'not_found':
-      return 'Never confirmed by the broker'
-    default:
-      return intent.status
-  }
-}
-
-function intentColour(intent: OrderIntent): string {
-  if (intent.status === 'filled') return 'text-positive'
-  if (['rejected', 'canceled', 'expired', 'halted'].includes(intent.status)) return 'text-danger'
-  if (['unknown', 'not_found'].includes(intent.status)) return 'text-danger'
-  return 'text-accent-ink'
+/** The id the detail card carries, so the row's button can point at what it opens. */
+function panelId(intentId: string): string {
+  return `order-detail-${intentId}`
 }
 
 export function OrdersPage({
@@ -193,10 +144,33 @@ export function OrdersPage({
 }
 
 function BatchCard({ batch, focused }: { batch: ExecutionBatch; focused: boolean }) {
+  // Which order's detail card is open. One at a time: the card is a restatement of the row
+  // that opened it, so a second open one is a second thing to scroll past rather than a
+  // second thing to compare with. Clicking the open order again closes it.
+  const [openOrderId, setOpenOrderId] = useState<string | null>(null)
+
+  // The ring the approval left behind, for as long as it is still news. `focused` says which
+  // batch that was; this says whether the moment is still running.
+  const [highlighted, setHighlighted] = useState(focused)
+
+  useEffect(() => {
+    if (!focused) {
+      setHighlighted(false)
+      return
+    }
+    setHighlighted(true)
+    const timer = window.setTimeout(() => setHighlighted(false), APPROVAL_HIGHLIGHT_MS)
+    return () => window.clearTimeout(timer)
+  }, [focused])
+
+  const toggle = (intentId: string) =>
+    setOpenOrderId((current) => (current === intentId ? null : intentId))
+
   return (
     <Card>
       <div
-        className={focused ? 'rounded-md ring-1 ring-accent/60' : undefined}
+        className={highlighted ? 'approval-ring rounded-md' : undefined}
+        style={highlighted ? { animationDuration: `${APPROVAL_HIGHLIGHT_MS}ms` } : undefined}
         data-testid={`batch-${batch.batch_id}`}
       >
         <div className="flex flex-wrap items-start justify-between gap-3">
@@ -205,7 +179,14 @@ function BatchCard({ batch, focused }: { batch: ExecutionBatch; focused: boolean
                 wants and the only thing this card leads with. */}
             <h2 className={`text-heading font-medium ${batchColour(batch)}`}>
               {batchLabel(batch)}
-              {focused && <span className="ml-2 text-label text-accent-ink">Just approved</span>}
+              {highlighted && (
+                <span
+                  className="approval-label ml-2 text-label text-accent-ink"
+                  style={{ animationDuration: `${APPROVAL_HIGHLIGHT_MS}ms` }}
+                >
+                  Just approved
+                </span>
+              )}
             </h2>
             <p className="mt-1 text-label text-faint">
               Proposal <span className="font-mono">{batch.proposal_id}</span>
@@ -244,42 +225,98 @@ function BatchCard({ batch, focused }: { batch: ExecutionBatch; focused: boolean
                 <th className="py-2 pr-3 font-medium">Average fill price</th>
                 <th className="py-2 pr-3 font-medium">Status</th>
                 <th className="py-2 font-medium">Broker order id</th>
+                <th className="py-2">
+                  <span className="sr-only">Details</span>
+                </th>
               </tr>
             </thead>
             <tbody>
-              {batch.orders.map((order) => (
-                <tr key={order.intent_id} className="border-b border-line/60 align-top">
-                  <td className="py-2 pr-3 font-medium text-ink">{order.symbol}</td>
-                  <td
-                    className={`py-2 pr-3 font-medium ${
-                      order.side === 'buy' ? 'text-positive' : 'text-danger'
-                    }`}
-                  >
-                    {order.side}
-                  </td>
-                  <td className="py-2 pr-3 text-dim">{shares(order.quantity)}</td>
-                  <td className="py-2 pr-3 text-dim">{shares(order.filled_quantity)}</td>
-                  <td className="py-2 pr-3 text-dim">{order.order_type}</td>
-                  <td className="py-2 pr-3 text-dim">{order.time_in_force}</td>
-                  {/* Labelled as an estimate in the heading, because that is all it is: the
-                      broker's own average is the next column and the only actual price. */}
-                  <td className="py-2 pr-3 text-dim">{money(order.estimated_price, batch.currency)}</td>
-                  <td className="py-2 pr-3 text-ink">
-                    {order.filled_avg_price === null
-                      ? '—'
-                      : money(order.filled_avg_price, batch.currency)}
-                  </td>
-                  <td className={`py-2 pr-3 ${intentColour(order)}`}>
-                    {intentLabel(order)}
-                    {order.broker_status !== null && (
-                      <span className="ml-1 text-faint">({order.broker_status})</span>
+              {batch.orders.map((order) => {
+                const open = order.intent_id === openOrderId
+                return (
+                  <Fragment key={order.intent_id}>
+                    <tr
+                      /* The row is the target, because a reader who wants one order's detail
+                         is pointing at the order, not at a control inside it. A click on the
+                         row and Enter on the button below do the same thing; the button is
+                         what a keyboard and a screen reader reach, and it is where the
+                         expanded state is announced from. */
+                      onClick={() => toggle(order.intent_id)}
+                      className="cursor-pointer border-b border-line/60 align-top transition-colors hover:bg-selected/40"
+                    >
+                      <td className="py-2 pr-3 font-medium text-ink">
+                        <button
+                          type="button"
+                          aria-expanded={open}
+                          aria-controls={panelId(order.intent_id)}
+                          onClick={(event) => {
+                            event.stopPropagation()
+                            toggle(order.intent_id)
+                          }}
+                          className="font-medium text-ink"
+                        >
+                          {order.symbol}
+                        </button>
+                      </td>
+                      <td
+                        className={`py-2 pr-3 font-medium ${
+                          order.side === 'buy' ? 'text-positive' : 'text-danger'
+                        }`}
+                      >
+                        {order.side}
+                      </td>
+                      <td className="py-2 pr-3 text-dim">{shares(order.quantity)}</td>
+                      <td className="py-2 pr-3 text-dim">{shares(order.filled_quantity)}</td>
+                      <td className="py-2 pr-3 text-dim">{order.order_type}</td>
+                      <td className="py-2 pr-3 text-dim">{order.time_in_force}</td>
+                      {/* Labelled as an estimate in the heading, because that is all it is: the
+                          broker's own average is the next column and the only actual price. */}
+                      <td className="py-2 pr-3 text-dim">
+                        {money(order.estimated_price, batch.currency)}
+                      </td>
+                      <td className="py-2 pr-3 text-ink">
+                        {order.filled_avg_price === null
+                          ? '—'
+                          : money(order.filled_avg_price, batch.currency)}
+                      </td>
+                      <td className={`py-2 pr-3 ${intentColour(order)}`}>
+                        {intentLabel(order)}
+                        {order.broker_status !== null && (
+                          <span className="ml-1 text-faint">({order.broker_status})</span>
+                        )}
+                      </td>
+                      {/* Shortened here and given in full in the card below, the way the
+                          batch id is shortened at the top of this card. A 36-character id is
+                          the widest thing in the row by a factor of two, and left whole it
+                          sets the table's minimum width on its own -- which is what turns
+                          one row opening into a scrollbar under the whole batch. */}
+                      <td className="py-2 pl-3 font-mono text-label text-faint">
+                        {order.broker_order_id === null ? (
+                          '—'
+                        ) : (
+                          <span title={order.broker_order_id}>
+                            {shortenedId(order.broker_order_id)}
+                          </span>
+                        )}
+                      </td>
+                      {/* Points at the card rather than naming it: the row already says
+                          which order this is, and a chevron that turns is the whole
+                          convention for "there is more under this". */}
+                      <td className="py-2 pl-2 text-right text-faint">
+                        <ChevronIcon open={open} />
+                      </td>
+                    </tr>
+
+                    {open && (
+                      <tr className="align-top">
+                        <td colSpan={ORDER_COLUMNS} className="pb-3 pt-1">
+                          <OrderDetail order={order} currency={batch.currency} />
+                        </td>
+                      </tr>
                     )}
-                  </td>
-                  <td className="py-2 font-mono text-label text-faint">
-                    {order.broker_order_id ?? '—'}
-                  </td>
-                </tr>
-              ))}
+                  </Fragment>
+                )
+              })}
             </tbody>
           </table>
         </div>
@@ -316,6 +353,115 @@ function BatchCard({ batch, focused }: { batch: ExecutionBatch; focused: boolean
   )
 }
 
+/** One order, opened out of its row.
+ *
+ * The table has to fit ten columns into a strip, so it sets the columns a reader compares
+ * across. This says the same fields at a size that can be read one at a time, which is what
+ * somebody wants when they are looking at a single order rather than at the batch.
+ *
+ * Nothing here is new information and nothing is recomputed: every value is the row's own,
+ * through the same `shares` and `money` helpers, so the card cannot come to disagree with
+ * the line it was opened from.
+ */
+function OrderDetail({ order, currency }: { order: OrderIntent; currency: string }) {
+  return (
+    <div
+      id={panelId(order.intent_id)}
+      className="rounded-card border border-line bg-page p-4"
+    >
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
+        <h3 className="text-heading font-medium text-ink">
+          {/* The space is written out: JSX drops the whitespace around a line break, so
+              `{order.symbol}` followed by the side on the next line would read as one word
+              -- "AAPLsell" -- to anyone selecting the text or hearing it read out. */}
+          {order.symbol}{' '}
+          <span
+            className={`ml-2 ${order.side === 'buy' ? 'text-positive' : 'text-danger'}`}
+          >
+            {order.side}
+          </span>
+        </h3>
+        {/* The order's own id: the batch id is on the card above, and this is the one the
+            broker and the execution plan are keyed by. */}
+        <p className="font-mono text-label text-faint" title={order.intent_id}>
+          {order.intent_id.slice(0, 12)}
+        </p>
+      </div>
+
+      <dl className="mt-3 grid grid-cols-2 gap-x-6 gap-y-2 text-label min-[700px]:grid-cols-4">
+        <Figure label="Quantity" value={shares(order.quantity)} />
+        <Figure label="Filled" value={shares(order.filled_quantity)} />
+        <Figure label="Order type" value={order.order_type} valueClassName="text-dim" />
+        <Figure label="Time in force" value={order.time_in_force} valueClassName="text-dim" />
+        <Figure
+          label="Estimated price"
+          value={money(order.estimated_price, currency)}
+          valueClassName="text-dim"
+        />
+        <Figure
+          label="Average fill price"
+          value={order.filled_avg_price === null ? '—' : money(order.filled_avg_price, currency)}
+        />
+        <Figure
+          label="Broker status"
+          value={statusWithBroker(order)}
+          valueClassName={intentColour(order)}
+        />
+        {/* `break-words`, not `break-all`: a hyphenated id wraps at its hyphens, which reads
+            as the groups it is made of, and only an id with no hyphens at all is broken
+            mid-word -- rather than widening the table it sits in. */}
+        <Figure
+          label="Broker order id"
+          value={order.broker_order_id ?? '—'}
+          valueClassName="font-mono text-faint break-words"
+        />
+      </dl>
+    </div>
+  )
+}
+
+/** The disclosure chevron on an order row.
+ *
+ * Drawn rather than typed, and that is the whole reason it is a component. "▸" is a font
+ * glyph, so its box is whatever the font decides it is -- about 19px here, in a column that
+ * is 26px wide including its padding. Left as a glyph it sticks out past the table's right
+ * edge and drags a horizontal scrollbar under a table that had been fitting, which is a
+ * large consequence for a small triangle. An SVG is exactly the size it says it is.
+ */
+function ChevronIcon({ open }: { open: boolean }) {
+  return (
+    <svg
+      viewBox="0 0 12 12"
+      width="12"
+      height="12"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      className={`inline-block shrink-0 transition-transform ${open ? 'rotate-90' : ''}`}
+    >
+      <path d="M4.5 2.5L8 6l-3.5 3.5" />
+    </svg>
+  )
+}
+
+/** An id, cut to twelve characters for the row -- with the ellipsis only when something was
+ *  actually cut, so a short id is never made to look like a longer one. */
+function shortenedId(value: string): string {
+  return value.length > 12 ? `${value.slice(0, 12)}…` : value
+}
+
+/** The status, and the broker's own word for it in brackets when there is one.
+ *
+ * The row shows the two side by side because they are two columns; here they are one line,
+ * which is how somebody reading a single order says it out loud. */
+function statusWithBroker(order: OrderIntent): string {
+  const label = intentLabel(order)
+  return order.broker_status === null ? label : `${label} (${order.broker_status})`
+}
+
 /** The portfolio sync, reported apart from the execution.
  *
  * A sync that failed says nothing about whether an order filled, so it is its own line rather
@@ -349,11 +495,27 @@ function SyncLine({ batch }: { batch: ExecutionBatch }) {
   )
 }
 
-function Figure({ label, value }: { label: string; value: string }) {
+/** `valueClassName` exists for the two figures that are not plain ink: a side that is a rise
+ *  or a fall, and a status that is one of the same. The default is what every other figure
+ *  already used.
+ *
+ *  `min-w-0` is the grid's own default being overruled on purpose. A grid item is
+ *  `min-width: auto`, which means it refuses to shrink below the width of its longest word --
+ *  and the order detail card lives in a row that spans the whole table, so a figure that
+ *  would not shrink would widen the table and put a horizontal scrollbar under it. */
+function Figure({
+  label,
+  value,
+  valueClassName = 'text-ink',
+}: {
+  label: string
+  value: string
+  valueClassName?: string
+}) {
   return (
-    <div>
+    <div className="min-w-0">
       <dt className="text-faint">{label}</dt>
-      <dd className="text-ink">{value}</dd>
+      <dd className={valueClassName}>{value}</dd>
     </div>
   )
 }

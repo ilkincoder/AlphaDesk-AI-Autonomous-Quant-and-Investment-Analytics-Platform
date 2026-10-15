@@ -15,6 +15,7 @@ from datetime import date
 from fastapi.testclient import TestClient
 
 from app.agent.progress import (
+    KIND_ANSWER_DRAFT,
     KIND_COMPOSING,
     KIND_DONE,
     KIND_ERROR,
@@ -143,10 +144,12 @@ class RealEventTests(ToolTestCase):
 
         kinds = [event.kind for event in self.events]
         self.assertEqual(result.status, STATUS_COMPLETED)
-        # Every stage named is a stage that ran, in the order it ran.
+        # Every stage named is a stage that ran, in the order it ran. The drafts are the
+        # answer being written, which is a stage of composition and comes last.
         self.assertEqual(
-            kinds, [KIND_ROUTING, KIND_TOOL, KIND_FINDINGS, KIND_COMPOSING]
+            kinds[:4], [KIND_ROUTING, KIND_TOOL, KIND_FINDINGS, KIND_COMPOSING]
         )
+        self.assertEqual(set(kinds[4:]), {KIND_ANSWER_DRAFT})
 
     def test_the_routing_event_names_the_destination_and_what_was_settled(self):
         self.run_it()
@@ -182,13 +185,33 @@ class RealEventTests(ToolTestCase):
                 ):
                     self.assertNotIn(forbidden, blob)
 
-    def test_no_event_carries_everything_the_answer_does(self):
-        """Events describe progress, not the result. The answer arrives once, at the end."""
-        self.run_it()
+    def test_the_only_event_carrying_prose_is_the_draft(self):
+        """The answer is written to the client as it is written, and nothing else that is not
+        the result travels with it: no citations, no limitations, no findings.
+
+        The draft is deliberately a *prefix* of the answer that stands -- it cannot be more
+        than the run went on to accept -- and it is the draft the client has to be told is not
+        final. What is checked here is that the channel carries the prose and only the prose.
+        """
+        result = self.run_it()
+
+        drafts = [e for e in self.events if e.kind == KIND_ANSWER_DRAFT]
+        self.assertTrue(drafts)
+
+        # Every draft is a prefix of the next, and of the answer the run settled on.
+        for earlier, later in zip(drafts, drafts[1:]):
+            self.assertTrue(result.answer.startswith(later.data["text"]))
+            self.assertTrue(later.data["text"].startswith(earlier.data["text"]))
+
+        # The last draft is the whole answer: the reader is not left waiting for the tail.
+        self.assertEqual(drafts[-1].data["text"], result.answer)
 
         for event in self.events:
-            self.assertNotIn("answer", event.data)
             self.assertNotIn("citations", event.data)
+            self.assertNotIn("evidence", event.data)
+            # The findings event reports *how many* limitations there were, never the
+            # sentences themselves.
+            self.assertIsInstance(event.data.get("limitations", 0), int)
 
     def test_an_emitter_that_raises_leaves_the_run_untouched(self):
         def broken(event: ProgressEvent) -> None:

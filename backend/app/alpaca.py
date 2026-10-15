@@ -42,6 +42,8 @@ from typing import Any, NoReturn
 
 import httpx
 
+from app.provider import redact
+
 BROKER = "alpaca_paper"
 
 PAPER_BASE_URL = "https://paper-api.alpaca.markets"
@@ -361,17 +363,6 @@ class BrokerOrder:
         )
 
 
-def redact(text: str, *secrets: str | None) -> str:
-    """Replace any of `secrets` appearing in `text` with a fixed marker.
-
-    Applied to every provider-supplied message before it reaches an exception, because
-    Alpaca is free to quote a credential back in an error and this client's whole point is
-    that neither ever leaves the process in a log line or a traceback.
-    """
-    for secret in secrets:
-        if secret and secret.strip():
-            text = text.replace(secret, "***")
-    return text
 
 
 
@@ -683,7 +674,7 @@ def _configured_secret_key() -> str | None:
 def _configured_base_url() -> str:
     from app.config import settings
 
-    return settings.alpaca_base_url
+    return settings.alpaca_api_base_url
 
 
 def _resolve_base_url(base_url: str) -> str:

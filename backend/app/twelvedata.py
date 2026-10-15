@@ -51,6 +51,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
+from app.provider import redact
+
 PROVIDER = "twelve_data"
 INTERVAL = "1day"
 ADJUST_MODE = "splits"
@@ -220,17 +222,6 @@ class DailyBarRange:
         return len(self.bars)
 
 
-def redact(text: str, *secrets: str | None) -> str:
-    """Replace any of `secrets` appearing in `text` with a fixed marker.
-
-    Applied to every provider-supplied message before it reaches an exception, because
-    Twelve Data is free to quote the key back in an error and this client's whole point
-    is that a key never leaves the process in a log line or a traceback.
-    """
-    for secret in secrets:
-        if secret and secret.strip():
-            text = text.replace(secret, "***")
-    return text
 
 
 def fetch_daily_bars(

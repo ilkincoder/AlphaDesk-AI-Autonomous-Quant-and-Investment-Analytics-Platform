@@ -1,12 +1,10 @@
 import { describe, expect, it } from 'vitest'
 
 import {
-  directionOf,
   formatCurrency,
   formatPercent,
   formatShares,
   formatSignedPercent,
-  isZeroAmount,
 } from './format'
 
 describe('formatCurrency', () => {
@@ -79,32 +77,11 @@ describe('formatSignedPercent', () => {
     expect(formatSignedPercent('-7.5')).toBe('-7.5%')
   })
 
-  it('does not put a plus on no change', () => {
+  it('does not put a plus on no change, however the zero is written', () => {
+    // Read off the digits rather than parsed: a minus sign in front of nothing is still
+    // nothing, and `-0.00` is what a difference that rounded down to zero leaves behind.
     expect(formatSignedPercent('0')).toBe('0%')
     expect(formatSignedPercent('0.00')).toBe('0%')
-  })
-})
-
-describe('isZeroAmount', () => {
-  it('reads zero off the digits, however it is written', () => {
-    expect(isZeroAmount('0')).toBe(true)
-    expect(isZeroAmount('0.00')).toBe(true)
-    // A minus sign in front of nothing is still nothing.
-    expect(isZeroAmount('-0.00')).toBe(true)
-  })
-
-  it('is false as soon as any digit is non-zero', () => {
-    expect(isZeroAmount('0.01')).toBe(false)
-    expect(isZeroAmount('-0.01')).toBe(false)
-    expect(isZeroAmount('150.00')).toBe(false)
-  })
-})
-
-describe('directionOf', () => {
-  it('names the direction in words', () => {
-    expect(directionOf('-150.00')).toBe('decrease')
-    expect(directionOf('150.00')).toBe('increase')
-    expect(directionOf('0.00')).toBe('no change')
-    expect(directionOf('-0.00')).toBe('no change')
+    expect(formatSignedPercent('-0.00')).toBe('0%')
   })
 })

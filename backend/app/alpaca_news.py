@@ -27,6 +27,8 @@ from typing import Any, NoReturn
 
 import httpx
 
+from app.provider import redact
+
 PROVIDER = "alpaca_news"
 
 # The market data host, and the only one this client will talk to.
@@ -101,12 +103,6 @@ class NewsItem:
     provider_updated_at: datetime | None
 
 
-def redact(text: str, *secrets: str | None) -> str:
-    """Replace any of `secrets` appearing in `text` with a fixed marker."""
-    for secret in secrets:
-        if secret and secret.strip():
-            text = text.replace(secret, "***")
-    return text
 
 
 def fetch_news(

@@ -8,7 +8,16 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { aConversation, aHistory, aTurn, jsonResponse, on, routeFetch, sseResponse } from '../testing'
+import {
+  aConversation,
+  aHistory,
+  aTurn,
+  jsonResponse,
+  on,
+  routeFetch,
+  slowSseResponse,
+  sseResponse,
+} from '../testing'
 import { AnalysisPage } from './AnalysisPage'
 
 /** What the page would have sent, parsed. */
@@ -89,7 +98,7 @@ describe('AnalysisPage — starting and restoring', () => {
     expect(creates).toHaveLength(0)
   })
 
-  it('restores the answer with its citations and limitations, not just its text', async () => {
+  it('restores the answer with its sources and limitations, not just its text', async () => {
     window.localStorage.setItem('alphadesk.analysis.activeConversation', 'conv-7')
     vi.stubGlobal(
       'fetch',
@@ -109,7 +118,9 @@ describe('AnalysisPage — starting and restoring', () => {
 
     expect(await screen.findByText(/Sources and evidence/)).toBeDefined()
     expect(screen.getByText('insufficient_coverage')).toBeDefined()
-    expect(screen.getByRole('button', { name: 'Show evidence E1' })).toBeDefined()
+    // The evidence is restored with the answer -- it is the sources listed under it now. The
+    // marker that used to tie the two together is stripped out of the prose on the way in.
+    expect(screen.getByText('It rose.')).toBeDefined()
   })
 
   it('offers a new conversation when the stored one is gone', async () => {
@@ -176,6 +187,50 @@ describe('AnalysisPage — asking', () => {
     const details = await screen.findByText('Tool details and usage')
     expect(within(details.closest('details') as HTMLElement).getByText(/market_insider_analysis/))
       .toBeDefined()
+  })
+
+  it('shows the answer as it is written, and replaces it with the checked one', async () => {
+    vi.stubGlobal(
+      'fetch',
+      routeFetch([
+        on('POST', '/analysis/conversations', () => jsonResponse(aConversation(), 201)),
+        on('GET', '/analysis/conversations/conv-1', () =>
+          jsonResponse(aHistory([aTurn({ user_message: 'How is NVDA doing?' })])),
+        ),
+        on('POST', '/analysis/chat/stream', () =>
+          slowSseResponse(
+            [
+              { event: 'routing', destination: 'module1_analysis', symbol: 'NVDA' },
+              { event: 'composing' },
+              { event: 'answer_draft', text: 'NVDA rose slightly' },
+              { event: 'answer_draft', text: 'NVDA rose slightly over the window' },
+              { event: 'done', turn: aTurn() },
+            ],
+            200,
+          ),
+        ),
+      ]),
+    )
+
+    await renderPage()
+    await ask('How is NVDA doing?')
+
+    // On screen while the run is still going, and marked as not yet checked -- the text can
+    // still be corrected or withdrawn at this point.
+    const WAIT = { timeout: 3000 }
+    expect(await screen.findByText('Answer being written', undefined, WAIT)).toBeDefined()
+    expect(screen.getByText('Not checked yet')).toBeDefined()
+
+    // The second draft replaces the first rather than being appended to it: the text on screen
+    // is the newest draft exactly, never the two run together.
+    expect(
+      await screen.findByText('NVDA rose slightly over the window', undefined, WAIT),
+    ).toBeDefined()
+    expect(screen.queryByText('NVDA rose slightly')).toBeNull()
+
+    // And gone once the turn is stored: the answer itself, with its sources, takes its place.
+    await waitFor(() => expect(screen.queryByText('Answer being written')).toBeNull())
+    expect(await screen.findByText('NVDA rose slightly.')).toBeDefined()
   })
 
   it('clears the composer once the question is answered', async () => {

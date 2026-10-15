@@ -8,11 +8,11 @@
 
 import { StrictMode } from 'react'
 
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { anOrder, aBatch, jsonResponse } from '../testing'
-import { OrdersPage } from './OrdersPage'
+import { APPROVAL_HIGHLIGHT_MS, OrdersPage } from './OrdersPage'
 
 function stubOrders(body: unknown, status = 200) {
   const fetchMock = vi.fn().mockResolvedValue(jsonResponse(body, status))
@@ -225,6 +225,122 @@ describe('OrdersPage', () => {
 
     expect(await screen.findByText('Just approved')).toBeTruthy()
     expect(screen.getByRole('heading', { name: /Waiting|Working|Completed|Stopped/ })).toBeTruthy()
+  })
+
+  it('opens one order out of its row, and closes it on a second click', async () => {
+    stubOrders({ active_batch_id: null, batches: [aBatch()] })
+
+    render(<OrdersPage active />)
+    await screen.findByRole('table')
+
+    const toggle = screen.getByRole('button', { name: 'AAPL' })
+    expect(toggle.getAttribute('aria-expanded')).toBe('false')
+
+    fireEvent.click(toggle)
+
+    expect(toggle.getAttribute('aria-expanded')).toBe('true')
+    expect(screen.getByRole('heading', { name: 'AAPL sell' })).toBeTruthy()
+    // The two labels the card uses where the row's are too short to be unambiguous: a card
+    // that opened without them would be a card that opened empty.
+    expect(screen.getByText('Order type')).toBeTruthy()
+    expect(screen.getByText('Broker status')).toBeTruthy()
+
+    fireEvent.click(toggle)
+
+    expect(toggle.getAttribute('aria-expanded')).toBe('false')
+    expect(screen.queryByText('Order type')).toBeNull()
+  })
+
+  it('shortens the broker order id in the row and gives it whole in the card', async () => {
+    // A real broker id is 36 characters. Left whole it is the widest thing in the row by a
+    // factor of two, and it sets the table's width on its own -- which is what turns opening
+    // one order into a horizontal scrollbar under the whole batch.
+    const whole = '0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0'
+    stubOrders({
+      active_batch_id: null,
+      batches: [aBatch({ orders: [anOrder({ broker_order_id: whole })] })],
+    })
+
+    render(<OrdersPage active />)
+    await screen.findByRole('table')
+
+    const row = screen.getByRole('row', { name: /AAPL/ })
+    expect(row.textContent).toContain('0f1e2d3c-4b5…')
+    expect(row.textContent).not.toContain(whole)
+
+    fireEvent.click(screen.getByRole('button', { name: 'AAPL' }))
+
+    // Nothing is lost: the row is short, the card is whole.
+    expect(screen.getByText(whole)).toBeTruthy()
+  })
+
+  it('opens the details when the row itself is clicked, not only the symbol', async () => {
+    stubOrders({ active_batch_id: null, batches: [aBatch()] })
+
+    render(<OrdersPage active />)
+    await screen.findByRole('table')
+
+    fireEvent.click(screen.getByRole('row', { name: /AAPL/ }))
+
+    expect(screen.getByRole('heading', { name: 'AAPL sell' })).toBeTruthy()
+  })
+
+  it('keeps one order open at a time', async () => {
+    stubOrders({
+      active_batch_id: null,
+      batches: [
+        aBatch({
+          orders: [
+            anOrder(),
+            anOrder({ intent_id: 'f'.repeat(32), sequence: 2, symbol: 'MSFT', side: 'buy' }),
+          ],
+        }),
+      ],
+    })
+
+    render(<OrdersPage active />)
+    await screen.findByRole('table')
+
+    fireEvent.click(screen.getByRole('button', { name: 'AAPL' }))
+    fireEvent.click(screen.getByRole('button', { name: 'MSFT' }))
+
+    expect(screen.queryByRole('heading', { name: 'AAPL sell' })).toBeNull()
+    expect(screen.getByRole('heading', { name: 'MSFT buy' })).toBeTruthy()
+  })
+
+  it('fades the just-approved highlight out and then leaves nothing behind', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    try {
+      // Completed, so nothing polls: the only clock running in this test is the highlight's.
+      const batch = aBatch({ status: 'completed' })
+      stubOrders({ active_batch_id: null, batches: [batch] })
+
+      render(<OrdersPage active focusBatchId={batch.batch_id} />)
+
+      const label = await screen.findByText('Just approved')
+      expect(label.className).toContain('approval-label')
+
+      // The ring fades over the same number the component removes it after. A stylesheet
+      // holding its own copy of the duration is the way those two drift apart.
+      const card = screen.getByTestId(`batch-${batch.batch_id}`)
+      expect(card.className).toContain('approval-ring')
+      expect(card.getAttribute('style')).toContain(`${APPROVAL_HIGHLIGHT_MS}ms`)
+
+      // Inside `act`, because the timer ends in a state update: advancing the clock without
+      // it fires the timeout but leaves React's work unflushed, and the DOM still shows the
+      // label the component has already decided to drop.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(APPROVAL_HIGHLIGHT_MS + 100)
+      })
+
+      // Gone from the DOM, not merely faded: at `opacity: 0` a screen reader still reads it.
+      expect(screen.queryByText('Just approved')).toBeNull()
+      expect(screen.getByTestId(`batch-${batch.batch_id}`).className).not.toContain(
+        'approval-ring',
+      )
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('reports a failure to load rather than an empty page', async () => {

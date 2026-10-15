@@ -18,27 +18,12 @@ before the caller uses it, and an instance outliving its session raises the mome
 is touched. Everything crossing this module's boundary is a plain dict.
 """
 
-import uuid
-from datetime import datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from app.db import SessionLocal
+from app.db import SessionLocal, new_id, utc_now
 from app.models import BacktestRun
-
-
-def new_id() -> str:
-    """A server-generated run identifier.
-
-    Random rather than sequential, for the reason `app.conversations.new_id` gives: an id that
-    counts runs tells anyone who reads a URL how many exist.
-    """
-    return uuid.uuid4().hex
-
-
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
 
 
 def find(request_id: str) -> dict | None:
@@ -126,7 +111,7 @@ def record(
                 BacktestRun(
                     id=run_id,
                     request_id=request_id,
-                    created_at=_now(),
+                    created_at=utc_now(),
                     input_snapshot=snapshot,
                     **run,
                 )

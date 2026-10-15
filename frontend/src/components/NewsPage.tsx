@@ -27,6 +27,7 @@ import { type FormEvent, useCallback, useEffect, useRef, useState } from 'react'
 
 import {
   decideProposal,
+  fetchBatch,
   fetchNews,
   fetchProposal,
   ingestNews,
@@ -34,6 +35,7 @@ import {
   streamProposal,
 } from '../api'
 import type {
+  ExecutionBatch,
   NewsArticle,
   NewsIngest,
   NewsList,
@@ -41,8 +43,10 @@ import type {
   RebalanceProposal,
 } from '../api'
 import { formatDateTime, formatSyncTime } from '../format'
+import { batchColour, batchLabel, intentLabel, isSettled, POLL_INTERVAL_MS } from '../orders'
 import { Button } from './Button'
 import { Card } from './Card'
+import { MarketPulse, PULSE_FADE_MS } from './MarketPulse'
 import { RebalanceProposal as ProposalSection } from './RebalanceProposal'
 import { Banner, ErrorNotice } from './States'
 
@@ -100,6 +104,41 @@ type ProposalState =
   | { phase: 'ready'; proposal: RebalanceProposal }
   | { phase: 'error'; message: string }
 
+/** The batch an approval opened: while it is being placed, and what it turned out to be.
+ *
+ * Approving does **not** place the orders. It records the decision and opens a batch, and a
+ * worker on the server submits it on its own thread, on its own schedule -- so `deciding` and
+ * `watching` are two different waits and not one: the first is this browser asking the server to
+ * record something, the second is a worker this page does not control doing something it cannot
+ * see. One spinner over both would claim the page is placing orders, which it never does.
+ *
+ * `settled` and `gave_up` are kept after the flow closes, because they are what the notice above
+ * the news is written from.
+ */
+type PlacingState =
+  | { phase: 'idle' }
+  /** The decision request is in flight, so there is no batch to watch yet. */
+  | { phase: 'deciding' }
+  | { phase: 'watching'; batchId: string; batch: ExecutionBatch | null }
+  | { phase: 'settled'; batch: ExecutionBatch }
+  /** The wait ended before the batch did. `batch` is what was last seen, if anything. */
+  | { phase: 'gave_up'; batch: ExecutionBatch | null }
+  | { phase: 'error'; message: string }
+
+/** How long to follow a batch before giving up on it.
+ *
+ * Not a limit on the execution -- the worker finishes the batch whether or not anybody is
+ * watching. It is a limit on how long this page holds the screen: a batch whose orders sit
+ * accepted because the market is closed may not settle for hours, and a loading screen that
+ * waits for one would trap the reader rather than inform them.
+ *
+ * It is above `UNCERTAIN_GRACE_SECONDS` (60s, `app/order_executor`) on purpose. A submission the
+ * broker did not answer is not recorded as `not_found`, and does not halt the batch, until that
+ * grace has passed and two reconciliations have missed it -- so a ceiling under it would give up
+ * on a batch that was about to reach an answer.
+ */
+export const WAIT_CEILING_MS = 90_000
+
 /** What each stage of the run is, in a reader's words.
  *
  * The names are the backend's own (`app/agent/module2`), and a stage that is not in this map is
@@ -116,6 +155,46 @@ const STAGE_LABELS: Record<string, string> = {
 function messageOf(error: unknown): string {
   if (error instanceof Error) return error.message
   return 'Something went wrong.'
+}
+
+/** How long a wait has to last before it is worth covering the screen for.
+ *
+ * Rejecting is one database write with no broker call and comes back in tens of milliseconds.
+ * A screen that covers the whole application for that long is a flash, and a flash reads as a
+ * fault rather than as progress -- so a short wait leaves the page as it is, and only a wait
+ * long enough to be a wait gets the screen.
+ */
+export const WORK_SCREEN_DELAY_MS = 300
+
+/** Whether the work screen should be up, and whether it is fading out.
+ *
+ * Two flags rather than one: the screen has to stay mounted through its fade, and unmounting it
+ * the moment the work ends would cut the transition off on its first frame. `show` is whether it
+ * is here at all, `leaving` is how it looks on the way out.
+ */
+function useWorkScreen(active: boolean): { show: boolean; leaving: boolean } {
+  const [show, setShow] = useState(false)
+  const [leaving, setLeaving] = useState(false)
+
+  useEffect(() => {
+    if (active) {
+      setLeaving(false)
+      const timer = window.setTimeout(() => setShow(true), WORK_SCREEN_DELAY_MS)
+      return () => window.clearTimeout(timer)
+    }
+
+    // Read from the render this effect is running in, which is the one where the work ended.
+    // Listing `show` as a dependency would re-run this on the state it sets.
+    if (!show) return
+    setLeaving(true)
+    const timer = window.setTimeout(() => {
+      setShow(false)
+      setLeaving(false)
+    }, PULSE_FADE_MS)
+    return () => window.clearTimeout(timer)
+  }, [active])
+
+  return { show, leaving }
 }
 
 export function NewsPage({
@@ -170,6 +249,73 @@ export function NewsPage({
   // What the server said about the last decision attempt, in its own words. A refusal's
   // sentence, or a renewal's, is the useful part and is shown rather than paraphrased.
   const [decisionNotice, setDecisionNotice] = useState<string | null>(null)
+
+  /** Whether the proposal flow has the page rather than the news.
+   *
+   * Deliberately not derived from `proposal.phase`. A proposal restored from the store is `ready`
+   * on load, and seizing the page for it every time somebody came here for news would be this
+   * page answering a question nobody asked -- so entering the flow is something a person does,
+   * and the restored one is offered as a notice instead. */
+  const [flowOpen, setFlowOpen] = useState(false)
+
+  // The approval and the batch it opened. See `PlacingState`.
+  const [placing, setPlacing] = useState<PlacingState>({ phase: 'idle' })
+
+  /** The batch being followed, as an identifier.
+   *
+   * Held apart from `placing` so the polling effect below depends on *which* batch this is and
+   * not on the status it happens to be at. Depending on `placing` would tear the interval down
+   * and build it again on every poll, which is a timer that never fires twice. */
+  const watchingId = placing.phase === 'watching' ? placing.batchId : null
+
+  /** The batch's progress, re-read until it stops.
+   *
+   * The first read is immediate rather than after one interval: the worker may already have
+   * submitted, and waiting four seconds to find that out would be a delay this page invented.
+   */
+  useEffect(() => {
+    if (!active || watchingId === null) return
+
+    let stopped = false
+    const deadline = Date.now() + WAIT_CEILING_MS
+
+    const poll = async () => {
+      let batch: ExecutionBatch | null = null
+      try {
+        batch = await fetchBatch(watchingId)
+      } catch {
+        // Reading the batch failed, which says nothing about the batch. Report what was last
+        // seen and let the reader reach the Orders page rather than inventing a failure.
+        if (!stopped) setPlacing({ phase: 'gave_up', batch: null })
+        return
+      }
+      if (stopped) return
+
+      if (batch !== null && isSettled(batch)) {
+        setPlacing({ phase: 'settled', batch })
+        return
+      }
+      if (batch === null || Date.now() >= deadline) {
+        setPlacing({ phase: 'gave_up', batch })
+        return
+      }
+      setPlacing({ phase: 'watching', batchId: watchingId, batch })
+    }
+
+    void poll()
+    const timer = window.setInterval(() => void poll(), POLL_INTERVAL_MS)
+    return () => {
+      stopped = true
+      window.clearInterval(timer)
+    }
+  }, [active, watchingId])
+
+  // The flow ends when the batch does, not when the decision is recorded: the news is what the
+  // reader came for, and holding the screen after the answer is known would be the page keeping
+  // them from it. The outcome stays on screen as the notice below.
+  useEffect(() => {
+    if (placing.phase === 'settled' || placing.phase === 'gave_up') setFlowOpen(false)
+  }, [placing.phase])
 
   const load = useCallback(
     async (filters = { provider, category }) => {
@@ -293,6 +439,9 @@ export function NewsPage({
       const proposalId = proposal.proposal.proposal_id
       setDeciding(true)
       setDecisionNotice(null)
+      // Approving is the one decision that leads somewhere to wait, so the screen changes on the
+      // press rather than when the request comes back. A rejection has nothing to follow.
+      if (decision === 'approve') setPlacing({ phase: 'deciding' })
       try {
         const outcome = await decideProposal(proposalId, {
           decision,
@@ -312,18 +461,29 @@ export function NewsPage({
             },
           })
         }
-        if (outcome.outcome === 'approved' && outcome.batch_id !== null) {
-          // The orders are the server's to submit, whether or not anybody is looking. This only
-          // takes the reader to where they can watch them.
-          onOpenOrders?.(outcome.batch_id)
+        if (outcome.batch_id !== null) {
+          // Keyed on the batch id rather than on the word `approved`: a second press that lands
+          // on an approval already recorded comes back as `already_decided` *with* its batch, and
+          // following that reports where the orders actually are instead of reporting nothing.
+          // Every other outcome -- a refusal, a renewal, a rejection -- carries no batch, and
+          // each is an answer the panel already shows.
+          //
+          // The orders are the server's to submit, whether or not anybody is looking, so this
+          // page follows the batch rather than claiming to place it. `onOpenOrders` is left to
+          // the report's own button: sending the reader away the moment they approve is how they
+          // lose the news they were reading.
+          setPlacing({ phase: 'watching', batchId: outcome.batch_id, batch: null })
+        } else if (decision === 'approve') {
+          setPlacing({ phase: 'idle' })
         }
       } catch (error) {
         setDecisionNotice(messageOf(error))
+        if (decision === 'approve') setPlacing({ phase: 'error', message: messageOf(error) })
       } finally {
         setDeciding(false)
       }
     },
-    [deciding, proposal, onOpenOrders],
+    [deciding, proposal],
   )
 
   /** Ask for a proposal, and say which stage the run is in while it works. */
@@ -331,6 +491,8 @@ export function NewsPage({
     if (generating.current) return
     generating.current = true
     setDismissed(false)
+    setPlacing({ phase: 'idle' })
+    setFlowOpen(true)
     setProposal({ phase: 'generating', stage: null })
     try {
       // A fresh identifier per press, so a previous request's stored outcome is never served
@@ -390,7 +552,17 @@ export function NewsPage({
   }, [state, provider, category])
 
   const searching = search.phase !== 'idle'
-  const busy = proposal.phase === 'generating'
+  // A placement is included, and not only a run: starting a second generation while a batch is
+  // being submitted would replace the screen that is following it, and the outcome the reader is
+  // waiting for would never be reported.
+  const busy = proposal.phase === 'generating' || placing.phase === 'watching'
+
+  // Everything the page can be waiting on. A decision is in here as well as a run: approving
+  // reads the broker before it records anything, so it is a real wait -- and rejecting is not,
+  // which is what the delay below is for.
+  const workScreen = useWorkScreen(
+    busy || placing.phase === 'deciding',
+  )
 
   return (
     <div>
@@ -417,37 +589,60 @@ export function NewsPage({
           >
             {refreshing ? 'Refreshing…' : 'Refresh news'}
           </Button>
-          {/* The page's one primary action, and the only thing here that runs the agent. It
-              generates a proposal and stops: approving and executing are not built, so there is
-              no second purple button beside it. */}
-          <Button
-            variant="primary"
-            onClick={() => {
-              if (!busy) void generate()
-            }}
-            // `disabled` rather than `aria-disabled`, unlike the buttons above: this one must
-            // not be pressable twice, and the press is what the guard in `generate` also
-            // covers for anything that slips through.
-            disabled={busy}
-          >
-            {busy ? 'Generating…' : 'Rebalance proposal'}
-          </Button>
+          {/* The page's one primary action, and the only thing here that runs the agent. While
+              the proposal has the page it becomes the way back to the news: the run is the
+              server's and keeps going either way, so leaving is not a cancellation. */}
+          {flowOpen ? (
+            <Button onClick={() => setFlowOpen(false)}>Back to news</Button>
+          ) : (
+            <Button
+              variant="primary"
+              onClick={() => {
+                if (!busy) void generate()
+              }}
+              // `disabled` rather than `aria-disabled`, unlike the buttons above: this one must
+              // not be pressable twice, and the press is what the guard in `generate` also
+              // covers for anything that slips through.
+              disabled={busy}
+            >
+              {busy ? 'Generating…' : 'Rebalance proposal'}
+            </Button>
+          )}
         </div>
       </header>
 
-      {/* A proposal takes a minute and is worth waiting for, so what it is doing is named
-          rather than shown as a spinner. `role="status"` because it accompanies the news below
-          and should not interrupt. */}
-      {busy && (
-        <p role="status" className="mt-3 text-note text-dim">
-          {proposal.stage === null
-            ? 'Starting…'
-            : (STAGE_LABELS[proposal.stage] ?? proposal.stage)}
-          . The news below stays available while this runs.
-        </p>
-      )}
+      {/* Dimmed out of reach while the work screen is up: the page underneath is what is doing
+          the work, and it stays rendered so the fade reveals it rather than a blank column --
+          but a reader must not be able to tab into a page they cannot see. */}
+      <div inert={workScreen.show}>
+        {flowOpen ? (
+          <ProposalFlow
+            state={proposal}
+            placing={placing}
+            dismissed={dismissed}
+            deciding={deciding}
+            notice={decisionNotice}
+            onDismiss={() => {
+              setDismissed(true)
+              setFlowOpen(false)
+            }}
+            onRetry={() => void generate()}
+            onDecide={(decision, confirm) => void decide(decision, confirm)}
+          />
+        ) : (
+        <>
+          <OutcomeNotice
+            placing={placing}
+            onDismiss={() => setPlacing({ phase: 'idle' })}
+            onOpenOrders={onOpenOrders}
+          />
+          <ReadyNotice
+            proposal={proposal}
+            dismissed={dismissed}
+            onReview={() => setFlowOpen(true)}
+          />
 
-      <form onSubmit={runSearch} className="mt-4 flex flex-wrap items-end gap-3">
+          <form onSubmit={runSearch} className="mt-4 flex flex-wrap items-end gap-3">
         <div className="min-w-[200px] flex-1">
           <label htmlFor="news-search" className="text-label text-faint">
             Search the stored news
@@ -551,19 +746,248 @@ export function NewsPage({
           />
         )}
       </div>
+        </>
+        )}
+      </div>
 
-      {/* Below the news and its Load more, not instead of them: the page keeps doing what it
-          did, and the proposal is added under it. */}
-      <ProposalPanel
-        state={proposal}
-        dismissed={dismissed}
-        onDismiss={() => setDismissed(true)}
-        onRetry={() => void generate()}
-        deciding={deciding}
-        notice={decisionNotice}
-        onDecide={(decision, confirm) => void decide(decision, confirm)}
-      />
+      {/* The same screen the application opens on, for the same reason: something is being
+          worked on and the page behind it is not what the reader should be reading. Full
+          viewport, so the sidebar goes under it too -- during a run there is nothing on this
+          page to do, and leaving half of it live would only invite a second run. */}
+      {workScreen.show && (
+        <MarketPulse message={workMessage(proposal, placing)} leaving={workScreen.leaving} />
+      )}
     </div>
+  )
+}
+
+/** What the work screen says it is waiting on.
+ *
+ * The run's own stage names where it has one, and the batch's own status where it does not --
+ * so the line changes as the work moves rather than sitting on one word for a minute. A stage
+ * the backend has added and this page has not been taught is shown by its identifier, the same
+ * as `STAGE_LABELS` does.
+ */
+function workMessage(proposal: ProposalState, placing: PlacingState): string {
+  if (placing.phase === 'deciding') return 'Recording the decision'
+  if (placing.phase === 'watching') {
+    const batch = placing.batch
+    if (batch === null) return 'Placing orders'
+    const sent = sentCount(batch)
+    const total = batch.orders.length
+    return `${batchLabel(batch)} · ${sent} of ${total} ${total === 1 ? 'order' : 'orders'} sent`
+  }
+  if (proposal.phase === 'generating') {
+    return proposal.stage === null
+      ? 'Starting the proposal'
+      : (STAGE_LABELS[proposal.stage] ?? proposal.stage)
+  }
+  return 'Working'
+}
+
+/** The outcome of an approval, reported where the reader is.
+ *
+ * This is why approving does not send anybody to the Orders page. The batch is the server's and
+ * its detail is one click away, but leaving the news the moment an approval lands is how the
+ * reader loses the thing they were reading -- and the answer to "did my orders go through?" is a
+ * sentence, not a page.
+ *
+ * A batch that was still working when the wait gave up says so, rather than being reported as one
+ * that finished: the orders may since have filled, and only the Orders page knows.
+ */
+function OutcomeNotice({
+  placing,
+  onDismiss,
+  onOpenOrders,
+}: {
+  placing: PlacingState
+  onDismiss: () => void
+  onOpenOrders?: (batchId: string) => void
+}) {
+  if (placing.phase !== 'settled' && placing.phase !== 'gave_up') return null
+  const batch = placing.batch
+
+  return (
+    <div className="mt-4">
+      <Banner>
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+          <span>
+            {batch === null
+              ? 'The batch was approved, but its progress could not be read here. Its orders are on the Orders page.'
+              : summarise(batch, placing.phase === 'gave_up')}
+          </span>
+          {batch !== null && onOpenOrders !== undefined && (
+            <Button className="bg-transparent" onClick={() => onOpenOrders(batch.batch_id)}>
+              View orders
+            </Button>
+          )}
+          <Button className="bg-transparent" onClick={onDismiss}>
+            Dismiss
+          </Button>
+        </div>
+      </Banner>
+    </div>
+  )
+}
+
+/** What a batch ended up doing, in one sentence.
+ *
+ * Counted from the orders the batch holds rather than from its status alone: `partial` and
+ * `halted` say the batch stopped, and how far it got is the part a reader is asking about.
+ */
+function summarise(batch: ExecutionBatch, gaveUp: boolean): string {
+  const counts = new Map<string, number>()
+  for (const order of batch.orders) {
+    const label = intentLabel(order)
+    counts.set(label, (counts.get(label) ?? 0) + 1)
+  }
+  const total = batch.orders.length
+  const orders = `${total} ${total === 1 ? 'order' : 'orders'}`
+  const breakdown = [...counts].map(([label, count]) => `${count} ${label.toLowerCase()}`).join(', ')
+
+  if (gaveUp) {
+    return `Approved — ${batchLabel(batch).toLowerCase()}. ${orders}: ${breakdown}. It is still being worked on; the Orders page has the latest.`
+  }
+  return `${batchLabel(batch)} — ${orders}: ${breakdown}.`
+}
+
+/** A proposal the page is holding but not showing.
+ *
+ * A stored proposal is restored on load and a run that finishes after the reader has gone back to
+ * the news lands here too. Neither should take the page, and neither should be invisible: the
+ * reader asked for a proposal, and this is where it is.
+ */
+function ReadyNotice({
+  proposal,
+  dismissed,
+  onReview,
+}: {
+  proposal: ProposalState
+  dismissed: boolean
+  onReview: () => void
+}) {
+  if (proposal.phase !== 'ready' || dismissed) return null
+  // A decided proposal is not waiting for anybody. Its outcome is on the Orders page, and
+  // offering to review it again would be offering a decision that has already been made.
+  if (proposal.proposal.decision !== null) return null
+
+  return (
+    <div className="mt-4">
+      <Banner>
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+          <span>A rebalance proposal is ready to review. Nothing has been sent yet.</span>
+          <Button className="bg-transparent" onClick={onReview}>
+            Review
+          </Button>
+        </div>
+      </Banner>
+    </div>
+  )
+}
+
+/** The proposal flow, on the page rather than under the news.
+ *
+ * One component for the three things the flow can be showing, because they are one screen
+ * succeeding another: the run, the proposal, and the wait after approving. The news is not
+ * rendered at all while this is up -- it is 178 cards and a Load more, and the reader cannot be
+ * asked to scroll past them to see the thing they pressed a button for.
+ */
+function ProposalFlow({
+  state,
+  placing,
+  dismissed,
+  deciding,
+  notice,
+  onDismiss,
+  onRetry,
+  onDecide,
+}: {
+  state: ProposalState
+  placing: PlacingState
+  dismissed: boolean
+  deciding: boolean
+  notice: string | null
+  onDismiss: () => void
+  onRetry: () => void
+  onDecide: (decision: 'approve' | 'reject', confirm: boolean) => void
+}) {
+  if (placing.phase === 'deciding' || placing.phase === 'watching') {
+    return <PlacingPanel placing={placing} />
+  }
+
+  if (placing.phase === 'error') {
+    return (
+      <section className="mt-6 border-t border-line pt-6">
+        <h2 className="text-heading font-semibold text-ink">Rebalance proposal</h2>
+        <div className="mt-4">
+          <ErrorNotice
+            title="Could not approve the proposal."
+            message={placing.message}
+            onRetry={onDismiss}
+          />
+        </div>
+      </section>
+    )
+  }
+
+  return (
+    <ProposalPanel
+      state={state}
+      dismissed={dismissed}
+      onDismiss={onDismiss}
+      onRetry={onRetry}
+      deciding={deciding}
+      notice={notice}
+      onDecide={onDecide}
+    />
+  )
+}
+
+/** How many of a batch's orders have been to the broker.
+ *
+ * `planned` is an order the worker has not reached and `submitting` is one it is sending right
+ * now. Everything else, including the refusals, is an answer that came back -- and counting a
+ * planned order as sent would report a submission that never happened.
+ */
+function sentCount(batch: ExecutionBatch): number {
+  return batch.orders.filter((order) => !['planned', 'submitting'].includes(order.status)).length
+}
+
+/** The wait after an approval: the decision being recorded, then the batch being placed.
+ *
+ * The two are named separately because they are separate waits. This page records a decision and
+ * reads what a server-side worker does with it; saying "placing your orders" over the whole thing
+ * would be the page claiming work that is not its own.
+ */
+function PlacingPanel({ placing }: { placing: PlacingState }) {
+  const batch = placing.phase === 'watching' ? placing.batch : null
+  // `planned` is an order the worker has not reached and `submitting` is one it is sending now.
+  const sent = batch === null ? 0 : sentCount(batch)
+
+  return (
+    <section className="mt-6 border-t border-line pt-6">
+      <h2 className="text-heading font-semibold text-ink">Placing orders</h2>
+      <Card className="mt-4">
+        <p
+          role="status"
+          className={`text-body ${batch === null ? 'text-dim' : batchColour(batch)}`}
+        >
+          {placing.phase === 'deciding'
+            ? 'Recording the approval…'
+            : batch === null
+              ? 'Reading the batch…'
+              : `${batchLabel(batch)} · ${sent} of ${batch.orders.length} ${
+                  batch.orders.length === 1 ? 'order' : 'orders'
+                } sent`}
+        </p>
+        <p className="mt-2 text-label text-faint">
+          The approval is recorded first, and a worker on the server then submits the orders on its
+          own thread. This page is re-reading the batch until it stops rather than sending anything
+          itself, so an order that is slow to fill is the broker taking its time rather than a wait
+          invented here. Nothing is sent to a broker by this browser.
+        </p>
+      </Card>
+    </section>
   )
 }
 

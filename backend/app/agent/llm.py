@@ -28,7 +28,7 @@ not a network problem.
 
 import logging
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -143,6 +143,20 @@ class ModelClient(Protocol):
         max_tokens: int,
     ) -> ModelResponse: ...
 
+    def complete_streaming(
+        self,
+        *,
+        messages: Sequence[Mapping[str, Any]],
+        max_tokens: int,
+        on_delta: Callable[[str], None],
+    ) -> ModelResponse:
+        """The same completion, with its text handed to `on_delta` as it is written.
+
+        No `tools` and no `response_format`: this exists for the one call whose *prose* a
+        person is waiting to read, and a tool-calling or JSON-mode stream is neither.
+        """
+        ...
+
 
 @dataclass
 class DeepSeekClient:
@@ -240,34 +254,177 @@ class DeepSeekClient:
 
         try:
             completion = self._client.chat.completions.create(**payload)
-        except openai.AuthenticationError as exc:
-            raise ProviderAuthError(
-                "DeepSeek rejected the configured credentials. Check DEEPSEEK_API_KEY."
-            ) from exc
-        except openai.PermissionDeniedError as exc:
-            raise ProviderAuthError(
-                "the DeepSeek account is not permitted to use this model."
-            ) from exc
-        except (
+        except openai.OpenAIError as exc:
+            raise _translated(exc) from exc
+
+        return _to_response(completion)
+
+    def complete_streaming(
+        self,
+        *,
+        messages: Sequence[Mapping[str, Any]],
+        max_tokens: int,
+        on_delta: Callable[[str], None],
+    ) -> ModelResponse:
+        """One completion, handed out as it is written.
+
+        The same failure taxonomy and the same retry allowance as `complete`, with one rule
+        added: **a retry is only allowed before the first delta has been handed out.** Once
+        part of an answer is on a reader's screen, a second attempt would start a new answer
+        underneath the half-written one, and nothing in the text would say which was which.
+        A stream that dies mid-answer is therefore reported rather than restarted.
+
+        The deltas are not counted as model requests: one request was made, and a retry that
+        gets as far as writing text still made one request that failed and one that did not --
+        which is exactly what `spend_retry` and `record_model` already count.
+        """
+        attempt = 0
+        while True:
+            written: list[str] = []
+
+            def hand_out(chunk: str) -> None:
+                written.append(chunk)
+                on_delta(chunk)
+
+            try:
+                return self._stream_request(
+                    messages=messages, max_tokens=max_tokens, on_delta=hand_out
+                )
+            except ProviderUnavailableError:
+                # Part of an answer has already been shown. Restarting it would be worse than
+                # reporting the failure: the reader would see two beginnings and no way to
+                # tell that the first one was abandoned.
+                if written:
+                    raise
+                if self.budget is None or not self.budget.retry_allowed():
+                    raise
+                # Raises `BudgetExhausted` if the run's deadline has passed.
+                self.budget.spend_retry()
+                attempt += 1
+                delay = _RETRY_BASE_SECONDS * attempt
+                logger.warning(
+                    "provider stream failed before any text was written, retrying in %.1fs "
+                    "(attempt %d)",
+                    delay,
+                    attempt,
+                )
+                self.sleep(delay)
+
+    def _stream_request(
+        self,
+        *,
+        messages: Sequence[Mapping[str, Any]],
+        max_tokens: int,
+        on_delta: Callable[[str], None],
+    ) -> ModelResponse:
+        payload: dict[str, Any] = {
+            "model": self.model_name,
+            "messages": list(messages),
+            "max_tokens": max_tokens,
+            "extra_body": dict(_THINKING_DISABLED),
+            "stream": True,
+            # Without this the provider sends no usage block at all on a streamed response,
+            # and the run's token counts would read as zero for the one call that wrote the
+            # answer -- a number that looks like "this was free" rather than "not reported".
+            "stream_options": {"include_usage": True},
+        }
+
+        try:
+            stream = self._client.chat.completions.create(**payload)
+            # Inside the try: a stream fails during iteration as often as it fails when it is
+            # opened, and both are the same kind of failure to a caller.
+            return _to_streamed_response(stream, on_delta)
+        except openai.OpenAIError as exc:
+            raise _translated(exc) from exc
+
+
+def _translated(exc: Exception) -> ModelError:
+    """One provider failure, as this module's own error type.
+
+    The order of the checks is the meaning: the SDK's authentication and permission errors are
+    both `APIStatusError`s, and so is a 5xx, so a later check would swallow an earlier one.
+    Authentication and permission are checked first because they are the two that must never be
+    retried -- a wrong key stays wrong, and retrying it spends the run's budget to learn the
+    same thing more slowly.
+    """
+    if isinstance(exc, openai.AuthenticationError):
+        return ProviderAuthError(
+            "DeepSeek rejected the configured credentials. Check DEEPSEEK_API_KEY."
+        )
+    if isinstance(exc, openai.PermissionDeniedError):
+        return ProviderAuthError(
+            "the DeepSeek account is not permitted to use this model."
+        )
+    if isinstance(
+        exc,
+        (
             openai.RateLimitError,
             openai.APITimeoutError,
             openai.APIConnectionError,
             openai.InternalServerError,
-        ) as exc:
-            raise ProviderUnavailableError(
-                f"the provider was unavailable: {type(exc).__name__}"
-            ) from exc
-        except openai.APIStatusError as exc:
-            # Reached the provider and was rejected. Retrying sends the same bad request.
-            raise ProviderResponseError(
-                f"the provider rejected the request: HTTP {exc.status_code}"
-            ) from exc
-        except openai.OpenAIError as exc:
-            raise ProviderResponseError(
-                f"the request could not be completed: {type(exc).__name__}"
-            ) from exc
+        ),
+    ):
+        return ProviderUnavailableError(
+            f"the provider was unavailable: {type(exc).__name__}"
+        )
+    if isinstance(exc, openai.APIStatusError):
+        # Reached the provider and was rejected. Retrying sends the same bad request.
+        return ProviderResponseError(
+            f"the provider rejected the request: HTTP {exc.status_code}"
+        )
+    return ProviderResponseError(
+        f"the request could not be completed: {type(exc).__name__}"
+    )
 
-        return _to_response(completion)
+
+def _to_streamed_response(stream: Any, on_delta: Callable[[str], None]) -> ModelResponse:
+    """Read a streamed completion, handing out its text as it arrives.
+
+    Two things about the provider's stream are worth knowing here. It sends one chunk per
+    delta, which for this model is a few characters -- hundreds of chunks for one answer. And
+    it reports token usage in a **final chunk that carries no choices at all**, so usage is
+    read from every chunk rather than from the last one's `choices[0]`.
+
+    A stream that ends without usage -- a proxy that strips the field, say -- leaves the token
+    counts at zero. That is logged rather than guessed at, because a zero that means "not
+    reported" and a zero that means "nothing was spent" are different facts and the run result
+    cannot tell them apart afterwards.
+    """
+    content: list[str] = []
+    usage: Any = None
+    finish_reason: str | None = None
+
+    for chunk in stream:
+        chunk_usage = getattr(chunk, "usage", None)
+        if chunk_usage is not None:
+            usage = chunk_usage
+
+        choices = getattr(chunk, "choices", None) or []
+        if not choices:
+            continue
+
+        choice = choices[0]
+        finish_reason = getattr(choice, "finish_reason", None) or finish_reason
+        delta = getattr(choice, "delta", None)
+        text = getattr(delta, "content", None)
+        if text:
+            content.append(text)
+            on_delta(text)
+
+    if usage is None:
+        logger.warning("a streamed completion reported no token usage")
+
+    answer = "".join(content) or None
+    return ModelResponse(
+        content=answer,
+        # A streamed request never asks for tools, and the provider has no id to give for a
+        # call that was not made.
+        tool_calls=(),
+        finish_reason=finish_reason,
+        message=assistant_message(content=answer, tool_calls=()),
+        prompt_tokens=int(getattr(usage, "prompt_tokens", 0) or 0),
+        completion_tokens=int(getattr(usage, "completion_tokens", 0) or 0),
+    )
 
 
 def _to_response(completion: Any) -> ModelResponse:

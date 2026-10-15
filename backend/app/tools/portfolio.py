@@ -32,7 +32,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app import portfolio_prices
-from app.models import Holding, Portfolio
+from app.models import Holding
 from app.portfolio_identity import DEMO_PORTFOLIO_NAME, find
 from app.portfolio_prices import PriceBasis
 from app.tools.results import (

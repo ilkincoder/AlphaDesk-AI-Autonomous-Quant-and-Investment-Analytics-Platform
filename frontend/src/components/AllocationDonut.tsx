@@ -6,9 +6,8 @@
  *
  * Hand-drawn SVG rather than a charting library. A donut is a circle with a `stroke-dasharray`
  * per segment, and the alternative is a dependency that ships a layout engine to draw one ring
- * — the existing `AllocationBar` already established that this application draws its own
- * allocation charts from the API's own percentages, and this follows it rather than adding a
- * second way to draw the same thing.
+ * — this application draws its allocation from the API's own percentages, and a library would
+ * be a second way to draw the same thing.
  *
  * **One ring is one complete allocation.** The percentages are the API's own strings, used as
  * segment lengths on a 100-unit circumference, and nothing here adds, scales or normalises
@@ -26,6 +25,15 @@ import { formatCurrency, formatPercent } from '../format'
 
 /** The radius that makes the circumference exactly 100, so a percentage is a dash length. */
 const RADIUS = 15.9155
+
+/** How wide the ring is drawn, in pixels.
+ *
+ * `viewBox` is fixed at 40 units and every segment is a dash on a 100-unit circumference, so
+ * this is the one number that sizes the chart: the drawing scales as a whole and no segment
+ * measure changes with it. It is a prop-less constant rather than a per-caller choice, so one
+ * portfolio's allocation is the same ring at the same size on every page that shows it.
+ */
+const RING_SIZE = 168
 
 export function AllocationDonut({
   label,
@@ -52,9 +60,15 @@ export function AllocationDonut({
         <>
           <svg
             viewBox="0 0 40 40"
-            width="104"
-            height="104"
-            className="mt-2 block"
+            width={RING_SIZE}
+            height={RING_SIZE}
+            // `mx-auto` centres the ring in whatever width the caller gives it, and the two
+            // constraints keep it a circle in a column too narrow to hold one: `max-w-full`
+            // narrows the width, `h-auto` takes the height down with it rather than leaving the
+            // box 168 tall around a drawing that is not. The label above and the legend below
+            // stay ranged left deliberately -- they are a list of the same shares, and the ring
+            // is the shape of that list rather than a heading over it.
+            className="mx-auto mt-2 block h-auto max-w-full"
             aria-hidden="true"
           >
             <g transform="rotate(-90 20 20)">

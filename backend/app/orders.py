@@ -23,12 +23,10 @@ have to have been stored anywhere to be reconstructed.
 makes it happen.
 """
 
-import contextlib
 import logging
-import uuid
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 from sqlalchemy import select, update
@@ -36,7 +34,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.alpaca import BrokerOrder
-from app.db import SessionLocal
+from app.db import SessionLocal, new_id, transaction, utc_now
 from app.execution_plan import ResolvedPlan
 from app.models import ExecutionBatch, OrderIntent, RebalanceDecision
 
@@ -131,23 +129,6 @@ class DecisionTakenError(Exception):
         )
 
 
-def new_id() -> str:
-    """A server-generated identifier, not a sequence -- see `app.proposals.new_id`."""
-    return uuid.uuid4().hex
-
-
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-@contextlib.contextmanager
-def _transaction(session: Session) -> Iterator[None]:
-    """One atomic unit of work, inside a caller's transaction if there is one."""
-    if session.in_transaction():
-        yield
-    else:
-        with session.begin():
-            yield
 
 
 def client_order_id(batch_id: str, sequence: int) -> str:
@@ -230,7 +211,7 @@ def _record(
     than an error.
     """
     with SessionLocal() as session:
-        with _transaction(session):
+        with transaction(session):
             existing = _decision_row(session, proposal_id)
             if existing is not None:
                 return _resolve_existing(existing, decision)
@@ -245,7 +226,7 @@ def _record(
                         id=new_id(),
                         proposal_id=proposal_id,
                         decision=decision,
-                        decided_at=now or _now(),
+                        decided_at=now or utc_now(),
                         idempotency_key=idempotency_key,
                         proposal_fingerprint=proposal_fingerprint,
                         plan_fingerprint=plan_fingerprint,
@@ -282,10 +263,10 @@ def approve(
     be an approval nothing acts on; a batch without a decision would be orders with nothing behind
     them.
     """
-    moment = now or _now()
+    moment = now or utc_now()
 
     with SessionLocal() as session:
-        with _transaction(session):
+        with transaction(session):
             existing = _decision_row(session, proposal_id)
             if existing is not None:
                 return _resolve_existing(existing, DECISION_APPROVED)
@@ -462,12 +443,12 @@ def expire_stale_batches(*, now: datetime | None = None) -> list[str]:
     and nothing sweeps in the background. Without this a batch whose submission is never
     confirmed would hold the account's only slot for ever.
     """
-    moment = now or _now()
+    moment = now or utc_now()
     cutoff = moment - timedelta(hours=BATCH_MAX_AGE_HOURS)
     halted: list[str] = []
 
     with SessionLocal() as session:
-        with _transaction(session):
+        with transaction(session):
             rows = session.scalars(
                 select(ExecutionBatch).where(
                     ExecutionBatch.status.in_(sorted(ACTIVE_BATCH_STATUSES)),
@@ -623,10 +604,10 @@ def claim_intent(intent_id: str, *, now: datetime | None = None) -> dict | None:
     Returns the intent as a plain dict, or None when somebody else holds it, when it has already
     been submitted, or when it was halted before it got its turn.
     """
-    moment = now or _now()
+    moment = now or utc_now()
 
     with SessionLocal() as session:
-        with _transaction(session):
+        with transaction(session):
             claimed = session.execute(
                 update(OrderIntent)
                 .where(OrderIntent.id == intent_id, OrderIntent.status == INTENT_PLANNED)
@@ -651,9 +632,9 @@ def record_submission(intent_id: str, order: BrokerOrder, *, now: datetime | Non
     The broker's own id, its status and its fill are all stored as it reported them. A submission
     that came back accepted is *accepted*, not filled, and the difference is kept.
     """
-    moment = now or _now()
+    moment = now or utc_now()
     with SessionLocal() as session:
-        with _transaction(session):
+        with transaction(session):
             row = session.get(OrderIntent, intent_id, with_for_update=True)
             if row is None:  # pragma: no cover - the caller just claimed it
                 return
@@ -666,9 +647,9 @@ def record_uncertain(intent_id: str, error: str, *, now: datetime | None = None)
     Deliberately **not** a failure and deliberately not retried. The intent stays in play, holds
     up whatever depended on it, and is reconciled by its client order id on the next pass.
     """
-    moment = now or _now()
+    moment = now or utc_now()
     with SessionLocal() as session:
-        with _transaction(session):
+        with transaction(session):
             row = session.get(OrderIntent, intent_id, with_for_update=True)
             if row is None:  # pragma: no cover
                 return
@@ -685,9 +666,9 @@ def record_refusal(intent_id: str, error: str, *, now: datetime | None = None) -
     insufficient buying power, a closed account. Distinct from `record_uncertain`, and the
     distinction is the whole reason the client raises two different errors.
     """
-    moment = now or _now()
+    moment = now or utc_now()
     with SessionLocal() as session:
-        with _transaction(session):
+        with transaction(session):
             row = session.get(OrderIntent, intent_id, with_for_update=True)
             if row is None:  # pragma: no cover
                 return
@@ -713,9 +694,9 @@ def apply_reconciliation(
     threshold has been met -- `app.order_executor` is where that threshold and its reasoning live,
     because how much patience a submission gets is a policy rather than a fact about the row.
     """
-    moment = checked_at or _now()
+    moment = checked_at or utc_now()
     with SessionLocal() as session:
-        with _transaction(session):
+        with transaction(session):
             row = session.get(OrderIntent, intent_id, with_for_update=True)
             if row is None:  # pragma: no cover
                 return
@@ -727,22 +708,6 @@ def apply_reconciliation(
             row.last_checked_at = moment
             if settle:
                 _mark_missing(row, moment)
-
-
-def resolve_missing(intent_id: str, *, now: datetime | None = None) -> None:
-    """Settle an intent the broker has no record of, after enough checks to believe it.
-
-    Never resubmitted. An order this application cannot find at the broker is reported as exactly
-    that, and the batch it belongs to becomes partial -- which is the honest outcome, and a
-    different one from quietly sending it a second time.
-    """
-    moment = now or _now()
-    with SessionLocal() as session:
-        with _transaction(session):
-            row = session.get(OrderIntent, intent_id, with_for_update=True)
-            if row is None:  # pragma: no cover
-                return
-            _mark_missing(row, moment)
 
 
 def _mark_missing(row: OrderIntent, moment: datetime) -> None:
@@ -772,39 +737,15 @@ def _apply_broker_order(row: OrderIntent, order: BrokerOrder, moment: datetime) 
         row.resolved_at = moment
 
 
-def record_cash_fill(batch_id: str, symbol: str, *, error: str, now: datetime | None = None) -> None:
-    """Halt one planned buy that the account can no longer pay for.
-
-    The quantity is not reduced to what is affordable. A resized order is a different order than
-    the one that was approved, and this application would rather report that a buy did not happen
-    than make a smaller one nobody asked for.
-    """
-    moment = now or _now()
-    with SessionLocal() as session:
-        with _transaction(session):
-            row = session.scalars(
-                select(OrderIntent).where(
-                    OrderIntent.batch_id == batch_id,
-                    OrderIntent.symbol == symbol,
-                    OrderIntent.status == INTENT_PLANNED,
-                )
-            ).first()
-            if row is None:
-                return
-            row.status = INTENT_HALTED
-            row.error = error
-            row.resolved_at = moment
-
-
 def halt_planned(batch_id: str, *, reason: str, now: datetime | None = None) -> int:
     """Halt every order in this batch that has not been sent yet. Returns how many.
 
     Used when something has made the rest of the batch wrong to send -- a rejected sell, a session
     that has ended, a portfolio that moved underneath it. Nothing already sent is touched.
     """
-    moment = now or _now()
+    moment = now or utc_now()
     with SessionLocal() as session:
-        with _transaction(session):
+        with transaction(session):
             result = session.execute(
                 update(OrderIntent)
                 .where(
@@ -825,9 +766,9 @@ def set_batch_status(
     now: datetime | None = None,
 ) -> None:
     """Move a batch on, and record why if it stopped."""
-    moment = now or _now()
+    moment = now or utc_now()
     with SessionLocal() as session:
-        with _transaction(session):
+        with transaction(session):
             row = session.get(ExecutionBatch, batch_id, with_for_update=True)
             if row is None:  # pragma: no cover
                 return
@@ -845,9 +786,9 @@ def set_batch_status(
 
 def add_note(batch_id: str, note: str, *, now: datetime | None = None) -> None:
     """Append a sentence to a batch's notes, once. Repeating a note does not duplicate it."""
-    moment = now or _now()
+    moment = now or utc_now()
     with SessionLocal() as session:
-        with _transaction(session):
+        with transaction(session):
             row = session.get(ExecutionBatch, batch_id, with_for_update=True)
             if row is None:  # pragma: no cover
                 return
@@ -867,9 +808,9 @@ def record_sync(
     portfolio it filled into could not be updated, and a reader needs to be able to tell that
     apart from an order that failed.
     """
-    moment = now or _now()
+    moment = now or utc_now()
     with SessionLocal() as session:
-        with _transaction(session):
+        with transaction(session):
             row = session.get(ExecutionBatch, batch_id, with_for_update=True)
             if row is None:  # pragma: no cover
                 return
@@ -923,12 +864,10 @@ __all__ = [
     "halt_planned",
     "map_broker_status",
     "new_id",
-    "record_cash_fill",
     "record_refusal",
     "record_rejection",
     "record_submission",
     "record_sync",
     "record_uncertain",
-    "resolve_missing",
     "set_batch_status",
 ]

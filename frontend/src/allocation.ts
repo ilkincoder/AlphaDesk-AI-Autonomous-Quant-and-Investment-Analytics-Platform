@@ -19,10 +19,10 @@ import type { ValuationHolding } from './api'
 
 /** Purple shades for holdings, in API order. Cycled, so a portfolio with more holdings than
  *  shades repeats rather than running out and rendering nothing. */
-export const HOLDING_SHADES = ['#8B5CF6', '#A78BFA', '#7C3AED', '#6D28D9', '#C4B5FD']
+const HOLDING_SHADES = ['#8B5CF6', '#A78BFA', '#7C3AED', '#6D28D9', '#C4B5FD']
 
 /** Cash is deliberately not purple: it is not a holding. */
-export const CASH_SHADE = 'var(--color-cash)'
+const CASH_SHADE = 'var(--color-cash)'
 
 export type AllocationAsset = {
   /** Stable across renders and unique within one allocation. */

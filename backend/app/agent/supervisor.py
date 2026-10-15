@@ -55,6 +55,7 @@ from app.agent.llm import ModelClient
 from app.agent.module1 import Module1Outcome
 from app.agent.module2 import ProposalOutcome
 from app.agent.progress import (
+    KIND_ANSWER_DRAFT,
     KIND_COMPOSING,
     KIND_ROUTING,
     NULL_PROGRESS,
@@ -81,6 +82,14 @@ ROUTING_ATTEMPTS = 2
 # One: a model that invents a reference twice is not converging, and the run should say so
 # rather than keep paying for attempts.
 CORRECTION_ATTEMPTS = 1
+
+# How much of the answer is written before its draft is sent to a watching client, in
+# characters. The provider streams a delta every few characters -- hundreds of them for one
+# answer -- and the progress queue behind the SSE route holds 32 events and drops the oldest
+# when it is full. One event per delta would therefore spend the whole channel on the answer's
+# own text and lose parts of it. At this size an answer is around twenty events, and each one
+# carries everything written so far rather than only the newest piece.
+DRAFT_CHUNK_CHARS = 120
 
 # What the answer must not do with dates. Three dates are in play and two of them are routinely
 # different numbers, so a model that reads one out of a tool payload and reports it as the
@@ -458,6 +467,12 @@ def compose_request(
     Evidence is trimmed by count when there is too much of it, and the trim is stated. What
     is never trimmed away is the warnings: a limitation that vanishes between the tools and
     the answer is how an answer becomes wrong while looking complete.
+
+    **Every limitation still reaches this prompt in full, and the answer is no longer asked to
+    repeat them.** The list is displayed under the answer by the application, and a live answer
+    that restated the whole of it spent most of its length saying the same thing twice. The
+    prompt therefore asks for the limitations that change how the answer should be read, and
+    hands over the rest for the reader to see where they are already printed.
     """
     findings = module1.findings if module1 else None
 
@@ -488,10 +503,15 @@ def compose_request(
 
     limitations = collect_limitations(module1)
     if limitations:
-        parts += ["", "Limitations that must be carried into the answer:"]
+        parts += [
+            "",
+            "Limitations this run carries. They are printed under your answer in full, so do "
+            "not restate the list: say the ones that change how this answer should be read, in "
+            "your own words, and leave the rest to the list.",
+        ]
         parts += [f"- {item}" for item in limitations]
 
-    parts += ["", "Evidence you may cite:"]
+    parts += ["", "Evidence behind this run:"]
     parts.append(
         evidence.render(limit=MAX_EVIDENCE_IN_PROMPT)
         if len(evidence)
@@ -500,10 +520,13 @@ def compose_request(
 
     parts += [
         "",
-        "Write the answer for the user. Cite evidence as [E1], [E2] and so on, using only "
-        "references from the list above. State the resolved company and dates. Carry every "
-        "limitation forward. Separate what was observed from what you make of it, and "
-        "suggest conditional next steps rather than a bare conclusion.",
+        "Write the answer for the user, in the voice your instructions describe. Write no "
+        "reference markers at all -- no [E1], no brackets of any kind. The list above is what "
+        "you may say; the application prints it under your answer, and it removes any marker "
+        "you leave in the prose, so one would reach the reader as a gap in the sentence. Do "
+        "not restate the resolved company and dates as a header -- they are displayed beside "
+        "your answer -- though the answer should still name the company in passing. One short "
+        "answer, not a report.",
         "",
         f"{DATE_RULES}",
     ]
@@ -824,9 +847,32 @@ def _compose(
             outcome.stopped_by = budget.stopped_by
             return {"stopped": True, "answer": answer}
 
-        response = client.complete(
-            messages=messages, max_tokens=budget.max_output_tokens
+        # The answer is sent to a watching client as it is written, in chunks, and each chunk
+        # carries the whole draft so far. A correction attempt therefore replaces the draft on
+        # screen rather than appending to it, and an event lost to a full queue is repaired by
+        # the next one instead of leaving a gap in a sentence.
+        #
+        # What a reader sees here is *not* the answer: this loop can still send the text back
+        # for a correction, and a budget that runs out before an attempt finishes leaves no
+        # answer at all. The client is told so.
+        written = ""
+        sent = ""
+
+        def emit_draft(text: str) -> None:
+            nonlocal written, sent
+            written += text
+            if len(written) - len(sent) >= DRAFT_CHUNK_CHARS:
+                sent = written
+                progress(ProgressEvent(KIND_ANSWER_DRAFT, {"text": written}))
+
+        response = client.complete_streaming(
+            messages=messages, max_tokens=budget.max_output_tokens, on_delta=emit_draft
         )
+        # The tail, which is everything written since the last chunk. Sent after the loop
+        # rather than inside it so that a short answer still reaches the client whole.
+        if written != sent:
+            progress(ProgressEvent(KIND_ANSWER_DRAFT, {"text": written}))
+
         budget.record_model(
             prompt_tokens=response.prompt_tokens,
             completion_tokens=response.completion_tokens,
@@ -851,15 +897,16 @@ def _compose(
                     "role": "user",
                     "content": CORRECTION_INSTRUCTION.format(
                         invalid=", ".join(invalid),
-                        verb="is" if len(invalid) == 1 else "are",
                         available=", ".join(evidence.references()) or "none",
                     ),
                 },
             ]
 
-    # Still citing references that do not exist. The answer is withheld rather than shown
-    # with invented citations, and the run reports itself incomplete.
-    logger.warning("the answer still cited unknown references after correction")
+    # Still carrying markers after being asked twice not to. The answer is withheld rather than
+    # shown, which is what this tail did when the markers were citations the reader could see:
+    # the rule is unchanged, and what it now catches is an answer the model would not stop
+    # writing markers into. The run reports itself incomplete and names what it found.
+    logger.warning("the answer still carried reference markers after correction")
     outcome.answer = None
     return {"answer": None, "citations": outcome.citations, "invalid": invalid}
 
@@ -912,12 +959,6 @@ def run_supervisor(
     return outcome
 
 
-def describe_route(route: SupervisorRoute | None) -> str:
-    if route is None:
-        return "no routing decision"
-    return f"{route.destination} ({route.reason})"
-
-
 __all__ = [
     "CORRECTION_ATTEMPTS",
     "company_not_stored_answer",
@@ -931,7 +972,6 @@ __all__ = [
     "build_supervisor_graph",
     "cited_references",
     "compose_request",
-    "describe_route",
     "parse_route",
     "run_supervisor",
 ]

@@ -23,12 +23,9 @@ background sweeper, and nothing is ever replayed automatically: a paid request t
 a paid request that died, and replaying it is the user's decision, with a new request id.
 """
 
-import contextlib
 import logging
-import uuid
-from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -42,7 +39,7 @@ from app.agent.context import (
 )
 from app.agent.run import STATUS_CLARIFICATION_NEEDED, STATUS_COMPLETED, RunResult
 from app.agent.supervisor import Destination
-from app.db import SessionLocal
+from app.db import SessionLocal, new_id, transaction, utc_now
 from app.models import Conversation, ConversationTurn
 
 logger = logging.getLogger(__name__)
@@ -118,30 +115,6 @@ class Missing:
 ClaimOutcome = Claimed | Replay | Busy | Conflicted | Missing
 
 
-def new_id() -> str:
-    """A server-generated identifier. Not a sequence: a small integer would let anyone
-    holding one id enumerate the conversations beside it."""
-    return uuid.uuid4().hex
-
-
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-@contextlib.contextmanager
-def _transaction(session: Session) -> Iterator[None]:
-    """One atomic unit of work, inside a caller's transaction if there is one.
-
-    Normally this opens and commits its own. If the session is *already* in a transaction --
-    because a caller opened one and handed the session in -- this joins it and leaves the
-    commit to whoever owns it. Committing a transaction somebody else began would end work
-    they were still assembling, and rolling it back would discard work they had already done.
-    """
-    if session.in_transaction():
-        yield
-    else:
-        with session.begin():
-            yield
 
 
 # --- creating and reading ---------------------------------------------------------------
@@ -153,12 +126,12 @@ def create_conversation() -> dict:
     Creating a conversation is opening a place to talk, not asking a question, and it should
     not cost anything or fail because a provider is down.
     """
-    now = _now()
+    now = utc_now()
     conversation = Conversation(
         id=new_id(), created_at=now, updated_at=now
     )
     with SessionLocal() as session:
-        with _transaction(session):
+        with transaction(session):
             session.add(conversation)
         return _conversation_summary(conversation)
 
@@ -169,7 +142,7 @@ def get_conversation(conversation_id: str) -> dict | None:
         conversation = session.get(Conversation, conversation_id)
         if conversation is None:
             return None
-        with _transaction(session):
+        with transaction(session):
             _recover_expired(session, conversation)
         return _conversation_summary(conversation)
 
@@ -195,7 +168,7 @@ def history(
         conversation = session.get(Conversation, conversation_id)
         if conversation is None:
             return None
-        with _transaction(session):
+        with transaction(session):
             _recover_expired(session, conversation)
 
         total = session.scalar(
@@ -252,7 +225,7 @@ def claim_turn(
     is told which date was chosen and hands the same one to the run.
     """
     with SessionLocal() as session:
-        with _transaction(session):
+        with transaction(session):
             # Locked for the duration of the claim only. Nothing downstream holds it.
             conversation = session.scalar(
                 select(Conversation)
@@ -282,7 +255,7 @@ def claim_turn(
                     deadline=conversation.processing_deadline,
                 )
 
-            now = _now()
+            now = utc_now()
             deadline = now + timedelta(seconds=budget_seconds + PROCESSING_GRACE_SECONDS)
             # A resumed clarification keeps the date it was asked on. Resolving a reply of
             # "August 6 to September 17" against today would move the window the user was
@@ -384,7 +357,7 @@ def finalize_turn(
     The turn's own row is written either way. The work was done and paid for; the user asked;
     the answer belongs to that turn whether or not the conversation has moved on.
     """
-    now = _now()
+    now = utc_now()
     # Where the status comes from, in order: the run's own outcome, then the caller's
     # description of why there is no result, then `interrupted` -- a turn with no result and
     # no explanation is one that stopped, and saying "processing" forever would leave the
@@ -394,7 +367,7 @@ def finalize_turn(
     )
 
     with SessionLocal() as session:
-        with _transaction(session):
+        with transaction(session):
             turn = session.get(ConversationTurn, turn_id)
             if turn is None:  # pragma: no cover - the turn was inserted by claim_turn
                 logger.warning("finalizing a turn that does not exist: %s", turn_id)
@@ -498,7 +471,7 @@ def _recover_expired(session: Session, conversation: Conversation) -> str | None
     """
     if conversation.processing_turn_id is None or conversation.processing_deadline is None:
         return None
-    if conversation.processing_deadline > _now():
+    if conversation.processing_deadline > utc_now():
         return None
 
     abandoned = conversation.processing_turn_id
@@ -510,7 +483,7 @@ def _recover_expired(session: Session, conversation: Conversation) -> str | None
     turn = session.get(ConversationTurn, abandoned)
     if turn is not None and turn.status == TURN_PROCESSING:
         turn.status = TURN_INTERRUPTED
-        turn.completed_at = _now()
+        turn.completed_at = utc_now()
         turn.processing_deadline = None
         turn.failure = (
             "This turn did not finish within its processing deadline. It was interrupted, "
@@ -519,7 +492,7 @@ def _recover_expired(session: Session, conversation: Conversation) -> str | None
 
     conversation.processing_turn_id = None
     conversation.processing_deadline = None
-    conversation.updated_at = _now()
+    conversation.updated_at = utc_now()
     return abandoned
 
 
@@ -575,15 +548,6 @@ def _load_context(
             for turn in reversed(recent)
         ),
     )
-
-
-def context_for_new_turn(conversation_id: str) -> ConversationContext | None:
-    """The context the *next* turn would run with, for tests and inspection."""
-    with SessionLocal() as session:
-        conversation = session.get(Conversation, conversation_id)
-        if conversation is None:
-            return None
-        return _load_context(session, conversation, before_sequence=None)
 
 
 # --- shapes -----------------------------------------------------------------------------
@@ -773,7 +737,6 @@ __all__ = [
     "TURN_INTERRUPTED",
     "TURN_PROCESSING",
     "claim_turn",
-    "context_for_new_turn",
     "create_conversation",
     "finalize_turn",
     "get_conversation",

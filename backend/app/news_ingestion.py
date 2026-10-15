@@ -41,12 +41,11 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.alpaca_news import AlpacaNewsError, NewsItem, fetch_news
+from app.alpaca_news import AlpacaNewsError, fetch_news
 from app.embeddings import Embedder, EmbeddingUnavailableError
 from app.models import Holding, NewsArticle, NewsIngestionRun
 from app.news import NewsArticle as NormalizedArticle
 from app.news import from_alpaca, from_feed_entry
-from app.news_index import OUTCOME_FAILED, OUTCOME_INDEXED, OUTCOME_UNCHANGED
 from app.news_index import index_articles
 from app.official_feeds import FEEDS, MIN_SUMMARY_CHARS, Feed, FeedEntry, OfficialFeedError
 from app.official_feeds import enrich_with_release_text, fetch_feed
@@ -725,12 +724,6 @@ def last_success_by_source(session: Session) -> dict[str, datetime | None]:
     """Every source's last successful read, for the page to show."""
     sources = [ALPACA_SOURCE] + [f"official_{feed.key}" for feed in FEEDS]
     return {source: _last_success(session, source) for source in sources}
-
-
-def recent_window(days: int = DEFAULT_DAYS, *, now: datetime | None = None) -> datetime:
-    """The oldest publication time a listing should show by default."""
-    began = now if now is not None else datetime.now(timezone.utc)
-    return began - timedelta(days=days)
 
 
 __all__ = [

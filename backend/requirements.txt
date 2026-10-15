@@ -3,43 +3,15 @@ uvicorn[standard]==0.53.0
 SQLAlchemy==2.0.54
 psycopg2-binary==2.9.13
 pydantic-settings==2.15.0
+pydantic==2.13.5
 alembic==1.20.0
 httpx==0.28.1
 fastembed==0.8.0
+tokenizers==0.23.2
 qdrant-client==1.19.1
-# Pinned rather than left transitive. The container is aarch64, and whether a compatible
-# wheel exists is the thing this whole step depends on: onnxruntime-1.30.0 ships
-# cp312-manylinux_2_28_aarch64, but a future resolve picking a version without that wheel
-# would break the image build rather than the code, which is a much worse place to find out.
 onnxruntime==1.30.0
-
-# --- Module 1 agent (steps 7B and 8) ------------------------------------------------
-#
-# LangGraph for orchestration. The two graphs are small and hand-written; nothing here
-# pulls in the langchain agent framework, so there is exactly one orchestration library.
 langgraph==1.2.11
-
-# The OpenAI SDK, pointed at DeepSeek's OpenAI-compatible endpoint.
-#
-# Pinned to the 2.x line deliberately, not by neglect. 3.x replaces the HTTP transport with
-# httpx2, stops installing `httpx`, and drops `certifi` in favour of the operating system's
-# trust store. This project already pins httpx==0.28.1 for its own Twelve Data and SEC
-# clients and runs in a slim container, so a second HTTP stack and a second TLS trust path
-# would buy nothing and would be one more thing to go wrong at the network layer. 2.x uses
-# the httpx that is already here.
 openai==2.54.0
-
-# --- Module 2 graph checkpointing ------------------------------------------------------
-#
-# LangGraph's PostgreSQL checkpointer. It is a *second* Postgres driver, and that is
-# deliberate rather than an oversight: `psycopg2-binary` above is SQLAlchemy's, and this
-# package is written against psycopg 3. Swapping the application's driver to satisfy one
-# dependency would change every query in the codebase to save an import, so the two coexist
-# and only the checkpointer uses this one.
-#
-# Pinned as a pair: `langgraph-checkpoint-postgres` requires `psycopg>=3.2` and
-# `psycopg-pool`, and the `[binary]` extra is what supplies libpq. Without it, psycopg falls
-# back to a pure-Python implementation that needs a system libpq, which this image does not
-# have -- the failure is an ImportError at the first checkpoint rather than at build time.
 langgraph-checkpoint-postgres==3.1.0
 psycopg[binary]>=3.2,<4
+psycopg-pool==3.3.3

@@ -28,7 +28,6 @@ from tokenizers import Tokenizer
 # built with a different model is detectable rather than silently mixed.
 EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 EMBEDDING_DIMENSION = 384
-EMBEDDING_MAX_TOKENS = 512
 
 
 class EmbeddingError(Exception):
